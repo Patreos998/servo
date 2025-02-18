@@ -11,14 +11,14 @@ use dom_struct::dom_struct;
 use crate::dom::bindings::codegen::Bindings::WebGL2RenderingContextBinding::WebGL2RenderingContextConstants as constants;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::webglobject::WebGLObject;
 use crate::dom::webglrenderingcontext::{Operation, WebGLRenderingContext};
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct WebGLQuery {
+pub(crate) struct WebGLQuery {
     webgl_object: WebGLObject,
     #[no_trace]
     gl_id: WebGLQueryId,
@@ -40,7 +40,7 @@ impl WebGLQuery {
         }
     }
 
-    pub fn new(context: &WebGLRenderingContext) -> DomRoot<Self> {
+    pub(crate) fn new(context: &WebGLRenderingContext) -> DomRoot<Self> {
         let (sender, receiver) = webgl_channel().unwrap();
         context.send_command(WebGLCommand::GenerateQuery(sender));
         let id = receiver.recv().unwrap();
@@ -48,10 +48,11 @@ impl WebGLQuery {
         reflect_dom_object(
             Box::new(Self::new_inherited(context, id)),
             &*context.global(),
+            CanGc::note(),
         )
     }
 
-    pub fn begin(
+    pub(crate) fn begin(
         &self,
         context: &WebGLRenderingContext,
         target: u32,
@@ -76,7 +77,7 @@ impl WebGLQuery {
         Ok(())
     }
 
-    pub fn end(
+    pub(crate) fn end(
         &self,
         context: &WebGLRenderingContext,
         target: u32,
@@ -99,7 +100,7 @@ impl WebGLQuery {
         Ok(())
     }
 
-    pub fn delete(&self, operation_fallibility: Operation) {
+    pub(crate) fn delete(&self, operation_fallibility: Operation) {
         if !self.marked_for_deletion.get() {
             self.marked_for_deletion.set(true);
 
@@ -112,11 +113,11 @@ impl WebGLQuery {
         }
     }
 
-    pub fn is_valid(&self) -> bool {
+    pub(crate) fn is_valid(&self) -> bool {
         !self.marked_for_deletion.get() && self.target().is_some()
     }
 
-    pub fn target(&self) -> Option<u32> {
+    pub(crate) fn target(&self) -> Option<u32> {
         self.gl_target.get()
     }
 
@@ -144,8 +145,8 @@ impl WebGLQuery {
         self.query_result_available.set(Some(is_available));
     }
 
-    #[cfg_attr(rustfmt, rustfmt_skip)]
-    pub fn get_parameter(
+    #[rustfmt::skip]
+    pub(crate) fn get_parameter(
         &self,
         context: &WebGLRenderingContext,
         pname: u32,
@@ -170,13 +171,10 @@ impl WebGLQuery {
                 this.update_results(&context);
             });
 
-            let global = self.global();
-            global
-                .as_window()
+            self.global()
                 .task_manager()
                 .dom_manipulation_task_source()
-                .queue(task, global.upcast())
-                .unwrap();
+                .queue(task);
         }
 
         match pname {

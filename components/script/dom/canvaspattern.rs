@@ -10,10 +10,11 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::canvasgradient::ToFillOrStrokeStyle;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#canvaspattern
 #[dom_struct]
-pub struct CanvasPattern {
+pub(crate) struct CanvasPattern {
     reflector_: Reflector,
     surface_data: Vec<u8>,
     #[no_trace]
@@ -39,14 +40,14 @@ impl CanvasPattern {
 
         CanvasPattern {
             reflector_: Reflector::new(),
-            surface_data: surface_data,
+            surface_data,
             surface_size,
             repeat_x: x,
             repeat_y: y,
-            origin_clean: origin_clean,
+            origin_clean,
         }
     }
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         surface_data: Vec<u8>,
         surface_size: Size2D<u32>,
@@ -61,14 +62,15 @@ impl CanvasPattern {
                 origin_clean,
             )),
             global,
+            CanGc::note(),
         )
     }
-    pub fn origin_is_clean(&self) -> bool {
+    pub(crate) fn origin_is_clean(&self) -> bool {
         self.origin_clean
     }
 }
 
-impl<'a> ToFillOrStrokeStyle for &'a CanvasPattern {
+impl ToFillOrStrokeStyle for &CanvasPattern {
     fn to_fill_or_stroke_style(self) -> FillOrStrokeStyle {
         FillOrStrokeStyle::Surface(SurfaceStyle::new(
             self.surface_data.clone(),

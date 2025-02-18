@@ -7,9 +7,10 @@ use std::sync::mpsc;
 
 use dom_struct::dom_struct;
 use servo_media::audio::graph::NodeId;
-use servo_media::audio::node::AudioNodeMessage;
+use servo_media::audio::node::{AudioNodeMessage, AudioNodeType};
 use servo_media::audio::param::{ParamRate, ParamType, RampKind, UserAutomationEvent};
 
+use crate::conversions::Convert;
 use crate::dom::baseaudiocontext::BaseAudioContext;
 use crate::dom::bindings::codegen::Bindings::AudioParamBinding::{
     AudioParamMethods, AutomationRate,
@@ -19,14 +20,18 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct AudioParam {
+pub(crate) struct AudioParam {
     reflector_: Reflector,
     context: Dom<BaseAudioContext>,
     #[ignore_malloc_size_of = "servo_media"]
     #[no_trace]
     node: NodeId,
+    #[ignore_malloc_size_of = "servo_media"]
+    #[no_trace]
+    node_type: AudioNodeType,
     #[ignore_malloc_size_of = "servo_media"]
     #[no_trace]
     param: ParamType,
@@ -37,9 +42,11 @@ pub struct AudioParam {
 }
 
 impl AudioParam {
-    pub fn new_inherited(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_inherited(
         context: &BaseAudioContext,
         node: NodeId,
+        node_type: AudioNodeType,
         param: ParamType,
         automation_rate: AutomationRate,
         default_value: f32,
@@ -50,6 +57,7 @@ impl AudioParam {
             reflector_: Reflector::new(),
             context: Dom::from_ref(context),
             node,
+            node_type,
             param,
             automation_rate: Cell::new(automation_rate),
             default_value,
@@ -58,11 +66,13 @@ impl AudioParam {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         context: &BaseAudioContext,
         node: NodeId,
+        node_type: AudioNodeType,
         param: ParamType,
         automation_rate: AutomationRate,
         default_value: f32,
@@ -72,13 +82,14 @@ impl AudioParam {
         let audio_param = AudioParam::new_inherited(
             context,
             node,
+            node_type,
             param,
             automation_rate,
             default_value,
             min_value,
             max_value,
         );
-        reflect_dom_object(Box::new(audio_param), window)
+        reflect_dom_object(Box::new(audio_param), window, CanGc::note())
     }
 
     fn message_node(&self, message: AudioNodeMessage) {
@@ -89,32 +100,44 @@ impl AudioParam {
             .message_node(self.node, message);
     }
 
-    pub fn context(&self) -> &BaseAudioContext {
+    pub(crate) fn context(&self) -> &BaseAudioContext {
         &self.context
     }
 
-    pub fn node_id(&self) -> NodeId {
+    pub(crate) fn node_id(&self) -> NodeId {
         self.node
     }
 
-    pub fn param_type(&self) -> ParamType {
+    pub(crate) fn param_type(&self) -> ParamType {
         self.param
     }
 }
 
-impl AudioParamMethods for AudioParam {
+impl AudioParamMethods<crate::DomTypeHolder> for AudioParam {
     // https://webaudio.github.io/web-audio-api/#dom-audioparam-automationrate
     fn AutomationRate(&self) -> AutomationRate {
         self.automation_rate.get()
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-audioparam-automationrate
-    fn SetAutomationRate(&self, automation_rate: AutomationRate) {
+    fn SetAutomationRate(&self, automation_rate: AutomationRate) -> Fallible<()> {
+        // > AudioBufferSourceNode
+        // > The AudioParams playbackRate and detune MUST be "k-rate". An InvalidStateError must be
+        // > thrown if the rate is changed to "a-rate".
+        if automation_rate == AutomationRate::A_rate &&
+            self.node_type == AudioNodeType::AudioBufferSourceNode &&
+            (self.param == ParamType::Detune || self.param == ParamType::PlaybackRate)
+        {
+            return Err(Error::InvalidState);
+        }
+
         self.automation_rate.set(automation_rate);
         self.message_node(AudioNodeMessage::SetParamRate(
             self.param,
-            automation_rate.into(),
+            automation_rate.convert(),
         ));
+
+        Ok(())
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-audioparam-value
@@ -302,9 +325,9 @@ impl AudioParamMethods for AudioParam {
 }
 
 // https://webaudio.github.io/web-audio-api/#enumdef-automationrate
-impl From<AutomationRate> for ParamRate {
-    fn from(rate: AutomationRate) -> Self {
-        match rate {
+impl Convert<ParamRate> for AutomationRate {
+    fn convert(self) -> ParamRate {
+        match self {
             AutomationRate::A_rate => ParamRate::ARate,
             AutomationRate::K_rate => ParamRate::KRate,
         }

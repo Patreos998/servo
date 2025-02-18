@@ -11,8 +11,9 @@ use js::rust::Runtime;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
-thread_local!(static STACK: RefCell<Vec<StackEntry>> = RefCell::new(Vec::new()));
+thread_local!(static STACK: RefCell<Vec<StackEntry>> = const { RefCell::new(Vec::new()) });
 
 #[derive(Debug, Eq, JSTraceable, PartialEq)]
 enum StackEntryKind {
@@ -20,7 +21,7 @@ enum StackEntryKind {
     Entry,
 }
 
-#[allow(crown::unrooted_must_root)]
+#[cfg_attr(crown, allow(crown::unrooted_must_root))]
 #[derive(JSTraceable)]
 struct StackEntry {
     global: Dom<GlobalScope>,
@@ -28,24 +29,27 @@ struct StackEntry {
 }
 
 /// Traces the script settings stack.
-pub unsafe fn trace(tracer: *mut JSTracer) {
+pub(crate) unsafe fn trace(tracer: *mut JSTracer) {
     STACK.with(|stack| {
         stack.borrow().trace(tracer);
     })
 }
 
-pub fn is_execution_stack_empty() -> bool {
+pub(crate) fn is_execution_stack_empty() -> bool {
     STACK.with(|stack| stack.borrow().is_empty())
 }
 
 /// RAII struct that pushes and pops entries from the script settings stack.
-pub struct AutoEntryScript {
+pub(crate) struct AutoEntryScript {
     global: DomRoot<GlobalScope>,
+    #[cfg(feature = "tracing")]
+    #[allow(dead_code)]
+    span: tracing::span::EnteredSpan,
 }
 
 impl AutoEntryScript {
     /// <https://html.spec.whatwg.org/multipage/#prepare-to-run-script>
-    pub fn new(global: &GlobalScope) -> Self {
+    pub(crate) fn new(global: &GlobalScope) -> Self {
         STACK.with(|stack| {
             trace!("Prepare to run script with {:p}", global);
             let mut stack = stack.borrow_mut();
@@ -55,6 +59,13 @@ impl AutoEntryScript {
             });
             AutoEntryScript {
                 global: DomRoot::from_ref(global),
+                #[cfg(feature = "tracing")]
+                span: tracing::info_span!(
+                    "ScriptEvaluate",
+                    servo_profiling = true,
+                    url = global.get_url().to_string(),
+                )
+                .entered(),
             }
         })
     }
@@ -76,7 +87,7 @@ impl Drop for AutoEntryScript {
 
         // Step 5
         if !thread::panicking() && incumbent_global().is_none() {
-            self.global.perform_a_microtask_checkpoint();
+            self.global.perform_a_microtask_checkpoint(CanGc::note());
         }
     }
 }
@@ -84,7 +95,7 @@ impl Drop for AutoEntryScript {
 /// Returns the ["entry"] global object.
 ///
 /// ["entry"]: https://html.spec.whatwg.org/multipage/#entry
-pub fn entry_global() -> DomRoot<GlobalScope> {
+pub(crate) fn entry_global() -> DomRoot<GlobalScope> {
     STACK
         .with(|stack| {
             stack
@@ -98,18 +109,18 @@ pub fn entry_global() -> DomRoot<GlobalScope> {
 }
 
 /// RAII struct that pushes and pops entries from the script settings stack.
-pub struct AutoIncumbentScript {
+pub(crate) struct AutoIncumbentScript {
     global: usize,
 }
 
 impl AutoIncumbentScript {
     /// <https://html.spec.whatwg.org/multipage/#prepare-to-run-a-callback>
-    pub fn new(global: &GlobalScope) -> Self {
+    pub(crate) fn new(global: &GlobalScope) -> Self {
         // Step 2-3.
         unsafe {
-            let cx = Runtime::get();
-            assert!(!cx.is_null());
-            HideScriptedCaller(cx);
+            let cx =
+                Runtime::get().expect("Creating a new incumbent script after runtime shutdown");
+            HideScriptedCaller(cx.as_ptr());
         }
         STACK.with(|stack| {
             trace!("Prepare to run a callback with {:p}", global);
@@ -146,9 +157,9 @@ impl Drop for AutoIncumbentScript {
         });
         unsafe {
             // Step 1-2.
-            let cx = Runtime::get();
-            assert!(!cx.is_null());
-            UnhideScriptedCaller(cx);
+            if let Some(cx) = Runtime::get() {
+                UnhideScriptedCaller(cx.as_ptr());
+            }
         }
     }
 }
@@ -156,7 +167,7 @@ impl Drop for AutoIncumbentScript {
 /// Returns the ["incumbent"] global object.
 ///
 /// ["incumbent"]: https://html.spec.whatwg.org/multipage/#incumbent
-pub fn incumbent_global() -> Option<DomRoot<GlobalScope>> {
+pub(crate) fn incumbent_global() -> Option<DomRoot<GlobalScope>> {
     // https://html.spec.whatwg.org/multipage/#incumbent-settings-object
 
     // Step 1, 3: See what the JS engine has to say. If we've got a scripted
@@ -164,9 +175,12 @@ pub fn incumbent_global() -> Option<DomRoot<GlobalScope>> {
     // there's nothing on the JS stack, which will cause us to check the
     // incumbent script stack below.
     unsafe {
-        let cx = Runtime::get();
-        assert!(!cx.is_null());
-        let global = GetScriptedCallerGlobal(cx);
+        let Some(cx) = Runtime::get() else {
+            // It's not meaningful to return a global object if the runtime
+            // no longer exists.
+            return None;
+        };
+        let global = GetScriptedCallerGlobal(cx.as_ptr());
         if !global.is_null() {
             return Some(GlobalScope::from_object(global));
         }

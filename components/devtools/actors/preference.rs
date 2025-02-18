@@ -4,10 +4,10 @@
 
 use std::net::TcpStream;
 
+use log::warn;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use servo_config::pref_util::PrefValue;
-use servo_config::prefs::pref_map;
+use servo_config::pref;
 
 use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
 use crate::protocol::JsonPacketStream;
@@ -32,117 +32,97 @@ impl Actor for PreferenceActor {
         &self,
         _registry: &ActorRegistry,
         msg_type: &str,
-        _msg: &Map<String, Value>,
+        msg: &Map<String, Value>,
         stream: &mut TcpStream,
         _id: StreamId,
     ) -> Result<ActorMessageStatus, ()> {
-        let pref_value = pref_map().get(msg_type);
-        Ok(handle_preference_value(
-            pref_value,
-            self.name(),
-            msg_type,
-            stream,
-        ))
+        let Some(key) = msg.get("value").and_then(|v| v.as_str()) else {
+            warn!("PreferenceActor: handle_message: value is not a string");
+            return Ok(ActorMessageStatus::Ignored);
+        };
+
+        // TODO: Map more preferences onto their Servo values.
+        Ok(match key {
+            "dom.serviceWorkers.enabled" => {
+                self.write_bool(pref!(dom_serviceworker_enabled), stream)
+            },
+            _ => self.handle_missing_preference(msg_type, stream),
+        })
     }
 }
 
-fn handle_preference_value(
-    pref_value: PrefValue,
-    name: String,
-    msg_type: &str,
-    stream: &mut TcpStream,
-) -> ActorMessageStatus {
-    match pref_value {
-        PrefValue::Float(value) => {
-            let reply = FloatReply { from: name, value };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-        PrefValue::Int(value) => {
-            let reply = IntReply { from: name, value };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-        PrefValue::Str(value) => {
-            let reply = CharReply { from: name, value };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-        PrefValue::Bool(value) => {
-            let reply = BoolReply { from: name, value };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-        PrefValue::Array(values) => {
-            let mut result = ActorMessageStatus::Processed;
-            for value in values {
-                result = handle_preference_value(value, name.clone(), msg_type, stream);
-            }
-            result
-        },
-        PrefValue::Missing => handle_missing_preference(name, msg_type, stream),
+impl PreferenceActor {
+    fn handle_missing_preference(
+        &self,
+        msg_type: &str,
+        stream: &mut TcpStream,
+    ) -> ActorMessageStatus {
+        match msg_type {
+            "getBoolPref" => self.write_bool(false, stream),
+            "getCharPref" => self.write_char("".into(), stream),
+            "getIntPref" => self.write_int(0, stream),
+            "getFloatPref" => self.write_float(0., stream),
+            _ => ActorMessageStatus::Ignored,
+        }
     }
-}
 
-// if the preferences are missing from pref_map then we return a
-// fake preference response based on msg_type.
-fn handle_missing_preference(
-    name: String,
-    msg_type: &str,
-    stream: &mut TcpStream,
-) -> ActorMessageStatus {
-    match msg_type {
-        "getBoolPref" => {
-            let reply = BoolReply {
-                from: name,
-                value: false,
-            };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
+    fn write_bool(&self, pref_value: bool, stream: &mut TcpStream) -> ActorMessageStatus {
+        #[derive(Serialize)]
+        struct BoolReply {
+            from: String,
+            value: bool,
+        }
 
-        "getCharPref" => {
-            let reply = CharReply {
-                from: name,
-                value: "".to_owned(),
-            };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-
-        "getIntPref" => {
-            let reply = IntReply {
-                from: name,
-                value: 0,
-            };
-            let _ = stream.write_json_packet(&reply);
-            ActorMessageStatus::Processed
-        },
-
-        _ => ActorMessageStatus::Ignored,
+        let reply = BoolReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        let _ = stream.write_json_packet(&reply);
+        ActorMessageStatus::Processed
     }
-}
 
-#[derive(Serialize)]
-struct BoolReply {
-    from: String,
-    value: bool,
-}
+    fn write_char(&self, pref_value: String, stream: &mut TcpStream) -> ActorMessageStatus {
+        #[derive(Serialize)]
+        struct CharReply {
+            from: String,
+            value: String,
+        }
 
-#[derive(Serialize)]
-struct CharReply {
-    from: String,
-    value: String,
-}
+        let reply = CharReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        let _ = stream.write_json_packet(&reply);
+        ActorMessageStatus::Processed
+    }
 
-#[derive(Serialize)]
-struct IntReply {
-    from: String,
-    value: i64,
-}
+    fn write_int(&self, pref_value: i64, stream: &mut TcpStream) -> ActorMessageStatus {
+        #[derive(Serialize)]
+        struct IntReply {
+            from: String,
+            value: i64,
+        }
 
-#[derive(Serialize)]
-struct FloatReply {
-    from: String,
-    value: f64,
+        let reply = IntReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        let _ = stream.write_json_packet(&reply);
+        ActorMessageStatus::Processed
+    }
+
+    fn write_float(&self, pref_value: f64, stream: &mut TcpStream) -> ActorMessageStatus {
+        #[derive(Serialize)]
+        struct FloatReply {
+            from: String,
+            value: f64,
+        }
+
+        let reply = FloatReply {
+            from: self.name.clone(),
+            value: pref_value,
+        };
+        let _ = stream.write_json_packet(&reply);
+        ActorMessageStatus::Processed
+    }
 }

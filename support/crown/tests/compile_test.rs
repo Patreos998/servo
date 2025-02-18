@@ -4,11 +4,11 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use compiletest_rs as compiletest;
-use once_cell::sync::Lazy;
 
-static PROFILE_PATH: Lazy<PathBuf> = Lazy::new(|| {
+static PROFILE_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let current_exe_path = env::current_exe().unwrap();
     let deps_path = current_exe_path.parent().unwrap();
     let profile_path = deps_path.parent().unwrap();
@@ -35,6 +35,8 @@ fn run_mode(mode: &'static str, bless: bool) {
     // Does not work reliably: https://github.com/servo/servo/pull/30508#issuecomment-1834542203
     //config.link_deps();
     config.strict_headers = true;
+    // See https://github.com/Manishearth/compiletest-rs/issues/295
+    config.compile_test_exit_code = Some(101);
 
     compiletest::run_tests(&config);
 }

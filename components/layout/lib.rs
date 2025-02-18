@@ -4,8 +4,6 @@
 
 #![deny(unsafe_code)]
 
-pub mod layout_debug;
-
 mod block;
 pub mod construct;
 pub mod context;
@@ -36,6 +34,7 @@ mod table_row;
 mod table_rowgroup;
 mod table_wrapper;
 mod text;
+mod text_run;
 pub mod traversal;
 pub mod wrapper;
 

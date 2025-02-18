@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import argparse
 import json
 import logging
@@ -189,7 +187,7 @@ def write_manifest_file(path: str, web_features_map: WebFeaturesMap) -> None:
                 {
                     "version": 1,
                     "data": web_features_map
-                }, cls=WebFeatureManifestEncoder))
+                }, cls=WebFeatureManifestEncoder, sort_keys=True))
 
 
 def main(venv: Any = None, **kwargs: Any) -> int:

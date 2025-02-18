@@ -8,13 +8,22 @@ use style::properties::longhands::flex_direction::computed_value::T as FlexDirec
 
 use crate::geom::{LogicalRect, LogicalSides, LogicalVec2};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct FlexRelativeVec2<T> {
     pub main: T,
     pub cross: T,
 }
 
-#[derive(Clone, Copy)]
+impl<T> FlexRelativeVec2<T> {
+    pub fn map<U>(&self, f: impl Fn(&T) -> U) -> FlexRelativeVec2<U> {
+        FlexRelativeVec2 {
+            main: f(&self.main),
+            cross: f(&self.cross),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(super) struct FlexRelativeSides<T> {
     pub cross_start: T,
     pub main_start: T,
@@ -63,21 +72,11 @@ impl<T> FlexRelativeSides<T> {
             cross: self.cross_start + self.cross_end,
         }
     }
-
-    // TODO(#29819): Check if this function can be removed after we convert everything to Au.
-    pub fn map<U>(&self, f: impl Fn(&T) -> U) -> FlexRelativeSides<U> {
-        FlexRelativeSides {
-            main_start: f(&self.main_start),
-            main_end: f(&self.main_end),
-            cross_start: f(&self.cross_start),
-            cross_end: f(&self.cross_end),
-        }
-    }
 }
 
 /// One of the two bits set by the `flex-direction` property
 /// (The other is "forward" v.s. reverse.)
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum FlexAxis {
     /// The main axis is the inline axis of the container (not necessarily of flex items!),
     /// cross is block.
@@ -88,7 +87,7 @@ pub(super) enum FlexAxis {
 
 /// Which flow-relative sides map to the main-start and cross-start sides, respectively.
 /// See <https://drafts.csswg.org/css-flexbox/#box-model>
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum MainStartCrossStart {
     InlineStartBlockStart,
     InlineStartBlockEnd,
@@ -276,6 +275,6 @@ where
         inline: flow_relative_base_rect_size.inline - flow_relative_offsets.inline_end,
         block: flow_relative_base_rect_size.block - flow_relative_offsets.block_end,
     };
-    let size = &end_corner_position - &start_corner;
+    let size = end_corner_position - start_corner;
     LogicalRect { start_corner, size }
 }

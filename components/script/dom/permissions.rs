@@ -5,30 +5,37 @@
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
-use embedder_traits::{self, EmbedderMsg, PermissionPrompt, PermissionRequest};
+use embedder_traits::{self, AllowOrDeny, EmbedderMsg, PermissionFeature};
 use ipc_channel::ipc;
 use js::conversions::ConversionResult;
 use js::jsapi::JSObject;
 use js::jsval::{ObjectValue, UndefinedValue};
+use script_bindings::inheritance::Castable;
 use servo_config::pref;
 
+use super::window::Window;
+use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::PermissionStatusBinding::{
     PermissionDescriptor, PermissionName, PermissionState, PermissionStatusMethods,
 };
 use crate::dom::bindings::codegen::Bindings::PermissionsBinding::PermissionsMethods;
+use crate::dom::bindings::codegen::Bindings::WindowBinding::Window_Binding::WindowMethods;
 use crate::dom::bindings::error::Error;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal, Reflector};
 use crate::dom::bindings::root::DomRoot;
+#[cfg(feature = "bluetooth")]
 use crate::dom::bluetooth::Bluetooth;
+#[cfg(feature = "bluetooth")]
 use crate::dom::bluetoothpermissionresult::BluetoothPermissionResult;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::permissionstatus::PermissionStatus;
 use crate::dom::promise::Promise;
 use crate::realms::{AlreadyInRealm, InRealm};
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
-pub trait PermissionAlgorithm {
+pub(crate) trait PermissionAlgorithm {
     type Descriptor;
+    #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
     type Status;
     fn create_descriptor(
         cx: JSContext,
@@ -46,7 +53,7 @@ pub trait PermissionAlgorithm {
         descriptor: &Self::Descriptor,
         status: &Self::Status,
     );
-    fn permission_revoke(descriptor: &Self::Descriptor, status: &Self::Status);
+    fn permission_revoke(descriptor: &Self::Descriptor, status: &Self::Status, can_gc: CanGc);
 }
 
 enum Operation {
@@ -57,19 +64,23 @@ enum Operation {
 
 // https://w3c.github.io/permissions/#permissions
 #[dom_struct]
-pub struct Permissions {
+pub(crate) struct Permissions {
     reflector_: Reflector,
 }
 
 impl Permissions {
-    pub fn new_inherited() -> Permissions {
+    pub(crate) fn new_inherited() -> Permissions {
         Permissions {
             reflector_: Reflector::new(),
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<Permissions> {
-        reflect_dom_object(Box::new(Permissions::new_inherited()), global)
+    pub(crate) fn new(global: &GlobalScope) -> DomRoot<Permissions> {
+        reflect_dom_object(
+            Box::new(Permissions::new_inherited()),
+            global,
+            CanGc::note(),
+        )
     }
 
     // https://w3c.github.io/permissions/#dom-permissions-query
@@ -82,13 +93,14 @@ impl Permissions {
         cx: JSContext,
         permissionDesc: *mut JSObject,
         promise: Option<Rc<Promise>>,
+        can_gc: CanGc,
     ) -> Rc<Promise> {
         // (Query, Request) Step 3.
         let p = match promise {
             Some(promise) => promise,
             None => {
                 let in_realm_proof = AlreadyInRealm::assert();
-                Promise::new_in_current_realm(InRealm::Already(&in_realm_proof))
+                Promise::new_in_current_realm(InRealm::Already(&in_realm_proof), can_gc)
             },
         };
 
@@ -106,6 +118,7 @@ impl Permissions {
 
         // (Query, Request, Revoke) Step 2.
         match root_desc.name {
+            #[cfg(feature = "bluetooth")]
             PermissionName::Bluetooth => {
                 let bluetooth_desc = match Bluetooth::create_descriptor(cx, permissionDesc) {
                     Ok(descriptor) => descriptor,
@@ -118,33 +131,33 @@ impl Permissions {
                 // (Query, Request) Step 5.
                 let result = BluetoothPermissionResult::new(&self.global(), &status);
 
-                match &op {
+                match op {
                     // (Request) Step 6 - 8.
-                    &Operation::Request => {
+                    Operation::Request => {
                         Bluetooth::permission_request(cx, &p, &bluetooth_desc, &result)
                     },
 
                     // (Query) Step 6 - 7.
-                    &Operation::Query => {
+                    Operation::Query => {
                         Bluetooth::permission_query(cx, &p, &bluetooth_desc, &result)
                     },
 
-                    &Operation::Revoke => {
+                    Operation::Revoke => {
                         // (Revoke) Step 3.
                         let globalscope = self.global();
                         globalscope
                             .permission_state_invocation_results()
                             .borrow_mut()
-                            .remove(&root_desc.name.to_string());
+                            .remove(&root_desc.name);
 
                         // (Revoke) Step 4.
-                        Bluetooth::permission_revoke(&bluetooth_desc, &result)
+                        Bluetooth::permission_revoke(&bluetooth_desc, &result, can_gc)
                     },
                 }
             },
             _ => {
-                match &op {
-                    &Operation::Request => {
+                match op {
+                    Operation::Request => {
                         // (Request) Step 6.
                         Permissions::permission_request(cx, &p, &root_desc, &status);
 
@@ -153,7 +166,7 @@ impl Permissions {
                         // (Request) Step 8.
                         p.resolve_native(&status);
                     },
-                    &Operation::Query => {
+                    Operation::Query => {
                         // (Query) Step 6.
                         Permissions::permission_query(cx, &p, &root_desc, &status);
 
@@ -161,23 +174,25 @@ impl Permissions {
                         p.resolve_native(&status);
                     },
 
-                    &Operation::Revoke => {
+                    Operation::Revoke => {
                         // (Revoke) Step 3.
                         let globalscope = self.global();
                         globalscope
                             .permission_state_invocation_results()
                             .borrow_mut()
-                            .remove(&root_desc.name.to_string());
+                            .remove(&root_desc.name);
 
                         // (Revoke) Step 4.
-                        Permissions::permission_revoke(&root_desc, &status);
+                        Permissions::permission_revoke(&root_desc, &status, can_gc);
                     },
                 }
             },
         };
         match op {
             // (Revoke) Step 5.
-            Operation::Revoke => self.manipulate(Operation::Query, cx, permissionDesc, Some(p)),
+            Operation::Revoke => {
+                self.manipulate(Operation::Query, cx, permissionDesc, Some(p), can_gc)
+            },
 
             // (Query, Request) Step 4.
             _ => p,
@@ -186,20 +201,20 @@ impl Permissions {
 }
 
 #[allow(non_snake_case)]
-impl PermissionsMethods for Permissions {
+impl PermissionsMethods<crate::DomTypeHolder> for Permissions {
     // https://w3c.github.io/permissions/#dom-permissions-query
-    fn Query(&self, cx: JSContext, permissionDesc: *mut JSObject) -> Rc<Promise> {
-        self.manipulate(Operation::Query, cx, permissionDesc, None)
+    fn Query(&self, cx: JSContext, permissionDesc: *mut JSObject, can_gc: CanGc) -> Rc<Promise> {
+        self.manipulate(Operation::Query, cx, permissionDesc, None, can_gc)
     }
 
     // https://w3c.github.io/permissions/#dom-permissions-request
-    fn Request(&self, cx: JSContext, permissionDesc: *mut JSObject) -> Rc<Promise> {
-        self.manipulate(Operation::Request, cx, permissionDesc, None)
+    fn Request(&self, cx: JSContext, permissionDesc: *mut JSObject, can_gc: CanGc) -> Rc<Promise> {
+        self.manipulate(Operation::Request, cx, permissionDesc, None, can_gc)
     }
 
     // https://w3c.github.io/permissions/#dom-permissions-revoke
-    fn Revoke(&self, cx: JSContext, permissionDesc: *mut JSObject) -> Rc<Promise> {
-        self.manipulate(Operation::Revoke, cx, permissionDesc, None)
+    fn Revoke(&self, cx: JSContext, permissionDesc: *mut JSObject, can_gc: CanGc) -> Rc<Promise> {
+        self.manipulate(Operation::Revoke, cx, permissionDesc, None, can_gc)
     }
 }
 
@@ -222,15 +237,25 @@ impl PermissionAlgorithm for Permissions {
         }
     }
 
-    // https://w3c.github.io/permissions/#boolean-permission-query-algorithm
+    /// <https://w3c.github.io/permissions/#dfn-permission-query-algorithm>
+    ///
+    /// > permission query algorithm:
+    /// > Takes an instance of the permission descriptor type and a new or existing instance of
+    /// > the permission result type, and updates the permission result type instance with the
+    /// > query result. Used by Permissions' query(permissionDesc) method and the
+    /// > PermissionStatus update steps. If unspecified, this defaults to the default permission
+    /// > query algorithm.
+    ///
+    /// > The default permission query algorithm, given a PermissionDescriptor
+    /// > permissionDesc and a PermissionStatus status, runs the following steps:
     fn permission_query(
         _cx: JSContext,
         _promise: &Rc<Promise>,
         _descriptor: &PermissionDescriptor,
         status: &PermissionStatus,
     ) {
-        // Step 1.
-        status.set_state(get_descriptor_permission_state(status.get_query(), None));
+        // Step 1. Set status's state to permissionDesc's permission state.
+        status.set_state(descriptor_permission_state(status.get_query(), None));
     }
 
     // https://w3c.github.io/permissions/#boolean-permission-request-algorithm
@@ -246,17 +271,14 @@ impl PermissionAlgorithm for Permissions {
         match status.State() {
             // Step 3.
             PermissionState::Prompt => {
-                let perm_name = status.get_query();
-                let prompt =
-                    PermissionPrompt::Request(embedder_traits::PermissionName::from(perm_name));
-
                 // https://w3c.github.io/permissions/#request-permission-to-use (Step 3 - 4)
+                let permission_name = status.get_query();
                 let globalscope = GlobalScope::current().expect("No current global object");
-                let state = prompt_user_from_embedder(prompt, &globalscope);
+                let state = prompt_user_from_embedder(permission_name, &globalscope);
                 globalscope
                     .permission_state_invocation_results()
                     .borrow_mut()
-                    .insert(perm_name.to_string(), state);
+                    .insert(permission_name, state);
             },
 
             // Step 2.
@@ -267,97 +289,81 @@ impl PermissionAlgorithm for Permissions {
         Permissions::permission_query(cx, promise, descriptor, status);
     }
 
-    fn permission_revoke(_descriptor: &PermissionDescriptor, _status: &PermissionStatus) {}
+    fn permission_revoke(
+        _descriptor: &PermissionDescriptor,
+        _status: &PermissionStatus,
+        _can_gc: CanGc,
+    ) {
+    }
 }
 
-// https://w3c.github.io/permissions/#permission-state
-pub fn get_descriptor_permission_state(
-    permission_name: PermissionName,
+/// <https://w3c.github.io/permissions/#dfn-permission-state>
+pub(crate) fn descriptor_permission_state(
+    feature: PermissionName,
     env_settings_obj: Option<&GlobalScope>,
 ) -> PermissionState {
-    // Step 1.
-    let globalscope = match env_settings_obj {
+    // Step 1. If settings wasn't passed, set it to the current settings object.
+    let global_scope = match env_settings_obj {
         Some(env_settings_obj) => DomRoot::from_ref(env_settings_obj),
         None => GlobalScope::current().expect("No current global object"),
     };
 
-    // Step 2.
-    // TODO: The `is the environment settings object a non-secure context` check is missing.
-    // The current solution is a workaround with a message box to warn about this,
-    // if the feature is not allowed in non-secure contexcts,
-    // and let the user decide to grant the permission or not.
-    let state = if allowed_in_nonsecure_contexts(&permission_name) {
-        PermissionState::Prompt
-    } else {
-        if pref!(dom.permissions.testing.allowed_in_nonsecure_contexts) {
-            PermissionState::Granted
-        } else {
-            globalscope
-                .permission_state_invocation_results()
-                .borrow_mut()
-                .remove(&permission_name.to_string());
-
-            prompt_user_from_embedder(
-                PermissionPrompt::Insecure(embedder_traits::PermissionName::from(permission_name)),
-                &globalscope,
-            )
+    // Step 2. If settings is a non-secure context, return "denied".
+    if !global_scope.is_secure_context() {
+        if pref!(dom_permissions_testing_allowed_in_nonsecure_contexts) {
+            return PermissionState::Granted;
         }
-    };
+        return PermissionState::Denied;
+    }
 
-    // Step 3.
-    if let Some(prev_result) = globalscope
+    // Step 3. Let feature be descriptor's name.
+    // The caller has already converted the descriptor into a name.
+
+    // Step 4. If there exists a policy-controlled feature for feature and settings'
+    // relevant global object has an associated Document run the following step:
+    //   1. Let document be settings' relevant global object's associated Document.
+    //   2. If document is not allowed to use feature, return "denied".
+    if let Some(window) = global_scope.downcast::<Window>() {
+        if !window.Document().allowed_to_use_feature(feature) {
+            return PermissionState::Denied;
+        }
+    }
+
+    // Step 5. Let key be the result of generating a permission key for descriptor with settings.
+    // Step 6. Let entry be the result of getting a permission store entry with descriptor and key.
+    // Step 7. If entry is not null, return a PermissionState enum value from entry's state.
+    //
+    // TODO: We aren't making a key based on the descriptor, but on the descriptor's name. This really
+    // only matters for WebBluetooth, which adds more fields to the descriptor beyond the name.
+    if let Some(entry) = global_scope
         .permission_state_invocation_results()
         .borrow()
-        .get(&permission_name.to_string())
+        .get(&feature)
     {
-        return prev_result.clone();
+        return *entry;
     }
 
-    // Store the invocation result
-    globalscope
-        .permission_state_invocation_results()
-        .borrow_mut()
-        .insert(permission_name.to_string(), state);
-
-    // Step 4.
-    state
+    // Step 8. Return the PermissionState enum value that represents the permission state
+    // of feature, taking into account any permission state constraints for descriptor's
+    // name.
+    PermissionState::Prompt
 }
 
-// https://w3c.github.io/permissions/#allowed-in-non-secure-contexts
-fn allowed_in_nonsecure_contexts(permission_name: &PermissionName) -> bool {
-    match *permission_name {
-        // https://w3c.github.io/permissions/#dom-permissionname-geolocation
-        PermissionName::Geolocation => true,
-        // https://w3c.github.io/permissions/#dom-permissionname-notifications
-        PermissionName::Notifications => true,
-        // https://w3c.github.io/permissions/#dom-permissionname-push
-        PermissionName::Push => false,
-        // https://w3c.github.io/permissions/#dom-permissionname-midi
-        PermissionName::Midi => true,
-        // https://w3c.github.io/permissions/#dom-permissionname-camera
-        PermissionName::Camera => false,
-        // https://w3c.github.io/permissions/#dom-permissionname-microphone
-        PermissionName::Microphone => false,
-        // https://w3c.github.io/permissions/#dom-permissionname-speaker
-        PermissionName::Speaker => false,
-        // https://w3c.github.io/permissions/#dom-permissionname-device-info
-        PermissionName::Device_info => false,
-        // https://w3c.github.io/permissions/#dom-permissionname-background-sync
-        PermissionName::Background_sync => false,
-        // https://webbluetoothcg.github.io/web-bluetooth/#dom-permissionname-bluetooth
-        PermissionName::Bluetooth => false,
-        // https://storage.spec.whatwg.org/#dom-permissionname-persistent-storage
-        PermissionName::Persistent_storage => false,
-    }
-}
-
-fn prompt_user_from_embedder(prompt: PermissionPrompt, gs: &GlobalScope) -> PermissionState {
+fn prompt_user_from_embedder(name: PermissionName, global_scope: &GlobalScope) -> PermissionState {
+    let Some(webview_id) = global_scope.webview_id() else {
+        warn!("Requesting permissions from non-webview-associated global scope");
+        return PermissionState::Denied;
+    };
     let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
-    gs.send_to_embedder(EmbedderMsg::PromptPermission(prompt, sender));
+    global_scope.send_to_embedder(EmbedderMsg::PromptPermission(
+        webview_id,
+        name.convert(),
+        sender,
+    ));
 
     match receiver.recv() {
-        Ok(PermissionRequest::Granted) => PermissionState::Granted,
-        Ok(PermissionRequest::Denied) => PermissionState::Denied,
+        Ok(AllowOrDeny::Allow) => PermissionState::Granted,
+        Ok(AllowOrDeny::Deny) => PermissionState::Denied,
         Err(e) => {
             warn!(
                 "Failed to receive permission state from embedder ({:?}).",
@@ -368,22 +374,20 @@ fn prompt_user_from_embedder(prompt: PermissionPrompt, gs: &GlobalScope) -> Perm
     }
 }
 
-impl From<PermissionName> for embedder_traits::PermissionName {
-    fn from(permission_name: PermissionName) -> Self {
-        match permission_name {
-            PermissionName::Geolocation => embedder_traits::PermissionName::Geolocation,
-            PermissionName::Notifications => embedder_traits::PermissionName::Notifications,
-            PermissionName::Push => embedder_traits::PermissionName::Push,
-            PermissionName::Midi => embedder_traits::PermissionName::Midi,
-            PermissionName::Camera => embedder_traits::PermissionName::Camera,
-            PermissionName::Microphone => embedder_traits::PermissionName::Microphone,
-            PermissionName::Speaker => embedder_traits::PermissionName::Speaker,
-            PermissionName::Device_info => embedder_traits::PermissionName::DeviceInfo,
-            PermissionName::Background_sync => embedder_traits::PermissionName::BackgroundSync,
-            PermissionName::Bluetooth => embedder_traits::PermissionName::Bluetooth,
-            PermissionName::Persistent_storage => {
-                embedder_traits::PermissionName::PersistentStorage
-            },
+impl Convert<PermissionFeature> for PermissionName {
+    fn convert(self) -> PermissionFeature {
+        match self {
+            PermissionName::Geolocation => PermissionFeature::Geolocation,
+            PermissionName::Notifications => PermissionFeature::Notifications,
+            PermissionName::Push => PermissionFeature::Push,
+            PermissionName::Midi => PermissionFeature::Midi,
+            PermissionName::Camera => PermissionFeature::Camera,
+            PermissionName::Microphone => PermissionFeature::Microphone,
+            PermissionName::Speaker => PermissionFeature::Speaker,
+            PermissionName::Device_info => PermissionFeature::DeviceInfo,
+            PermissionName::Background_sync => PermissionFeature::BackgroundSync,
+            PermissionName::Bluetooth => PermissionFeature::Bluetooth,
+            PermissionName::Persistent_storage => PermissionFeature::PersistentStorage,
         }
     }
 }

@@ -16,10 +16,11 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#beforeunloadevent
 #[dom_struct]
-pub struct BeforeUnloadEvent {
+pub(crate) struct BeforeUnloadEvent {
     event: Event,
     return_value: DomRefCell<DOMString>,
 }
@@ -32,11 +33,15 @@ impl BeforeUnloadEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<BeforeUnloadEvent> {
-        reflect_dom_object(Box::new(BeforeUnloadEvent::new_inherited()), window)
+    pub(crate) fn new_uninitialized(window: &Window) -> DomRoot<BeforeUnloadEvent> {
+        reflect_dom_object(
+            Box::new(BeforeUnloadEvent::new_inherited()),
+            window,
+            CanGc::note(),
+        )
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         type_: Atom,
         bubbles: EventBubbles,
@@ -51,7 +56,7 @@ impl BeforeUnloadEvent {
     }
 }
 
-impl BeforeUnloadEventMethods for BeforeUnloadEvent {
+impl BeforeUnloadEventMethods<crate::DomTypeHolder> for BeforeUnloadEvent {
     // https://html.spec.whatwg.org/multipage/#dom-beforeunloadevent-returnvalue
     fn ReturnValue(&self) -> DOMString {
         self.return_value.borrow().clone()

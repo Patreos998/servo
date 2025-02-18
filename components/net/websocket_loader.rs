@@ -12,24 +12,21 @@
 //! the need for a dedicated thread per websocket.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_tungstenite::tokio::{client_async_tls_with_connector_and_config, ConnectStream};
 use async_tungstenite::WebSocketStream;
 use base64::Engine;
 use futures::future::TryFutureExt;
-use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use http::header::{self, HeaderName, HeaderValue};
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
-use lazy_static::lazy_static;
 use log::{debug, trace, warn};
 use net_traits::request::{RequestBuilder, RequestMode};
 use net_traits::{CookieSource, MessageData, WebSocketDomAction, WebSocketNetworkEvent};
 use servo_url::ServoUrl;
 use tokio::net::TcpStream;
-use tokio::runtime::Runtime;
 use tokio::select;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio_rustls::TlsConnector;
@@ -39,19 +36,12 @@ use tungstenite::protocol::CloseFrame;
 use tungstenite::Message;
 use url::Url;
 
+use crate::async_runtime::HANDLE;
 use crate::connector::{create_tls_config, CACertificates, TlsConfig};
-use crate::cookie::Cookie;
-use crate::fetch::methods::should_be_blocked_due_to_bad_port;
+use crate::cookie::ServoCookie;
+use crate::fetch::methods::should_request_be_blocked_due_to_a_bad_port;
 use crate::hosts::replace_host;
 use crate::http_loader::HttpState;
-
-// Websockets get their own tokio runtime that's independent of the one used for
-// HTTP connections, otherwise a large number of websockets could occupy all workers
-// and starve other network traffic.
-lazy_static! {
-    pub static ref HANDLE: Mutex<Option<Runtime>> = Mutex::new(Some(Runtime::new().unwrap()));
-}
-
 /// Create a tungstenite Request object for the initial HTTP request.
 /// This request contains `Origin`, `Sec-WebSocket-Protocol`, `Authorization`,
 /// and `Cookie` headers as appropriate.
@@ -94,7 +84,7 @@ fn create_request(
     }
 
     if resource_url.password().is_some() || resource_url.username() != "" {
-        let basic = base64::engine::general_purpose::STANDARD.encode(&format!(
+        let basic = base64::engine::general_purpose::STANDARD.encode(format!(
             "{}:{}",
             resource_url.username(),
             resource_url.password().unwrap_or("")
@@ -136,7 +126,7 @@ fn process_ws_response(
     for cookie in response.headers().get_all(header::SET_COOKIE) {
         if let Ok(s) = std::str::from_utf8(cookie.as_bytes()) {
             if let Some(cookie) =
-                Cookie::from_cookie_string(s.into(), resource_url, CookieSource::HTTP)
+                ServoCookie::from_cookie_string(s.into(), resource_url, CookieSource::HTTP)
             {
                 jar.push(cookie, resource_url, CookieSource::HTTP);
             }
@@ -147,7 +137,7 @@ fn process_ws_response(
         .hsts_list
         .write()
         .unwrap()
-        .update_hsts_list_from_response(resource_url, &response.headers());
+        .update_hsts_list_from_response(resource_url, response.headers());
 
     Ok(protocol_in_use)
 }
@@ -166,10 +156,10 @@ fn setup_dom_listener(
 ) -> UnboundedReceiver<DomMsg> {
     let (sender, receiver) = unbounded_channel();
 
-    ROUTER.add_route(
-        dom_action_receiver.to_opaque(),
+    ROUTER.add_typed_route(
+        dom_action_receiver,
         Box::new(move |message| {
-            let dom_action = message.to().expect("Ws dom_action message to deserialize");
+            let dom_action = message.expect("Ws dom_action message to deserialize");
             trace!("handling WS DOM action: {:?}", dom_action);
             match dom_action {
                 WebSocketDomAction::SendMessage(MessageData::Text(data)) => {
@@ -381,7 +371,7 @@ fn connect(
 
     let req_url = req_builder.url.clone();
 
-    if should_be_blocked_due_to_bad_port(&req_url) {
+    if should_request_be_blocked_due_to_a_bad_port(&req_url) {
         return Err("Port blocked".to_string());
     }
 
@@ -389,7 +379,7 @@ fn connect(
         &req_url,
         &req_builder.origin.ascii_serialization(),
         &protocols,
-        &*http_state,
+        &http_state,
     ) {
         Ok(c) => c,
         Err(e) => return Err(e.to_string()),
@@ -400,7 +390,7 @@ fn connect(
         ignore_certificate_errors,
         http_state.override_manager.clone(),
     );
-    tls_config.alpn_protocols = vec!["h2".to_string().into(), "http/1.1".to_string().into()];
+    tls_config.alpn_protocols = vec!["http/1.1".to_string().into()];
 
     let resource_event_sender2 = resource_event_sender.clone();
     match HANDLE.lock().unwrap().as_mut() {

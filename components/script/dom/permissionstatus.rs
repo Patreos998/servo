@@ -14,17 +14,18 @@ use crate::dom::bindings::reflector::reflect_dom_object;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 // https://w3c.github.io/permissions/#permissionstatus
 #[dom_struct]
-pub struct PermissionStatus {
+pub(crate) struct PermissionStatus {
     eventtarget: EventTarget,
     state: Cell<PermissionState>,
     query: Cell<PermissionName>,
 }
 
 impl PermissionStatus {
-    pub fn new_inherited(query: PermissionName) -> PermissionStatus {
+    pub(crate) fn new_inherited(query: PermissionName) -> PermissionStatus {
         PermissionStatus {
             eventtarget: EventTarget::new_inherited(),
             state: Cell::new(PermissionState::Denied),
@@ -32,23 +33,27 @@ impl PermissionStatus {
         }
     }
 
-    pub fn new(global: &GlobalScope, query: &PermissionDescriptor) -> DomRoot<PermissionStatus> {
+    pub(crate) fn new(
+        global: &GlobalScope,
+        query: &PermissionDescriptor,
+    ) -> DomRoot<PermissionStatus> {
         reflect_dom_object(
             Box::new(PermissionStatus::new_inherited(query.name)),
             global,
+            CanGc::note(),
         )
     }
 
-    pub fn set_state(&self, state: PermissionState) {
+    pub(crate) fn set_state(&self, state: PermissionState) {
         self.state.set(state);
     }
 
-    pub fn get_query(&self) -> PermissionName {
+    pub(crate) fn get_query(&self) -> PermissionName {
         self.query.get()
     }
 }
 
-impl PermissionStatusMethods for PermissionStatus {
+impl PermissionStatusMethods<crate::DomTypeHolder> for PermissionStatus {
     // https://w3c.github.io/permissions/#dom-permissionstatus-state
     fn State(&self) -> PermissionState {
         self.state.get()

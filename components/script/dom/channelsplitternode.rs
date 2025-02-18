@@ -11,20 +11,23 @@ use crate::dom::baseaudiocontext::BaseAudioContext;
 use crate::dom::bindings::codegen::Bindings::AudioNodeBinding::{
     ChannelCountMode, ChannelInterpretation,
 };
-use crate::dom::bindings::codegen::Bindings::ChannelSplitterNodeBinding::ChannelSplitterOptions;
+use crate::dom::bindings::codegen::Bindings::ChannelSplitterNodeBinding::{
+    ChannelSplitterNodeMethods, ChannelSplitterOptions,
+};
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct ChannelSplitterNode {
+pub(crate) struct ChannelSplitterNode {
     node: AudioNode,
 }
 
 impl ChannelSplitterNode {
-    #[allow(crown::unrooted_must_root)]
-    pub fn new_inherited(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new_inherited(
         _: &Window,
         context: &BaseAudioContext,
         options: &ChannelSplitterOptions,
@@ -56,32 +59,42 @@ impl ChannelSplitterNode {
         Ok(ChannelSplitterNode { node })
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         context: &BaseAudioContext,
         options: &ChannelSplitterOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<ChannelSplitterNode>> {
-        Self::new_with_proto(window, None, context, options)
+        Self::new_with_proto(window, None, context, options, can_gc)
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &ChannelSplitterOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<ChannelSplitterNode>> {
         let node = ChannelSplitterNode::new_inherited(window, context, options)?;
-        Ok(reflect_dom_object_with_proto(Box::new(node), window, proto))
+        Ok(reflect_dom_object_with_proto(
+            Box::new(node),
+            window,
+            proto,
+            can_gc,
+        ))
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl ChannelSplitterNodeMethods<crate::DomTypeHolder> for ChannelSplitterNode {
+    /// <https://webaudio.github.io/web-audio-api/#dom-channelsplitternode-channelsplitternode>
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         context: &BaseAudioContext,
         options: &ChannelSplitterOptions,
     ) -> Fallible<DomRoot<ChannelSplitterNode>> {
-        ChannelSplitterNode::new_with_proto(window, proto, context, options)
+        ChannelSplitterNode::new_with_proto(window, proto, context, options, can_gc)
     }
 }

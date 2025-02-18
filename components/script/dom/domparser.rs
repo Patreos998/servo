@@ -10,7 +10,7 @@ use crate::document_loader::DocumentLoader;
 use crate::dom::bindings::codegen::Bindings::DOMParserBinding;
 use crate::dom::bindings::codegen::Bindings::DOMParserBinding::DOMParserMethods;
 use crate::dom::bindings::codegen::Bindings::DOMParserBinding::SupportedType::{
-    Application_xhtml_xml, Application_xml, Text_html, Text_xml,
+    Application_xhtml_xml, Application_xml, Image_svg_xml, Text_html, Text_xml,
 };
 use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentReadyState;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
@@ -21,9 +21,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::servoparser::ServoParser;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct DOMParser {
+pub(crate) struct DOMParser {
     reflector_: Reflector,
     window: Dom<Window>, // XXXjdm Document instead?
 }
@@ -36,25 +37,32 @@ impl DOMParser {
         }
     }
 
-    fn new(window: &Window, proto: Option<HandleObject>) -> DomRoot<DOMParser> {
-        reflect_dom_object_with_proto(Box::new(DOMParser::new_inherited(window)), window, proto)
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<DOMParser>> {
-        Ok(DOMParser::new(window, proto))
+    fn new(window: &Window, proto: Option<HandleObject>, can_gc: CanGc) -> DomRoot<DOMParser> {
+        reflect_dom_object_with_proto(
+            Box::new(DOMParser::new_inherited(window)),
+            window,
+            proto,
+            can_gc,
+        )
     }
 }
 
-impl DOMParserMethods for DOMParser {
-    // https://w3c.github.io/DOM-Parsing/#the-domparser-interface
+impl DOMParserMethods<crate::DomTypeHolder> for DOMParser {
+    /// <https://html.spec.whatwg.org/multipage/#dom-domparser-constructor>
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<DOMParser>> {
+        Ok(DOMParser::new(window, proto, can_gc))
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-domparser-parsefromstring>
     fn ParseFromString(
         &self,
         s: DOMString,
         ty: DOMParserBinding::SupportedType,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<Document>> {
         let url = self.window.get_url();
         let content_type = ty
@@ -62,7 +70,7 @@ impl DOMParserMethods for DOMParser {
             .parse()
             .expect("Supported type is not a MIME type");
         let doc = self.window.Document();
-        let loader = DocumentLoader::new(&*doc.loader());
+        let loader = DocumentLoader::new(&doc.loader());
         match ty {
             Text_html => {
                 let document = Document::new(
@@ -79,12 +87,15 @@ impl DOMParserMethods for DOMParser {
                     None,
                     None,
                     Default::default(),
+                    false,
+                    Some(doc.insecure_requests_policy()),
+                    can_gc,
                 );
-                ServoParser::parse_html_document(&document, Some(s), url);
-                document.set_ready_state(DocumentReadyState::Complete);
+                ServoParser::parse_html_document(&document, Some(s), url, can_gc);
+                document.set_ready_state(DocumentReadyState::Complete, can_gc);
                 Ok(document)
             },
-            Text_xml | Application_xml | Application_xhtml_xml => {
+            Text_xml | Application_xml | Application_xhtml_xml | Image_svg_xml => {
                 let document = Document::new(
                     &self.window,
                     HasBrowsingContext::No,
@@ -99,9 +110,12 @@ impl DOMParserMethods for DOMParser {
                     None,
                     None,
                     Default::default(),
+                    false,
+                    Some(doc.insecure_requests_policy()),
+                    can_gc,
                 );
-                ServoParser::parse_xml_document(&document, Some(s), url);
-                document.set_ready_state(DocumentReadyState::Complete);
+                ServoParser::parse_xml_document(&document, Some(s), url, can_gc);
+                document.set_ready_state(DocumentReadyState::Complete, can_gc);
                 Ok(document)
             },
         }

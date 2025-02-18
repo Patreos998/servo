@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 use std::{cmp, thread};
 
 use compositing_traits::ConstellationMsg;
+use embedder_traits::MouseButtonAction;
 use ipc_channel::ipc;
 use keyboard_types::webdriver::KeyInputState;
 use script_traits::webdriver_msg::WebDriverScriptCommand;
-use script_traits::{MouseButton, MouseEventType, WebDriverCommandMsg};
+use script_traits::WebDriverCommandMsg;
 use webdriver::actions::{
     ActionSequence, ActionsType, GeneralAction, KeyAction, KeyActionItem, KeyDownAction,
     KeyUpAction, NullActionItem, PointerAction, PointerActionItem, PointerActionParameters,
@@ -82,18 +83,6 @@ fn compute_tick_duration(tick_actions: &ActionSequence) -> u64 {
     duration
 }
 
-fn u64_to_mouse_button(button: u64) -> Option<MouseButton> {
-    if MouseButton::Left as u64 == button {
-        Some(MouseButton::Left)
-    } else if MouseButton::Middle as u64 == button {
-        Some(MouseButton::Middle)
-    } else if MouseButton::Right as u64 == button {
-        Some(MouseButton::Right)
-    } else {
-        None
-    }
-}
-
 impl Handler {
     // https://w3c.github.io/webdriver/#dfn-dispatch-actions
     pub(crate) fn dispatch_actions(
@@ -101,8 +90,8 @@ impl Handler {
         actions_by_tick: &[ActionSequence],
     ) -> Result<(), ErrorStatus> {
         for tick_actions in actions_by_tick.iter() {
-            let tick_duration = compute_tick_duration(&tick_actions);
-            self.dispatch_tick_actions(&tick_actions, tick_duration)?;
+            let tick_duration = compute_tick_duration(tick_actions);
+            self.dispatch_tick_actions(tick_actions, tick_duration)?;
         }
         Ok(())
     }
@@ -144,10 +133,10 @@ impl Handler {
                                 .or_insert(InputSourceState::Key(KeyInputState::new()));
                             match action {
                                 KeyAction::Down(action) => {
-                                    self.dispatch_keydown_action(&source_id, &action)
+                                    self.dispatch_keydown_action(source_id, action)
                                 },
                                 KeyAction::Up(action) => {
-                                    self.dispatch_keyup_action(&source_id, &action)
+                                    self.dispatch_keyup_action(source_id, action)
                                 },
                             };
                         },
@@ -174,15 +163,15 @@ impl Handler {
                             match action {
                                 PointerAction::Cancel => (),
                                 PointerAction::Down(action) => {
-                                    self.dispatch_pointerdown_action(&source_id, &action)
+                                    self.dispatch_pointerdown_action(source_id, action)
                                 },
                                 PointerAction::Move(action) => self.dispatch_pointermove_action(
-                                    &source_id,
-                                    &action,
+                                    source_id,
+                                    action,
                                     tick_duration,
                                 )?,
                                 PointerAction::Up(action) => {
-                                    self.dispatch_pointerup_action(&source_id, &action)
+                                    self.dispatch_pointerup_action(source_id, action)
                                 },
                             }
                         },
@@ -290,17 +279,16 @@ impl Handler {
             },
         });
 
-        if let Some(button) = u64_to_mouse_button(action.button) {
-            let cmd_msg = WebDriverCommandMsg::MouseButtonAction(
-                MouseEventType::MouseDown,
-                button,
-                pointer_input_state.x as f32,
-                pointer_input_state.y as f32,
-            );
-            self.constellation_chan
-                .send(ConstellationMsg::WebDriverCommand(cmd_msg))
-                .unwrap();
-        }
+        let button = (action.button as u16).into();
+        let cmd_msg = WebDriverCommandMsg::MouseButtonAction(
+            MouseButtonAction::Down,
+            button,
+            pointer_input_state.x as f32,
+            pointer_input_state.y as f32,
+        );
+        self.constellation_chan
+            .send(ConstellationMsg::WebDriverCommand(cmd_msg))
+            .unwrap();
     }
 
     // https://w3c.github.io/webdriver/#dfn-dispatch-a-pointerup-action
@@ -337,17 +325,16 @@ impl Handler {
             },
         });
 
-        if let Some(button) = u64_to_mouse_button(action.button) {
-            let cmd_msg = WebDriverCommandMsg::MouseButtonAction(
-                MouseEventType::MouseUp,
-                button,
-                pointer_input_state.x as f32,
-                pointer_input_state.y as f32,
-            );
-            self.constellation_chan
-                .send(ConstellationMsg::WebDriverCommand(cmd_msg))
-                .unwrap();
-        }
+        let button = (action.button as u16).into();
+        let cmd_msg = WebDriverCommandMsg::MouseButtonAction(
+            MouseButtonAction::Up,
+            button,
+            pointer_input_state.x as f32,
+            pointer_input_state.y as f32,
+        );
+        self.constellation_chan
+            .send(ConstellationMsg::WebDriverCommand(cmd_msg))
+            .unwrap();
     }
 
     // https://w3c.github.io/webdriver/#dfn-dispatch-a-pointermove-action
@@ -434,7 +421,8 @@ impl Handler {
         Ok(())
     }
 
-    // https://w3c.github.io/webdriver/#dfn-perform-a-pointer-move
+    /// <https://w3c.github.io/webdriver/#dfn-perform-a-pointer-move>
+    #[allow(clippy::too_many_arguments)]
     fn perform_pointer_move(
         &mut self,
         source_id: &str,
@@ -470,11 +458,7 @@ impl Handler {
             };
 
             // Step 3
-            let last = if 1.0 - duration_ratio < 0.001 {
-                true
-            } else {
-                false
-            };
+            let last = 1.0 - duration_ratio < 0.001;
 
             // Step 4
             let (x, y) = if last {

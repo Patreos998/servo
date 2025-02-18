@@ -28,9 +28,10 @@ from wptrunner import wptrunner
 
 
 CERTS_PATH = os.path.join(WPT_TOOLS_PATH, "certs")
-TRACKER_API = "https://build.servo.org/intermittent-tracker"
+TRACKER_API = "https://intermittent-tracker.servo.org"
 TRACKER_API_ENV_VAR = "INTERMITTENT_TRACKER_API"
-TRACKER_DASHBOARD_SECRET_ENV_VAR = "INTERMITTENT_TRACKER_DASHBOARD_SECRET"
+TRACKER_DASHBOARD_SECRET_ENV_VAR = "INTERMITTENT_TRACKER_DASHBOARD_SECRET_PROD"
+TRACKER_DASHBOARD_MAXIMUM_OUTPUT_LENGTH = 1024
 
 
 def set_if_none(args: dict, key: str, value):
@@ -92,7 +93,7 @@ def run_tests(default_binary_path: str, **kwargs):
     if not kwargs.get("no_default_test_types"):
         test_types = {
             "servo": ["testharness", "reftest", "wdspec", "crashtest"],
-            "servodriver": ["testharness", "reftest"],
+            "servodriver": ["testharness", "reftest", "wdspec", "crashtest"],
         }
         product = kwargs.get("product") or "servo"
         kwargs["test_types"] = test_types[product]
@@ -235,7 +236,10 @@ class TrackerDashboardFilter():
             'expected': result.expected,
             'actual': result.actual,
             'time': result.time // 1000,
-            'message': result.message,
+            # Truncate the message, to avoid issues with lots of output causing "HTTP
+            # Error 413: Request Entity Too Large."
+            # See https://github.com/servo/servo/issues/31845.
+            'message': result.message[0:TRACKER_DASHBOARD_MAXIMUM_OUTPUT_LENGTH],
             'stack': result.stack,
         }
         if isinstance(result, UnexpectedSubtestResult):
@@ -281,9 +285,9 @@ def filter_intermittents(
     unexpected_results: List[UnexpectedResult],
     output_path: str
 ) -> bool:
-    print(f"Filtering {len(unexpected_results)} "
-          "unexpected results for known intermittents")
     dashboard = TrackerDashboardFilter()
+    print(f"Filtering {len(unexpected_results)} "
+          f"unexpected results for known intermittents via <{dashboard.url}>")
     dashboard.report_failures(unexpected_results)
 
     def add_result(output, text, results: List[UnexpectedResult], filter_func) -> None:

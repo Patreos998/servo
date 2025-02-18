@@ -4,36 +4,36 @@
 
 use std::cell::Cell;
 
+use base::id::ServiceWorkerId;
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject};
 use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
-use msg::constellation_msg::ServiceWorkerId;
 use script_traits::{DOMMessage, ScriptMsg};
 use servo_url::ServoUrl;
 
 use crate::dom::abstractworker::SimpleWorkerErrorHandler;
 use crate::dom::bindings::cell::DomRefCell;
-use crate::dom::bindings::codegen::Bindings::MessagePortBinding::PostMessageOptions;
+use crate::dom::bindings::codegen::Bindings::MessagePortBinding::StructuredSerializeOptions;
 use crate::dom::bindings::codegen::Bindings::ServiceWorkerBinding::{
     ServiceWorkerMethods, ServiceWorkerState,
 };
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::USVString;
 use crate::dom::bindings::structuredclone;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 use crate::task::TaskOnce;
 
-pub type TrustedServiceWorkerAddress = Trusted<ServiceWorker>;
+pub(crate) type TrustedServiceWorkerAddress = Trusted<ServiceWorker>;
 
 #[dom_struct]
-pub struct ServiceWorker {
+pub(crate) struct ServiceWorker {
     eventtarget: EventTarget,
     script_url: DomRefCell<String>,
     #[no_trace]
@@ -53,12 +53,12 @@ impl ServiceWorker {
             eventtarget: EventTarget::new_inherited(),
             script_url: DomRefCell::new(String::from(script_url)),
             state: Cell::new(ServiceWorkerState::Installing),
-            scope_url: scope_url,
+            scope_url,
             worker_id,
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         script_url: ServoUrl,
         scope_url: ServoUrl,
@@ -71,21 +71,22 @@ impl ServiceWorker {
                 worker_id,
             )),
             global,
+            CanGc::note(),
         )
     }
 
-    pub fn dispatch_simple_error(address: TrustedServiceWorkerAddress) {
+    pub(crate) fn dispatch_simple_error(address: TrustedServiceWorkerAddress, can_gc: CanGc) {
         let service_worker = address.root();
-        service_worker.upcast().fire_event(atom!("error"));
+        service_worker.upcast().fire_event(atom!("error"), can_gc);
     }
 
-    pub fn set_transition_state(&self, state: ServiceWorkerState) {
+    pub(crate) fn set_transition_state(&self, state: ServiceWorkerState, can_gc: CanGc) {
         self.state.set(state);
         self.upcast::<EventTarget>()
-            .fire_event(atom!("statechange"));
+            .fire_event(atom!("statechange"), can_gc);
     }
 
-    pub fn get_script_url(&self) -> ServoUrl {
+    pub(crate) fn get_script_url(&self) -> ServoUrl {
         ServoUrl::parse(&self.script_url.borrow().clone()).unwrap()
     }
 
@@ -118,7 +119,7 @@ impl ServiceWorker {
     }
 }
 
-impl ServiceWorkerMethods for ServiceWorker {
+impl ServiceWorkerMethods<crate::DomTypeHolder> for ServiceWorker {
     // https://w3c.github.io/ServiceWorker/#service-worker-state-attribute
     fn State(&self) -> ServiceWorkerState {
         self.state.get()
@@ -144,7 +145,7 @@ impl ServiceWorkerMethods for ServiceWorker {
         &self,
         cx: JSContext,
         message: HandleValue,
-        options: RootedTraceableBox<PostMessageOptions>,
+        options: RootedTraceableBox<StructuredSerializeOptions>,
     ) -> ErrorResult {
         let mut rooted = CustomAutoRooter::new(
             options
@@ -165,8 +166,8 @@ impl ServiceWorkerMethods for ServiceWorker {
 }
 
 impl TaskOnce for SimpleWorkerErrorHandler<ServiceWorker> {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn run_once(self) {
-        ServiceWorker::dispatch_simple_error(self.addr);
+        ServiceWorker::dispatch_simple_error(self.addr, CanGc::note());
     }
 }

@@ -17,14 +17,15 @@ use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::weakref::MutableWeakRef;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::url::URL;
+use crate::script_runtime::CanGc;
 
-// https://url.spec.whatwg.org/#interface-urlsearchparams
+/// <https://url.spec.whatwg.org/#interface-urlsearchparams>
 #[dom_struct]
-pub struct URLSearchParams {
+pub(crate) struct URLSearchParams {
     reflector_: Reflector,
-    // https://url.spec.whatwg.org/#concept-urlsearchparams-list
+    /// <https://url.spec.whatwg.org/#concept-urlsearchparams-list>
     list: DomRefCell<Vec<(String, String)>>,
-    // https://url.spec.whatwg.org/#concept-urlsearchparams-url-object
+    /// <https://url.spec.whatwg.org/#concept-urlsearchparams-url-object>
     url: MutableWeakRef<URL>,
 }
 
@@ -37,27 +38,43 @@ impl URLSearchParams {
         }
     }
 
-    pub fn new(global: &GlobalScope, url: Option<&URL>) -> DomRoot<URLSearchParams> {
-        Self::new_with_proto(global, None, url)
+    pub(crate) fn new(
+        global: &GlobalScope,
+        url: Option<&URL>,
+        can_gc: CanGc,
+    ) -> DomRoot<URLSearchParams> {
+        Self::new_with_proto(global, None, url, can_gc)
     }
 
-    pub fn new_with_proto(
+    pub(crate) fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
         url: Option<&URL>,
+        can_gc: CanGc,
     ) -> DomRoot<URLSearchParams> {
-        reflect_dom_object_with_proto(Box::new(URLSearchParams::new_inherited(url)), global, proto)
+        reflect_dom_object_with_proto(
+            Box::new(URLSearchParams::new_inherited(url)),
+            global,
+            proto,
+            can_gc,
+        )
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-urlsearchparams
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    pub(crate) fn set_list(&self, list: Vec<(String, String)>) {
+        *self.list.borrow_mut() = list;
+    }
+}
+
+impl URLSearchParamsMethods<crate::DomTypeHolder> for URLSearchParams {
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-urlsearchparams>
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         init: USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString,
     ) -> Fallible<DomRoot<URLSearchParams>> {
         // Step 1.
-        let query = URLSearchParams::new_with_proto(global, proto, None);
+        let query = URLSearchParams::new_with_proto(global, proto, None, can_gc);
         match init {
             USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString::USVStringSequenceSequence(init) => {
                 // Step 2.
@@ -79,7 +96,7 @@ impl URLSearchParams {
             USVStringSequenceSequenceOrUSVStringUSVStringRecordOrUSVString::USVString(init) => {
                 // Step 4.
                 let init_bytes = match init.0.chars().next() {
-                    Some(first_char) if first_char == '?' => {
+                    Some('?') => {
                         let (_, other_bytes) = init.0.as_bytes().split_at(1);
 
                         other_bytes
@@ -96,18 +113,12 @@ impl URLSearchParams {
         Ok(query)
     }
 
-    pub fn set_list(&self, list: Vec<(String, String)>) {
-        *self.list.borrow_mut() = list;
-    }
-}
-
-impl URLSearchParamsMethods for URLSearchParams {
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-size
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-size>
     fn Size(&self) -> u32 {
         self.list.borrow().len() as u32
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-append
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-append>
     fn Append(&self, name: USVString, value: USVString) {
         // Step 1.
         self.list.borrow_mut().push((name.0, value.0));
@@ -115,32 +126,30 @@ impl URLSearchParamsMethods for URLSearchParams {
         self.update_steps();
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-delete
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-delete>
     fn Delete(&self, name: USVString, value: Option<USVString>) {
         // Step 1.
-        self.list
-            .borrow_mut()
-            .retain(|&(ref k, ref v)| match &value {
-                Some(value) => !(k == &name.0 && v == &value.0),
-                None => k != &name.0,
-            });
+        self.list.borrow_mut().retain(|(k, v)| match &value {
+            Some(value) => !(k == &name.0 && v == &value.0),
+            None => k != &name.0,
+        });
         // Step 2.
         self.update_steps();
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-get
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-get>
     fn Get(&self, name: USVString) -> Option<USVString> {
         let list = self.list.borrow();
         list.iter()
             .find(|&kv| kv.0 == name.0)
-            .map(|ref kv| USVString(kv.1.clone()))
+            .map(|kv| USVString(kv.1.clone()))
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-getall
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-getall>
     fn GetAll(&self, name: USVString) -> Vec<USVString> {
         let list = self.list.borrow();
         list.iter()
-            .filter_map(|&(ref k, ref v)| {
+            .filter_map(|(k, v)| {
                 if k == &name.0 {
                     Some(USVString(v.clone()))
                 } else {
@@ -150,23 +159,23 @@ impl URLSearchParamsMethods for URLSearchParams {
             .collect()
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-has
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-has>
     fn Has(&self, name: USVString, value: Option<USVString>) -> bool {
         let list = self.list.borrow();
-        list.iter().any(|&(ref k, ref v)| match &value {
+        list.iter().any(|(k, v)| match &value {
             Some(value) => k == &name.0 && v == &value.0,
             None => k == &name.0,
         })
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-set
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-set>
     fn Set(&self, name: USVString, value: USVString) {
         {
             // Step 1.
             let mut list = self.list.borrow_mut();
             let mut index = None;
             let mut i = 0;
-            list.retain(|&(ref k, _)| {
+            list.retain(|(k, _)| {
                 if index.is_none() {
                     if k == &name.0 {
                         index = Some(i);
@@ -187,7 +196,7 @@ impl URLSearchParamsMethods for URLSearchParams {
         self.update_steps();
     }
 
-    // https://url.spec.whatwg.org/#dom-urlsearchparams-sort
+    /// <https://url.spec.whatwg.org/#dom-urlsearchparams-sort>
     fn Sort(&self) {
         // Step 1.
         self.list
@@ -198,22 +207,22 @@ impl URLSearchParamsMethods for URLSearchParams {
         self.update_steps();
     }
 
-    // https://url.spec.whatwg.org/#stringification-behavior
+    /// <https://url.spec.whatwg.org/#stringification-behavior>
     fn Stringifier(&self) -> DOMString {
         DOMString::from(self.serialize_utf8())
     }
 }
 
 impl URLSearchParams {
-    // https://url.spec.whatwg.org/#concept-urlencoded-serializer
-    pub fn serialize_utf8(&self) -> String {
+    /// <https://url.spec.whatwg.org/#concept-urlencoded-serializer>
+    pub(crate) fn serialize_utf8(&self) -> String {
         let list = self.list.borrow();
         form_urlencoded::Serializer::new(String::new())
             .extend_pairs(&*list)
             .finish()
     }
 
-    // https://url.spec.whatwg.org/#concept-urlsearchparams-update
+    /// <https://url.spec.whatwg.org/#concept-urlsearchparams-update>
     fn update_steps(&self) {
         if let Some(url) = self.url.root() {
             url.set_query_pairs(&self.list.borrow())

@@ -6,26 +6,24 @@
 
 use std::borrow::Cow;
 use std::fmt;
-use std::marker::PhantomData;
 use std::sync::Arc as StdArc;
 
-use atomic_refcell::AtomicRefCell;
-use gfx_traits::ByteIndex;
+use base::id::{BrowsingContextId, PipelineId};
+use fonts_traits::ByteIndex;
 use html5ever::{local_name, namespace_url, ns};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::{Image, ImageMetadata};
+use pixels::{Image, ImageMetadata};
 use range::Range;
 use script_layout_interface::wrapper_traits::{
-    GetStyleAndOpaqueLayoutData, LayoutDataTrait, LayoutNode, PseudoElementType,
-    ThreadSafeLayoutNode,
+    LayoutDataTrait, LayoutNode, PseudoElementType, ThreadSafeLayoutNode,
 };
 use script_layout_interface::{
-    HTMLCanvasData, HTMLMediaData, LayoutNodeType, SVGSVGData, StyleAndOpaqueLayoutData, StyleData,
+    GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutNodeType, SVGSVGData, StyleData,
     TrustedNodeAddress,
 };
 use servo_arc::Arc;
 use servo_url::ServoUrl;
 use style;
+use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
 use style::context::SharedStyleContext;
 use style::dom::{NodeInfo, TElement, TNode, TShadowRoot};
 use style::properties::ComputedValues;
@@ -38,7 +36,7 @@ use crate::dom::bindings::inheritance::{CharacterDataTypeId, NodeTypeId, TextTyp
 use crate::dom::bindings::root::LayoutDom;
 use crate::dom::characterdata::LayoutCharacterDataHelpers;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::node::{LayoutNodeHelpers, Node, NodeFlags};
+use crate::dom::node::{LayoutNodeHelpers, Node, NodeFlags, NodeTypeIdWrapper};
 use crate::dom::text::Text;
 
 /// A wrapper around a `LayoutDom<Node>` which provides a safe interface that
@@ -46,60 +44,44 @@ use crate::dom::text::Text;
 /// several style and selectors traits for use during layout. This version
 /// should only be used on a single thread. If you need to use nodes across
 /// threads use ServoThreadSafeLayoutNode.
-pub struct ServoLayoutNode<'dom, LayoutDataType: LayoutDataTrait> {
+#[derive(Clone, Copy, PartialEq)]
+#[repr(transparent)]
+pub struct ServoLayoutNode<'dom> {
     /// The wrapped private DOM node.
     pub(super) node: LayoutDom<'dom, Node>,
-
-    /// A PhantomData that is used to track the type of the stored layout data.
-    pub(super) phantom: PhantomData<LayoutDataType>,
 }
 
-//// Those are supposed to be sound, but they aren't because the entire system
-//// between script and layout so far has been designed to work around their
-//// absence. Switching the entire thing to the inert crate infra will help.
+/// Those are supposed to be sound, but they aren't because the entire system
+/// between script and layout so far has been designed to work around their
+/// absence. Switching the entire thing to the inert crate infra will help.
 ///
-//// FIXME(mrobinson): These are required because Layout 2020 sends non-threadsafe
-//// nodes to different threads. This should be adressed in a comprehensive way.
-unsafe impl<LayoutDataType: LayoutDataTrait> Send for ServoLayoutNode<'_, LayoutDataType> {}
-unsafe impl<LayoutDataType: LayoutDataTrait> Sync for ServoLayoutNode<'_, LayoutDataType> {}
+/// FIXME(mrobinson): These are required because Layout 2020 sends non-threadsafe
+/// nodes to different threads. This should be adressed in a comprehensive way.
+unsafe impl Send for ServoLayoutNode<'_> {}
+unsafe impl Sync for ServoLayoutNode<'_> {}
 
-// These impls are required because `derive` has trouble with PhantomData.
-// See https://github.com/rust-lang/rust/issues/52079
-impl<'dom, LayoutDataType: LayoutDataTrait> Clone for ServoLayoutNode<'dom, LayoutDataType> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<'dom, LayoutDataType: LayoutDataTrait> Copy for ServoLayoutNode<'dom, LayoutDataType> {}
-impl<'a, LayoutDataType: LayoutDataTrait> PartialEq for ServoLayoutNode<'a, LayoutDataType> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.node == other.node
-    }
-}
-
-impl<'dom, LayoutDataType: LayoutDataTrait> fmt::Debug for ServoLayoutNode<'dom, LayoutDataType> {
+impl fmt::Debug for ServoLayoutNode<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(el) = self.as_element() {
             el.fmt(f)
+        } else if self.is_text_node() {
+            write!(f, "<text node> ({:#x})", self.opaque().0)
         } else {
-            if self.is_text_node() {
-                write!(f, "<text node> ({:#x})", self.opaque().0)
-            } else {
-                write!(f, "<non-text node> ({:#x})", self.opaque().0)
-            }
+            write!(f, "<non-text node> ({:#x})", self.opaque().0)
         }
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> ServoLayoutNode<'dom, LayoutDataType> {
+impl<'dom> ServoLayoutNode<'dom> {
     pub(super) fn from_layout_js(n: LayoutDom<'dom, Node>) -> Self {
-        ServoLayoutNode {
-            node: n,
-            phantom: PhantomData,
-        }
+        ServoLayoutNode { node: n }
     }
 
+    /// Create a new [`ServoLayoutNode`] for this given [`TrustedNodeAddress`].
+    ///
+    /// # Safety
+    ///
+    /// The address pointed to by `address` should point to a valid node in memory.
     pub unsafe fn new(address: &TrustedNodeAddress) -> Self {
         ServoLayoutNode::from_layout_js(LayoutDom::from_trusted_node_address(*address))
     }
@@ -109,14 +91,20 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ServoLayoutNode<'dom, LayoutDataType
     }
 
     /// Returns the interior of this node as a `LayoutDom`.
-    pub fn get_jsmanaged(self) -> LayoutDom<'dom, Node> {
+    pub(crate) fn get_jsmanaged(self) -> LayoutDom<'dom, Node> {
         self.node
+    }
+
+    pub(crate) fn assigned_slot(self) -> Option<ServoLayoutElement<'dom>> {
+        self.node
+            .assigned_slot_for_layout()
+            .as_ref()
+            .map(LayoutDom::upcast)
+            .map(ServoLayoutElement::from_layout_js)
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::NodeInfo
-    for ServoLayoutNode<'dom, LayoutDataType>
-{
+impl style::dom::NodeInfo for ServoLayoutNode<'_> {
     fn is_element(&self) -> bool {
         self.node.is_element_for_layout()
     }
@@ -127,12 +115,10 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::NodeInfo
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TNode
-    for ServoLayoutNode<'dom, LayoutDataType>
-{
-    type ConcreteDocument = ServoLayoutDocument<'dom, LayoutDataType>;
-    type ConcreteElement = ServoLayoutElement<'dom, LayoutDataType>;
-    type ConcreteShadowRoot = ServoShadowRoot<'dom, LayoutDataType>;
+impl<'dom> style::dom::TNode for ServoLayoutNode<'dom> {
+    type ConcreteDocument = ServoLayoutDocument<'dom>;
+    type ConcreteElement = ServoLayoutElement<'dom>;
+    type ConcreteShadowRoot = ServoShadowRoot<'dom>;
 
     fn parent_node(&self) -> Option<Self> {
         self.node
@@ -160,7 +146,10 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TNode
         ServoLayoutDocument::from_layout_js(self.node.owner_doc_for_layout())
     }
 
-    fn traversal_parent(&self) -> Option<ServoLayoutElement<'dom, LayoutDataType>> {
+    fn traversal_parent(&self) -> Option<ServoLayoutElement<'dom>> {
+        if let Some(assigned_slot) = self.assigned_slot() {
+            return Some(assigned_slot);
+        }
         let parent = self.parent_node()?;
         if let Some(shadow) = parent.as_shadow_root() {
             return Some(shadow.host());
@@ -176,116 +165,86 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TNode
         self.opaque().0
     }
 
-    fn as_element(&self) -> Option<ServoLayoutElement<'dom, LayoutDataType>> {
+    fn as_element(&self) -> Option<ServoLayoutElement<'dom>> {
         self.node.downcast().map(ServoLayoutElement::from_layout_js)
     }
 
-    fn as_document(&self) -> Option<ServoLayoutDocument<'dom, LayoutDataType>> {
+    fn as_document(&self) -> Option<ServoLayoutDocument<'dom>> {
         self.node
             .downcast()
             .map(ServoLayoutDocument::from_layout_js)
     }
 
-    fn as_shadow_root(&self) -> Option<ServoShadowRoot<'dom, LayoutDataType>> {
+    fn as_shadow_root(&self) -> Option<ServoShadowRoot<'dom>> {
         self.node.downcast().map(ServoShadowRoot::from_layout_js)
     }
 
     fn is_in_document(&self) -> bool {
-        unsafe { self.node.get_flag(NodeFlags::IS_IN_DOC) }
+        unsafe { self.node.get_flag(NodeFlags::IS_IN_A_DOCUMENT_TREE) }
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> LayoutNode<'dom>
-    for ServoLayoutNode<'dom, LayoutDataType>
-{
-    type ConcreteThreadSafeLayoutNode = ServoThreadSafeLayoutNode<'dom, LayoutDataType>;
+impl<'dom> LayoutNode<'dom> for ServoLayoutNode<'dom> {
+    type ConcreteThreadSafeLayoutNode = ServoThreadSafeLayoutNode<'dom>;
 
     fn to_threadsafe(&self) -> Self::ConcreteThreadSafeLayoutNode {
         ServoThreadSafeLayoutNode::new(*self)
     }
 
     fn type_id(&self) -> LayoutNodeType {
-        self.script_type_id().into()
+        NodeTypeIdWrapper(self.script_type_id()).into()
     }
 
-    unsafe fn initialize_data(&self) {
-        if self.get_style_and_opaque_layout_data().is_none() {
-            let opaque = StyleAndOpaqueLayoutData::new(
-                StyleData::new(),
-                AtomicRefCell::new(LayoutDataType::default()),
-            );
-            self.init_style_and_opaque_layout_data(opaque);
-        };
+    unsafe fn initialize_style_and_layout_data<RequestedLayoutDataType: LayoutDataTrait>(&self) {
+        let inner = self.get_jsmanaged();
+        if inner.style_data().is_none() {
+            inner.initialize_style_data();
+        }
+        if inner.layout_data().is_none() {
+            inner.initialize_layout_data(Box::<RequestedLayoutDataType>::default());
+        }
     }
 
-    unsafe fn init_style_and_opaque_layout_data(&self, data: Box<StyleAndOpaqueLayoutData>) {
-        self.get_jsmanaged().init_style_and_opaque_layout_data(data);
-    }
-
-    unsafe fn take_style_and_opaque_layout_data(&self) -> Box<StyleAndOpaqueLayoutData> {
-        self.get_jsmanaged().take_style_and_opaque_layout_data()
+    fn initialize_layout_data<RequestedLayoutDataType: LayoutDataTrait>(&self) {
+        let inner = self.get_jsmanaged();
+        if inner.layout_data().is_none() {
+            unsafe {
+                inner.initialize_layout_data(Box::<RequestedLayoutDataType>::default());
+            }
+        }
     }
 
     fn is_connected(&self) -> bool {
         unsafe { self.node.get_flag(NodeFlags::IS_CONNECTED) }
     }
-}
 
-impl<'dom, LayoutDataType: LayoutDataTrait> GetStyleAndOpaqueLayoutData<'dom>
-    for ServoLayoutNode<'dom, LayoutDataType>
-{
-    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData> {
-        self.get_jsmanaged().get_style_and_opaque_layout_data()
+    fn style_data(&self) -> Option<&'dom StyleData> {
+        self.get_jsmanaged().style_data()
+    }
+
+    fn layout_data(&self) -> Option<&'dom GenericLayoutData> {
+        self.get_jsmanaged().layout_data()
     }
 }
 
 /// A wrapper around a `ServoLayoutNode` that can be used safely on different threads.
 /// It's very important that this never mutate anything except this wrapped node and
 /// never access any other node apart from its parent.
-pub struct ServoThreadSafeLayoutNode<'dom, LayoutDataType: LayoutDataTrait> {
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ServoThreadSafeLayoutNode<'dom> {
     /// The wrapped `ServoLayoutNode`.
-    pub(super) node: ServoLayoutNode<'dom, LayoutDataType>,
+    pub(super) node: ServoLayoutNode<'dom>,
 
     /// The pseudo-element type, with (optionally)
     /// a specified display value to override the stylesheet.
     pub(super) pseudo: PseudoElementType,
 }
 
-// These impls are required because `derive` has trouble with PhantomData.
-// See https://github.com/rust-lang/rust/issues/52079
-impl<'dom, LayoutDataType: LayoutDataTrait> Clone
-    for ServoThreadSafeLayoutNode<'dom, LayoutDataType>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<'dom, LayoutDataType: LayoutDataTrait> Copy
-    for ServoThreadSafeLayoutNode<'dom, LayoutDataType>
-{
-}
-impl<'a, LayoutDataType: LayoutDataTrait> PartialEq
-    for ServoThreadSafeLayoutNode<'a, LayoutDataType>
-{
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.node == other.node
-    }
-}
-
-impl<'lr, LayoutDataType: LayoutDataTrait> fmt::Debug
-    for ServoThreadSafeLayoutNode<'lr, LayoutDataType>
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.node.fmt(f)
-    }
-}
-
-impl<'dom, LayoutDataType: LayoutDataTrait> ServoThreadSafeLayoutNode<'dom, LayoutDataType> {
+impl<'dom> ServoThreadSafeLayoutNode<'dom> {
     /// Creates a new `ServoThreadSafeLayoutNode` from the given `ServoLayoutNode`.
-    pub fn new(node: ServoLayoutNode<'dom, LayoutDataType>) -> Self {
+    pub fn new(node: ServoLayoutNode<'dom>) -> Self {
         ServoThreadSafeLayoutNode {
-            node: node.clone(),
+            node,
             pseudo: PseudoElementType::Normal,
         }
     }
@@ -315,9 +274,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ServoThreadSafeLayoutNode<'dom, Layo
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::NodeInfo
-    for ServoThreadSafeLayoutNode<'dom, LayoutDataType>
-{
+impl style::dom::NodeInfo for ServoThreadSafeLayoutNode<'_> {
     fn is_element(&self) -> bool {
         self.node.is_element()
     }
@@ -327,13 +284,11 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::NodeInfo
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutNode<'dom>
-    for ServoThreadSafeLayoutNode<'dom, LayoutDataType>
-{
-    type ConcreteNode = ServoLayoutNode<'dom, LayoutDataType>;
-    type ConcreteThreadSafeLayoutElement = ServoThreadSafeLayoutElement<'dom, LayoutDataType>;
-    type ConcreteElement = ServoLayoutElement<'dom, LayoutDataType>;
-    type ChildrenIterator = ServoThreadSafeLayoutNodeChildrenIterator<'dom, LayoutDataType>;
+impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
+    type ConcreteNode = ServoLayoutNode<'dom>;
+    type ConcreteThreadSafeLayoutElement = ServoThreadSafeLayoutElement<'dom>;
+    type ConcreteElement = ServoLayoutElement<'dom>;
+    type ChildrenIterator = ServoThreadSafeLayoutNodeChildrenIterator<'dom>;
 
     fn opaque(&self) -> style::dom::OpaqueNode {
         unsafe { self.get_jsmanaged().opaque() }
@@ -366,7 +321,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutNode<'dom>
         style::dom::LayoutIterator(ServoThreadSafeLayoutNodeChildrenIterator::new(*self))
     }
 
-    fn as_element(&self) -> Option<ServoThreadSafeLayoutElement<'dom, LayoutDataType>> {
+    fn as_element(&self) -> Option<ServoThreadSafeLayoutElement<'dom>> {
         self.node
             .as_element()
             .map(|el| ServoThreadSafeLayoutElement {
@@ -375,8 +330,17 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutNode<'dom>
             })
     }
 
-    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData> {
-        self.node.get_style_and_opaque_layout_data()
+    fn as_html_element(&self) -> Option<ServoThreadSafeLayoutElement<'dom>> {
+        self.as_element()
+            .filter(|element| element.element.is_html_element())
+    }
+
+    fn style_data(&self) -> Option<&'dom StyleData> {
+        self.node.style_data()
+    }
+
+    fn layout_data(&self) -> Option<&'dom GenericLayoutData> {
+        self.node.layout_data()
     }
 
     fn is_ignorable_whitespace(&self, context: &SharedStyleContext) -> bool {
@@ -396,15 +360,14 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutNode<'dom>
             //
             // If you implement other values for this property, you will almost certainly
             // want to update this check.
-            !self
-                .style(context)
+            self.style(context)
                 .get_inherited_text()
-                .white_space
-                .preserve_newlines()
+                .white_space_collapse ==
+                WhiteSpaceCollapse::Collapse
         }
     }
 
-    unsafe fn unsafe_get(self) -> Self::ConcreteNode {
+    fn unsafe_get(self) -> Self::ConcreteNode {
         self.node
     }
 
@@ -465,7 +428,16 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutNode<'dom>
         this.iframe_pipeline_id()
     }
 
-    fn get_colspan(&self) -> u32 {
+    fn get_span(&self) -> Option<u32> {
+        unsafe {
+            self.get_jsmanaged()
+                .downcast::<Element>()
+                .unwrap()
+                .get_span()
+        }
+    }
+
+    fn get_colspan(&self) -> Option<u32> {
         unsafe {
             self.get_jsmanaged()
                 .downcast::<Element>()
@@ -474,7 +446,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutNode<'dom>
         }
     }
 
-    fn get_rowspan(&self) -> u32 {
+    fn get_rowspan(&self) -> Option<u32> {
         unsafe {
             self.get_jsmanaged()
                 .downcast::<Element>()
@@ -484,15 +456,13 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutNode<'dom>
     }
 }
 
-pub struct ServoThreadSafeLayoutNodeChildrenIterator<'dom, LayoutDataType: LayoutDataTrait> {
-    current_node: Option<ServoThreadSafeLayoutNode<'dom, LayoutDataType>>,
-    parent_node: ServoThreadSafeLayoutNode<'dom, LayoutDataType>,
+pub struct ServoThreadSafeLayoutNodeChildrenIterator<'dom> {
+    current_node: Option<ServoThreadSafeLayoutNode<'dom>>,
+    parent_node: ServoThreadSafeLayoutNode<'dom>,
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait>
-    ServoThreadSafeLayoutNodeChildrenIterator<'dom, LayoutDataType>
-{
-    pub fn new(parent: ServoThreadSafeLayoutNode<'dom, LayoutDataType>) -> Self {
+impl<'dom> ServoThreadSafeLayoutNodeChildrenIterator<'dom> {
+    pub fn new(parent: ServoThreadSafeLayoutNode<'dom>) -> Self {
         let first_child = match parent.get_pseudo_element_type() {
             PseudoElementType::Normal => parent
                 .get_before_pseudo()
@@ -510,17 +480,15 @@ impl<'dom, LayoutDataType: LayoutDataTrait>
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> Iterator
-    for ServoThreadSafeLayoutNodeChildrenIterator<'dom, LayoutDataType>
-{
-    type Item = ServoThreadSafeLayoutNode<'dom, LayoutDataType>;
-    fn next(&mut self) -> Option<ServoThreadSafeLayoutNode<'dom, LayoutDataType>> {
+impl<'dom> Iterator for ServoThreadSafeLayoutNodeChildrenIterator<'dom> {
+    type Item = ServoThreadSafeLayoutNode<'dom>;
+    fn next(&mut self) -> Option<ServoThreadSafeLayoutNode<'dom>> {
         use selectors::Element;
         match self.parent_node.get_pseudo_element_type() {
             PseudoElementType::Before | PseudoElementType::After => None,
 
             PseudoElementType::DetailsSummary => {
-                let mut current_node = self.current_node.clone();
+                let mut current_node = self.current_node;
                 loop {
                     let next_node = if let Some(ref node) = current_node {
                         if let Some(element) = node.as_element() {
@@ -528,7 +496,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> Iterator
                                 element.has_namespace(&ns!(html))
                             {
                                 self.current_node = None;
-                                return Some(node.clone());
+                                return Some(*node);
                             }
                         }
                         unsafe { node.dangerous_next_sibling() }
@@ -541,7 +509,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> Iterator
             },
 
             PseudoElementType::DetailsContent => {
-                let node = self.current_node.clone();
+                let node = self.current_node;
                 let node = node.and_then(|node| {
                     if node.is_element() &&
                         node.as_element()
@@ -559,7 +527,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> Iterator
             },
 
             PseudoElementType::Normal => {
-                let node = self.current_node.clone();
+                let node = self.current_node;
                 if let Some(ref node) = node {
                     self.current_node = match node.get_pseudo_element_type() {
                         PseudoElementType::Before => self
@@ -579,13 +547,5 @@ impl<'dom, LayoutDataType: LayoutDataTrait> Iterator
                 node
             },
         }
-    }
-}
-
-impl<'dom, LayoutDataType: LayoutDataTrait> GetStyleAndOpaqueLayoutData<'dom>
-    for ServoThreadSafeLayoutNode<'dom, LayoutDataType>
-{
-    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData> {
-        self.node.get_style_and_opaque_layout_data()
     }
 }

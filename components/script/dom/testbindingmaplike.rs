@@ -18,17 +18,22 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::maplike;
+use crate::script_runtime::CanGc;
 
 /// maplike<DOMString, long>
 #[dom_struct]
-pub struct TestBindingMaplike {
+pub(crate) struct TestBindingMaplike {
     reflector: Reflector,
     #[custom_trace]
     internal: DomRefCell<IndexMap<DOMString, i32>>,
 }
 
 impl TestBindingMaplike {
-    fn new(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<TestBindingMaplike> {
+    fn new(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<TestBindingMaplike> {
         reflect_dom_object_with_proto(
             Box::new(TestBindingMaplike {
                 reflector: Reflector::new(),
@@ -36,19 +41,20 @@ impl TestBindingMaplike {
             }),
             global,
             proto,
+            can_gc,
         )
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<TestBindingMaplike>> {
-        Ok(TestBindingMaplike::new(global, proto))
     }
 }
 
-impl TestBindingMaplikeMethods for TestBindingMaplike {
+impl TestBindingMaplikeMethods<crate::DomTypeHolder> for TestBindingMaplike {
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<TestBindingMaplike>> {
+        Ok(TestBindingMaplike::new(global, proto, can_gc))
+    }
+
     fn SetInternal(&self, key: DOMString, value: i32) {
         self.internal.set(key, value)
     }
@@ -81,7 +87,7 @@ impl TestBindingMaplikeMethods for TestBindingMaplike {
 
 // this error is wrong because if we inline Self::Key and Self::Value all errors are gone
 // TODO: FIX THIS
-#[allow(crown::unrooted_must_root)]
+#[cfg_attr(crown, allow(crown::unrooted_must_root))]
 impl Maplike for TestBindingMaplike {
     type Key = DOMString;
     type Value = i32;

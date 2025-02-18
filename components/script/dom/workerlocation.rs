@@ -11,10 +11,11 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::USVString;
 use crate::dom::urlhelper::UrlHelper;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
+use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#worker-locations
 #[dom_struct]
-pub struct WorkerLocation {
+pub(crate) struct WorkerLocation {
     reflector_: Reflector,
     #[no_trace]
     url: ServoUrl,
@@ -24,22 +25,26 @@ impl WorkerLocation {
     fn new_inherited(url: ServoUrl) -> WorkerLocation {
         WorkerLocation {
             reflector_: Reflector::new(),
-            url: url,
+            url,
         }
     }
 
-    pub fn new(global: &WorkerGlobalScope, url: ServoUrl) -> DomRoot<WorkerLocation> {
-        reflect_dom_object(Box::new(WorkerLocation::new_inherited(url)), global)
+    pub(crate) fn new(global: &WorkerGlobalScope, url: ServoUrl) -> DomRoot<WorkerLocation> {
+        reflect_dom_object(
+            Box::new(WorkerLocation::new_inherited(url)),
+            global,
+            CanGc::note(),
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-workerlocation-origin
     #[allow(dead_code)]
-    pub fn origin(&self) -> ImmutableOrigin {
+    pub(crate) fn origin(&self) -> ImmutableOrigin {
         self.url.origin()
     }
 }
 
-impl WorkerLocationMethods for WorkerLocation {
+impl WorkerLocationMethods<crate::DomTypeHolder> for WorkerLocation {
     // https://html.spec.whatwg.org/multipage/#dom-workerlocation-hash
     fn Hash(&self) -> USVString {
         UrlHelper::Hash(&self.url)

@@ -3,9 +3,11 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use euclid::Size2D;
-use script_traits::compositor::{ScrollTree, ScrollTreeNodeId, ScrollableNodeInfo};
 use webrender_api::units::LayoutVector2D;
-use webrender_api::{ExternalScrollId, PipelineId, ScrollLocation, ScrollSensitivity, SpatialId};
+use webrender_api::{ExternalScrollId, PipelineId, ScrollLocation, SpatialId};
+use webrender_traits::display_list::{
+    AxesScrollSensitivity, ScrollSensitivity, ScrollTree, ScrollTreeNodeId, ScrollableNodeInfo,
+};
 
 fn add_mock_scroll_node(tree: &mut ScrollTree) -> ScrollTreeNodeId {
     let pipeline_id = PipelineId(0, 0);
@@ -25,7 +27,10 @@ fn add_mock_scroll_node(tree: &mut ScrollTree) -> ScrollTreeNodeId {
         Some(ScrollableNodeInfo {
             external_id: ExternalScrollId(num_nodes as u64, pipeline_id),
             scrollable_size: Size2D::new(100.0, 100.0),
-            scroll_sensitivity: ScrollSensitivity::ScriptAndInputEvents,
+            scroll_sensitivity: AxesScrollSensitivity {
+                x: ScrollSensitivity::ScriptAndInputEvents,
+                y: ScrollSensitivity::ScriptAndInputEvents,
+            },
             offset: LayoutVector2D::zero(),
         }),
     )
@@ -156,7 +161,10 @@ fn test_scroll_tree_chain_through_overflow_hidden() {
         .scroll_info
         .as_mut()
         .map(|info| {
-            info.scroll_sensitivity = ScrollSensitivity::Script;
+            info.scroll_sensitivity = AxesScrollSensitivity {
+                x: ScrollSensitivity::Script,
+                y: ScrollSensitivity::Script,
+            };
         });
 
     let (scrolled_id, offset) = scroll_tree

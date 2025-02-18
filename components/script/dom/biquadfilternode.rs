@@ -10,9 +10,10 @@ use js::rust::HandleObject;
 use servo_media::audio::biquad_filter_node::{
     BiquadFilterNodeMessage, BiquadFilterNodeOptions, FilterType,
 };
-use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage};
+use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage, AudioNodeType};
 use servo_media::audio::param::ParamType;
 
+use crate::conversions::Convert;
 use crate::dom::audionode::AudioNode;
 use crate::dom::audioparam::AudioParam;
 use crate::dom::baseaudiocontext::BaseAudioContext;
@@ -27,9 +28,10 @@ use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct BiquadFilterNode {
+pub(crate) struct BiquadFilterNode {
     node: AudioNode,
     gain: Dom<AudioParam>,
     frequency: Dom<AudioParam>,
@@ -39,8 +41,8 @@ pub struct BiquadFilterNode {
 }
 
 impl BiquadFilterNode {
-    #[allow(crown::unrooted_must_root)]
-    pub fn new_inherited(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new_inherited(
         window: &Window,
         context: &BaseAudioContext,
         options: &BiquadFilterOptions,
@@ -50,7 +52,7 @@ impl BiquadFilterNode {
                 .parent
                 .unwrap_or(2, ChannelCountMode::Max, ChannelInterpretation::Speakers);
         let filter = Cell::new(options.type_);
-        let options = options.into();
+        let options = options.convert();
         let node = AudioNode::new_inherited(
             AudioNodeInit::BiquadFilterNode(options),
             context,
@@ -62,6 +64,7 @@ impl BiquadFilterNode {
             window,
             context,
             node.node_id(),
+            AudioNodeType::BiquadFilterNode,
             ParamType::Gain,
             AutomationRate::A_rate,
             options.gain, // default value
@@ -72,6 +75,7 @@ impl BiquadFilterNode {
             window,
             context,
             node.node_id(),
+            AudioNodeType::BiquadFilterNode,
             ParamType::Q,
             AutomationRate::A_rate,
             options.q, // default value
@@ -82,6 +86,7 @@ impl BiquadFilterNode {
             window,
             context,
             node.node_id(),
+            AudioNodeType::BiquadFilterNode,
             ParamType::Frequency,
             AutomationRate::A_rate,
             options.frequency, // default value
@@ -92,6 +97,7 @@ impl BiquadFilterNode {
             window,
             context,
             node.node_id(),
+            AudioNodeType::BiquadFilterNode,
             ParamType::Detune,
             AutomationRate::A_rate,
             options.detune, // default value
@@ -108,37 +114,45 @@ impl BiquadFilterNode {
         })
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         context: &BaseAudioContext,
         options: &BiquadFilterOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<BiquadFilterNode>> {
-        Self::new_with_proto(window, None, context, options)
+        Self::new_with_proto(window, None, context, options, can_gc)
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &BiquadFilterOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<BiquadFilterNode>> {
         let node = BiquadFilterNode::new_inherited(window, context, options)?;
-        Ok(reflect_dom_object_with_proto(Box::new(node), window, proto))
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        context: &BaseAudioContext,
-        options: &BiquadFilterOptions,
-    ) -> Fallible<DomRoot<BiquadFilterNode>> {
-        BiquadFilterNode::new_with_proto(window, proto, context, options)
+        Ok(reflect_dom_object_with_proto(
+            Box::new(node),
+            window,
+            proto,
+            can_gc,
+        ))
     }
 }
 
-impl BiquadFilterNodeMethods for BiquadFilterNode {
+impl BiquadFilterNodeMethods<crate::DomTypeHolder> for BiquadFilterNode {
+    // https://webaudio.github.io/web-audio-api/#dom-biquadfilternode-biquadfilternode-context-options
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        context: &BaseAudioContext,
+        options: &BiquadFilterOptions,
+    ) -> Fallible<DomRoot<BiquadFilterNode>> {
+        BiquadFilterNode::new_with_proto(window, proto, context, options, can_gc)
+    }
+
     // https://webaudio.github.io/web-audio-api/#dom-biquadfilternode-gain
     fn Gain(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.gain)
@@ -168,26 +182,26 @@ impl BiquadFilterNodeMethods for BiquadFilterNode {
     fn SetType(&self, filter: BiquadFilterType) {
         self.filter.set(filter);
         self.node.message(AudioNodeMessage::BiquadFilterNode(
-            BiquadFilterNodeMessage::SetFilterType(filter.into()),
+            BiquadFilterNodeMessage::SetFilterType(filter.convert()),
         ));
     }
 }
 
-impl<'a> From<&'a BiquadFilterOptions> for BiquadFilterNodeOptions {
-    fn from(options: &'a BiquadFilterOptions) -> Self {
-        Self {
-            gain: *options.gain,
-            q: *options.Q,
-            frequency: *options.frequency,
-            detune: *options.detune,
-            filter: options.type_.into(),
+impl Convert<BiquadFilterNodeOptions> for &BiquadFilterOptions {
+    fn convert(self) -> BiquadFilterNodeOptions {
+        BiquadFilterNodeOptions {
+            gain: *self.gain,
+            q: *self.Q,
+            frequency: *self.frequency,
+            detune: *self.detune,
+            filter: self.type_.convert(),
         }
     }
 }
 
-impl From<BiquadFilterType> for FilterType {
-    fn from(filter: BiquadFilterType) -> FilterType {
-        match filter {
+impl Convert<FilterType> for BiquadFilterType {
+    fn convert(self) -> FilterType {
+        match self {
             BiquadFilterType::Lowpass => FilterType::LowPass,
             BiquadFilterType::Highpass => FilterType::HighPass,
             BiquadFilterType::Bandpass => FilterType::BandPass,

@@ -17,9 +17,10 @@ use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
 use crate::dom::node::{BindContext, Node, UnbindContext};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLLegendElement {
+pub(crate) struct HTMLLegendElement {
     htmlelement: HTMLElement,
     form_owner: MutNullableDom<HTMLFormElement>,
 }
@@ -36,12 +37,13 @@ impl HTMLLegendElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLLegendElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLLegendElement::new_inherited(
@@ -49,6 +51,7 @@ impl HTMLLegendElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
@@ -59,7 +62,7 @@ impl VirtualMethods for HTMLLegendElement {
     }
 
     fn bind_to_tree(&self, context: &BindContext) {
-        if let Some(ref s) = self.super_type() {
+        if let Some(s) = self.super_type() {
             s.bind_to_tree(context);
         }
 
@@ -83,7 +86,7 @@ impl VirtualMethods for HTMLLegendElement {
     }
 }
 
-impl HTMLLegendElementMethods for HTMLLegendElement {
+impl HTMLLegendElementMethods<crate::DomTypeHolder> for HTMLLegendElement {
     // https://html.spec.whatwg.org/multipage/#dom-legend-form
     fn GetForm(&self) -> Option<DomRoot<HTMLFormElement>> {
         let parent = self.upcast::<Node>().GetParentElement()?;
@@ -103,7 +106,7 @@ impl FormControl for HTMLLegendElement {
         self.form_owner.set(form);
     }
 
-    fn to_element<'a>(&'a self) -> &'a Element {
+    fn to_element(&self) -> &Element {
         self.upcast::<Element>()
     }
 }

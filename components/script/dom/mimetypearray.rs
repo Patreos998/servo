@@ -10,25 +10,30 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::mimetype::MimeType;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MimeTypeArray {
+pub(crate) struct MimeTypeArray {
     reflector_: Reflector,
 }
 
 impl MimeTypeArray {
-    pub fn new_inherited() -> MimeTypeArray {
+    pub(crate) fn new_inherited() -> MimeTypeArray {
         MimeTypeArray {
             reflector_: Reflector::new(),
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<MimeTypeArray> {
-        reflect_dom_object(Box::new(MimeTypeArray::new_inherited()), global)
+    pub(crate) fn new(global: &GlobalScope) -> DomRoot<MimeTypeArray> {
+        reflect_dom_object(
+            Box::new(MimeTypeArray::new_inherited()),
+            global,
+            CanGc::note(),
+        )
     }
 }
 
-impl MimeTypeArrayMethods for MimeTypeArray {
+impl MimeTypeArrayMethods<crate::DomTypeHolder> for MimeTypeArray {
     // https://html.spec.whatwg.org/multipage/#dom-mimetypearray-length
     fn Length(&self) -> u32 {
         0

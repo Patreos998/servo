@@ -15,9 +15,10 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::mediasession::MediaSession;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MediaMetadata {
+pub(crate) struct MediaMetadata {
     reflector_: Reflector,
     session: MutNullableDom<MediaSession>,
     title: DomRefCell<DOMString>,
@@ -36,40 +37,48 @@ impl MediaMetadata {
         }
     }
 
-    pub fn new(global: &Window, init: &MediaMetadataInit) -> DomRoot<MediaMetadata> {
-        Self::new_with_proto(global, None, init)
+    pub(crate) fn new(
+        global: &Window,
+        init: &MediaMetadataInit,
+        can_gc: CanGc,
+    ) -> DomRoot<MediaMetadata> {
+        Self::new_with_proto(global, None, init, can_gc)
     }
 
     fn new_with_proto(
         global: &Window,
         proto: Option<HandleObject>,
         init: &MediaMetadataInit,
+        can_gc: CanGc,
     ) -> DomRoot<MediaMetadata> {
-        reflect_dom_object_with_proto(Box::new(MediaMetadata::new_inherited(init)), global, proto)
-    }
-
-    /// <https://w3c.github.io/mediasession/#dom-mediametadata-mediametadata>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        init: &MediaMetadataInit,
-    ) -> Fallible<DomRoot<MediaMetadata>> {
-        Ok(MediaMetadata::new_with_proto(window, proto, init))
+        reflect_dom_object_with_proto(
+            Box::new(MediaMetadata::new_inherited(init)),
+            global,
+            proto,
+            can_gc,
+        )
     }
 
     fn queue_update_metadata_algorithm(&self) {
-        if self.session.get().is_none() {
-            return;
-        }
+        if self.session.get().is_none() {}
     }
 
-    pub fn set_session(&self, session: &MediaSession) {
-        self.session.set(Some(&session));
+    pub(crate) fn set_session(&self, session: &MediaSession) {
+        self.session.set(Some(session));
     }
 }
 
-impl MediaMetadataMethods for MediaMetadata {
+impl MediaMetadataMethods<crate::DomTypeHolder> for MediaMetadata {
+    /// <https://w3c.github.io/mediasession/#dom-mediametadata-mediametadata>
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        init: &MediaMetadataInit,
+    ) -> Fallible<DomRoot<MediaMetadata>> {
+        Ok(MediaMetadata::new_with_proto(window, proto, init, can_gc))
+    }
+
     /// <https://w3c.github.io/mediasession/#dom-mediametadata-title>
     fn Title(&self) -> DOMString {
         self.title.borrow().clone()

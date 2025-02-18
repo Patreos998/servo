@@ -1,49 +1,47 @@
 [package]
 name = "canvas"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "canvas"
 path = "lib.rs"
 
 [features]
-no-wgl = ["surfman/sm-no-wgl"]
 webgl_backtrace = ["canvas_traits/webgl_backtrace"]
-xr-profile = ["webxr-api/profile", "time"]
+webxr = ["dep:webxr", "dep:webxr-api"]
 
 [dependencies]
+app_units = { workspace = true }
 bitflags = { workspace = true }
 byteorder = { workspace = true }
 canvas_traits = { workspace = true }
 crossbeam-channel = { workspace = true }
 cssparser = { workspace = true }
 euclid = { workspace = true }
-font-kit = "0.11"
 fnv = { workspace = true }
-gfx = { path = "../gfx" }
-gleam = { workspace = true }
+font-kit = "0.14"
+fonts = { path = "../fonts" }
+glow = { workspace = true }
 half = "2"
 ipc-channel = { workspace = true }
 log = { workspace = true }
 lyon_geom = "1.0.4"
+net_traits = { workspace = true }
 num-traits = { workspace = true }
-pathfinder_geometry = "0.5"
 pixels = { path = "../pixels" }
-raqote = "0.8.2"
-servo_arc = { path = "../servo_arc" }
-servo_config = { path = "../config" }
-sparkle = { workspace = true }
-style = { path = "../style" }
-style_traits = { workspace = true }
+range = { path = "../range" }
+raqote = "0.8.5"
+servo_arc = { workspace = true }
+style = { workspace = true }
 surfman = { workspace = true }
-time = { workspace = true, optional = true }
+unicode-script = { workspace = true }
 webrender = { workspace = true }
 webrender_api = { workspace = true }
-webrender_surfman = { path = "../webrender_surfman" }
 webrender_traits = { workspace = true }
-webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
-webxr = { git = "https://github.com/servo/webxr", features = ["ipc"] }
+webxr = { path = "../webxr", features = ["ipc"], optional = true }
+webxr-api = { workspace = true, features = ["ipc"], optional = true }

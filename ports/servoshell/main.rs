@@ -20,52 +20,19 @@
 // mode is turned on.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-cfg_if::cfg_if! {
-    if #[cfg(not(target_os = "android"))] {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        #[macro_use]
-        extern crate sig;
-
-        #[cfg(test)]
-        mod test;
-
-        mod app;
-        mod backtrace;
-        mod browser;
-        mod crash_handler;
-        mod egui_glue;
-        mod embedder;
-        mod events_loop;
-        mod geometry;
-        mod headed_window;
-        mod headless_window;
-        mod keyutils;
-        mod main2;
-        mod minibrowser;
-        mod parser;
-        mod prefs;
-        mod resources;
-        mod window_trait;
-
-        pub mod platform {
-            #[cfg(target_os = "macos")]
-            pub use crate::platform::macos::deinit;
-
-            #[cfg(target_os = "macos")]
-            pub mod macos;
-
-            #[cfg(not(target_os = "macos"))]
-            pub fn deinit(_clean_shutdown: bool) {}
-        }
-
-        pub fn main() {
-            main2::main()
-        }
-    } else {
-        pub fn main() {
+fn main() {
+    cfg_if::cfg_if! {
+        if #[cfg(not(any(target_os = "android", target_env = "ohos")))] {
+            servoshell::main()
+        } else {
+            // Android: see ports/servoshell/egl/android/simpleservo.rs.
+            // OpenHarmony: see ports/servoshell/egl/ohos/simpleservo.rs.
             println!(
-                "Cannot start /ports/servo/ on Android. \
-                 Use /support/android/apk/ + /ports/libsimpleservo/ instead"
+                "Cannot run the servoshell `bin` executable on platforms such as \
+                 Android or OpenHarmony. On these platforms you need to compile \
+                 the servoshell library as a `cdylib` and integrate it with the \
+                 platform app code into an `apk` (android) or `hap` (OpenHarmony).\
+                 For Android `mach build` will do these steps automatically for you."
             );
         }
     }

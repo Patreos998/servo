@@ -2,21 +2,21 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+//! The constellation uses logging to perform crash reporting.
+//! The constellation receives all `warn!`, `error!` and `panic!` messages,
+//! and generates a crash report when it receives a panic.
+
 use std::borrow::ToOwned;
 use std::sync::Arc;
 use std::thread;
 
 use backtrace::Backtrace;
+use base::id::TopLevelBrowsingContextId;
 use compositing_traits::ConstellationMsg as FromCompositorMsg;
 use crossbeam_channel::Sender;
 use log::{Level, LevelFilter, Log, Metadata, Record};
-use msg::constellation_msg::TopLevelBrowsingContextId;
+use parking_lot::ReentrantMutex;
 use script_traits::{LogEntry, ScriptMsg as FromScriptMsg, ScriptToConstellationChan};
-use servo_remutex::ReentrantMutex;
-
-/// The constellation uses logging to perform crash reporting.
-/// The constellation receives all `warn!`, `error!` and `panic!` messages,
-/// and generates a crash report when it receives a panic.
 
 /// A logger directed at the constellation from content processes
 /// #[derive(Clone)]
@@ -24,10 +24,6 @@ pub struct FromScriptLogger {
     /// A channel to the constellation
     pub script_to_constellation_chan: Arc<ReentrantMutex<ScriptToConstellationChan>>,
 }
-
-/// The constellation uses logging to perform crash reporting.
-/// The constellation receives all `warn!`, `error!` and `panic!` messages,
-/// and generates a crash report when it receives a panic.
 
 /// A logger directed at the constellation from content processes
 impl FromScriptLogger {
@@ -55,10 +51,7 @@ impl Log for FromScriptLogger {
         if let Some(entry) = log_entry(record) {
             let thread_name = thread::current().name().map(ToOwned::to_owned);
             let msg = FromScriptMsg::LogEntry(thread_name, entry);
-            let chan = self
-                .script_to_constellation_chan
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
+            let chan = self.script_to_constellation_chan.lock();
             let _ = chan.send(msg);
         }
     }
@@ -97,10 +90,7 @@ impl Log for FromCompositorLogger {
             let top_level_id = TopLevelBrowsingContextId::installed();
             let thread_name = thread::current().name().map(ToOwned::to_owned);
             let msg = FromCompositorMsg::LogEntry(top_level_id, thread_name, entry);
-            let chan = self
-                .constellation_chan
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
+            let chan = self.constellation_chan.lock();
             let _ = chan.send(msg);
         }
     }

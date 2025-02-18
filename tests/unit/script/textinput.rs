@@ -8,12 +8,11 @@
 // except according to those terms.
 
 use keyboard_types::{Key, Modifiers};
-use script::clipboard_provider::ClipboardProvider;
-use script::test::DOMString;
-use script::textinput::{
-    Direction, Lines, Selection, SelectionDirection, TextInput, TextPoint, UTF16CodeUnits,
-    UTF8Bytes,
+use script::test::textinput::{
+    ClipboardProvider, Direction, Lines, Selection, SelectionDirection, TextInput, TextPoint,
+    UTF16CodeUnits, UTF8Bytes,
 };
+use script::test::DOMString;
 
 pub struct DummyClipboardContext {
     content: String,
@@ -28,10 +27,10 @@ impl DummyClipboardContext {
 }
 
 impl ClipboardProvider for DummyClipboardContext {
-    fn clipboard_contents(&mut self) -> String {
-        self.content.clone()
+    fn get_text(&mut self) -> Result<String, String> {
+        Ok(self.content.clone())
     }
-    fn set_clipboard_contents(&mut self, s: String) {
+    fn set_text(&mut self, s: String) {
         self.content = s;
     }
 }

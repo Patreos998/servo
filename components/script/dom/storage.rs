@@ -14,16 +14,16 @@ use crate::dom::bindings::codegen::Bindings::StorageBinding::StorageMethods;
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::storageevent::StorageEvent;
 use crate::dom::window::Window;
-use crate::task_source::TaskSource;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct Storage {
+pub(crate) struct Storage {
     reflector_: Reflector,
     #[no_trace]
     storage_type: StorageType,
@@ -33,12 +33,16 @@ impl Storage {
     fn new_inherited(storage_type: StorageType) -> Storage {
         Storage {
             reflector_: Reflector::new(),
-            storage_type: storage_type,
+            storage_type,
         }
     }
 
-    pub fn new(global: &Window, storage_type: StorageType) -> DomRoot<Storage> {
-        reflect_dom_object(Box::new(Storage::new_inherited(storage_type)), global)
+    pub(crate) fn new(global: &Window, storage_type: StorageType) -> DomRoot<Storage> {
+        reflect_dom_object(
+            Box::new(Storage::new_inherited(storage_type)),
+            global,
+            CanGc::note(),
+        )
     }
 
     fn get_url(&self) -> ServoUrl {
@@ -50,7 +54,7 @@ impl Storage {
     }
 }
 
-impl StorageMethods for Storage {
+impl StorageMethods<crate::DomTypeHolder> for Storage {
     // https://html.spec.whatwg.org/multipage/#dom-storage-length
     fn Length(&self) -> u32 {
         let (sender, receiver) = ipc::channel(self.global().time_profiler_chan().clone()).unwrap();
@@ -195,7 +199,7 @@ impl Storage {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#send-a-storage-notification>
-    pub fn queue_storage_event(
+    pub(crate) fn queue_storage_event(
         &self,
         url: ServoUrl,
         key: Option<String>,
@@ -204,29 +208,24 @@ impl Storage {
     ) {
         let global = self.global();
         let this = Trusted::new(self);
-        global
-            .as_window()
-            .task_manager()
-            .dom_manipulation_task_source()
-            .queue(
-                task!(send_storage_notification: move || {
-                    let this = this.root();
-                    let global = this.global();
-                    let event = StorageEvent::new(
-                        global.as_window(),
-                        atom!("storage"),
-                        EventBubbles::DoesNotBubble,
-                        EventCancelable::NotCancelable,
-                        key.map(DOMString::from),
-                        old_value.map(DOMString::from),
-                        new_value.map(DOMString::from),
-                        DOMString::from(url.into_string()),
-                        Some(&this),
-                    );
-                    event.upcast::<Event>().fire(global.upcast());
-                }),
-                global.upcast(),
-            )
-            .unwrap();
+        global.task_manager().dom_manipulation_task_source().queue(
+            task!(send_storage_notification: move || {
+                let this = this.root();
+                let global = this.global();
+                let event = StorageEvent::new(
+                    global.as_window(),
+                    atom!("storage"),
+                    EventBubbles::DoesNotBubble,
+                    EventCancelable::NotCancelable,
+                    key.map(DOMString::from),
+                    old_value.map(DOMString::from),
+                    new_value.map(DOMString::from),
+                    DOMString::from(url.into_string()),
+                    Some(&this),
+                    CanGc::note()
+                );
+                event.upcast::<Event>().fire(global.upcast(), CanGc::note());
+            }),
+        );
     }
 }

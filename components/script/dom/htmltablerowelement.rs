@@ -2,11 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use cssparser::RGBA;
 use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use js::rust::HandleObject;
-use style::attr::AttrValue;
+use style::attr::{AttrValue, LengthOrPercentageOrAuto};
+use style::color::AbsoluteColor;
 
 use crate::dom::bindings::codegen::Bindings::HTMLTableElementBinding::HTMLTableElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLTableRowElementBinding::HTMLTableRowElementMethods;
@@ -18,25 +18,17 @@ use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmltablecellelement::HTMLTableCellElement;
 use crate::dom::htmltableelement::HTMLTableElement;
 use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
-
-#[derive(JSTraceable)]
-struct CellsFilter;
-impl CollectionFilter for CellsFilter {
-    fn filter(&self, elem: &Element, root: &Node) -> bool {
-        (elem.is::<HTMLTableCellElement>()) &&
-            elem.upcast::<Node>().GetParentNode().as_deref() == Some(root)
-    }
-}
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLTableRowElement {
+pub(crate) struct HTMLTableRowElement {
     htmlelement: HTMLElement,
     cells: MutNullableDom<HTMLCollection>,
 }
@@ -53,12 +45,13 @@ impl HTMLTableRowElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableRowElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableRowElement::new_inherited(
@@ -66,6 +59,7 @@ impl HTMLTableRowElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -82,7 +76,7 @@ impl HTMLTableRowElement {
     }
 }
 
-impl HTMLTableRowElementMethods for HTMLTableRowElement {
+impl HTMLTableRowElementMethods<crate::DomTypeHolder> for HTMLTableRowElement {
     // https://html.spec.whatwg.org/multipage/#dom-tr-bgcolor
     make_getter!(BgColor, "bgcolor");
 
@@ -92,19 +86,24 @@ impl HTMLTableRowElementMethods for HTMLTableRowElement {
     // https://html.spec.whatwg.org/multipage/#dom-tr-cells
     fn Cells(&self) -> DomRoot<HTMLCollection> {
         self.cells.or_init(|| {
-            let window = window_from_node(self);
-            let filter = Box::new(CellsFilter);
-            HTMLCollection::create(&window, self.upcast(), filter)
+            HTMLCollection::new_with_filter_fn(
+                &self.owner_window(),
+                self.upcast(),
+                |element, root| {
+                    (element.is::<HTMLTableCellElement>()) &&
+                        element.upcast::<Node>().GetParentNode().as_deref() == Some(root)
+                },
+            )
         })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-tr-insertcell
-    fn InsertCell(&self, index: i32) -> Fallible<DomRoot<HTMLElement>> {
+    fn InsertCell(&self, index: i32, can_gc: CanGc) -> Fallible<DomRoot<HTMLElement>> {
         let node = self.upcast::<Node>();
         node.insert_cell_or_row(
             index,
             || self.Cells(),
-            || HTMLTableCellElement::new(local_name!("td"), None, &node.owner_doc(), None),
+            || HTMLTableCellElement::new(local_name!("td"), None, &node.owner_doc(), None, can_gc),
         )
     }
 
@@ -152,16 +151,25 @@ impl HTMLTableRowElementMethods for HTMLTableRowElement {
     }
 }
 
-pub trait HTMLTableRowElementLayoutHelpers {
-    fn get_background_color(self) -> Option<RGBA>;
+pub(crate) trait HTMLTableRowElementLayoutHelpers {
+    fn get_background_color(self) -> Option<AbsoluteColor>;
+    fn get_height(self) -> LengthOrPercentageOrAuto;
 }
 
 impl HTMLTableRowElementLayoutHelpers for LayoutDom<'_, HTMLTableRowElement> {
-    fn get_background_color(self) -> Option<RGBA> {
+    fn get_background_color(self) -> Option<AbsoluteColor> {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
             .and_then(AttrValue::as_color)
             .cloned()
+    }
+
+    fn get_height(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 }
 
@@ -173,6 +181,7 @@ impl VirtualMethods for HTMLTableRowElement {
     fn parse_plain_attribute(&self, local_name: &LocalName, value: DOMString) -> AttrValue {
         match *local_name {
             local_name!("bgcolor") => AttrValue::from_legacy_color(value.into()),
+            local_name!("height") => AttrValue::from_dimension(value.into()),
             _ => self
                 .super_type()
                 .unwrap()

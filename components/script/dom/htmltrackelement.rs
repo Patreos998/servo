@@ -17,11 +17,12 @@ use crate::dom::element::Element;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::texttrack::TextTrack;
+use crate::script_runtime::CanGc;
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
 #[repr(u16)]
 #[allow(unused)]
-pub enum ReadyState {
+pub(crate) enum ReadyState {
     None = HTMLTrackElementConstants::NONE,
     Loading = HTMLTrackElementConstants::LOADING,
     Loaded = HTMLTrackElementConstants::LOADED,
@@ -29,7 +30,7 @@ pub enum ReadyState {
 }
 
 #[dom_struct]
-pub struct HTMLTrackElement {
+pub(crate) struct HTMLTrackElement {
     htmlelement: HTMLElement,
     ready_state: ReadyState,
     track: Dom<TextTrack>,
@@ -45,18 +46,19 @@ impl HTMLTrackElement {
         HTMLTrackElement {
             htmlelement: HTMLElement::new_inherited(local_name, prefix, document),
             ready_state: ReadyState::None,
-            track: Dom::from_ref(&track),
+            track: Dom::from_ref(track),
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTrackElement> {
         let track = TextTrack::new(
-            &document.window(),
+            document.window(),
             Default::default(),
             Default::default(),
             Default::default(),
@@ -70,11 +72,12 @@ impl HTMLTrackElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLTrackElementMethods for HTMLTrackElement {
+impl HTMLTrackElementMethods<crate::DomTypeHolder> for HTMLTrackElement {
     // https://html.spec.whatwg.org/multipage/#dom-track-kind
     fn Kind(&self) -> DOMString {
         let element = self.upcast::<Element>();

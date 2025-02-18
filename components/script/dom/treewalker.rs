@@ -16,10 +16,11 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot, MutDom};
 use crate::dom::document::Document;
 use crate::dom::node::Node;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#interface-treewalker
 #[dom_struct]
-pub struct TreeWalker {
+pub(crate) struct TreeWalker {
     reflector_: Reflector,
     root_node: Dom<Node>,
     current_node: MutDom<Node>,
@@ -35,13 +36,13 @@ impl TreeWalker {
             reflector_: Reflector::new(),
             root_node: Dom::from_ref(root_node),
             current_node: MutDom::new(root_node),
-            what_to_show: what_to_show,
-            filter: filter,
+            what_to_show,
+            filter,
             active: Cell::new(false),
         }
     }
 
-    pub fn new_with_filter(
+    pub(crate) fn new_with_filter(
         document: &Document,
         root_node: &Node,
         what_to_show: u32,
@@ -50,10 +51,11 @@ impl TreeWalker {
         reflect_dom_object(
             Box::new(TreeWalker::new_inherited(root_node, what_to_show, filter)),
             document.window(),
+            CanGc::note(),
         )
     }
 
-    pub fn new(
+    pub(crate) fn new(
         document: &Document,
         root_node: &Node,
         what_to_show: u32,
@@ -67,7 +69,7 @@ impl TreeWalker {
     }
 }
 
-impl TreeWalkerMethods for TreeWalker {
+impl TreeWalkerMethods<crate::DomTypeHolder> for TreeWalker {
     // https://dom.spec.whatwg.org/#dom-treewalker-root
     fn Root(&self) -> DomRoot<Node> {
         DomRoot::from_ref(&*self.root_node)
@@ -317,7 +319,7 @@ impl TreeWalker {
                             //     return null."
                             None => return Ok(None),
                             Some(ref parent)
-                                if self.is_root_node(&parent) || self.is_current_node(&parent) =>
+                                if self.is_root_node(parent) || self.is_current_node(parent) =>
                             {
                                 return Ok(None);
                             },
@@ -382,7 +384,7 @@ impl TreeWalker {
             match node.GetParentNode() {
                 // "4. If node is null or is root, return null."
                 None => return Ok(None),
-                Some(ref n) if self.is_root_node(&n) => return Ok(None),
+                Some(ref n) if self.is_root_node(n) => return Ok(None),
                 // "5. Filter node and if the return value is FILTER_ACCEPT, then return null."
                 Some(n) => {
                     node = n;
@@ -454,7 +456,7 @@ impl TreeWalker {
     }
 }
 
-impl<'a> Iterator for &'a TreeWalker {
+impl Iterator for &TreeWalker {
     type Item = DomRoot<Node>;
 
     fn next(&mut self) -> Option<DomRoot<Node>> {
@@ -474,7 +476,7 @@ impl<'a> Iterator for &'a TreeWalker {
 }
 
 #[derive(JSTraceable)]
-pub enum Filter {
+pub(crate) enum Filter {
     None,
     Dom(Rc<NodeFilter>),
 }

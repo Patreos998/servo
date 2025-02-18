@@ -10,7 +10,7 @@ use crate::dom::bindings::codegen::Bindings::HTMLFormControlsCollectionBinding::
 use crate::dom::bindings::codegen::Bindings::NodeBinding::{GetRootNodeOptions, NodeMethods};
 use crate::dom::bindings::codegen::UnionTypes::RadioNodeListOrElement;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::Element;
@@ -19,9 +19,10 @@ use crate::dom::htmlformelement::HTMLFormElement;
 use crate::dom::node::Node;
 use crate::dom::radionodelist::RadioNodeList;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLFormControlsCollection {
+pub(crate) struct HTMLFormControlsCollection {
     collection: HTMLCollection,
     form: Dom<HTMLFormElement>,
 }
@@ -35,12 +36,12 @@ impl HTMLFormControlsCollection {
             .upcast::<Node>()
             .GetRootNode(&GetRootNodeOptions::empty());
         HTMLFormControlsCollection {
-            collection: HTMLCollection::new_inherited(&*root_of_form, filter),
+            collection: HTMLCollection::new_inherited(&root_of_form, filter),
             form: Dom::from_ref(form),
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         form: &HTMLFormElement,
         filter: Box<dyn CollectionFilter + 'static>,
@@ -48,18 +49,19 @@ impl HTMLFormControlsCollection {
         reflect_dom_object(
             Box::new(HTMLFormControlsCollection::new_inherited(form, filter)),
             window,
+            CanGc::note(),
         )
-    }
-
-    // FIXME: This shouldn't need to be implemented here since HTMLCollection (the parent of
-    // HTMLFormControlsCollection) implements Length
-    #[allow(non_snake_case)]
-    pub fn Length(&self) -> u32 {
-        self.collection.Length()
     }
 }
 
-impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
+impl HTMLFormControlsCollectionMethods<crate::DomTypeHolder> for HTMLFormControlsCollection {
+    // FIXME: This shouldn't need to be implemented here since HTMLCollection (the parent of
+    // HTMLFormControlsCollection) implements Length
+    // https://dom.spec.whatwg.org/#dom-htmlcollection-length
+    fn Length(&self) -> u32 {
+        self.collection.Length()
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-htmlformcontrolscollection-nameditem
     fn NamedItem(&self, name: DOMString) -> Option<RadioNodeListOrElement> {
         // Step 1
@@ -70,8 +72,8 @@ impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
         let name = Atom::from(name);
 
         let mut filter_map = self.collection.elements_iter().filter_map(|elem| {
-            if elem.get_name().map_or(false, |n| n == name) ||
-                elem.get_id().map_or(false, |i| i == name)
+            if elem.get_name().is_some_and(|n| n == name) ||
+                elem.get_id().is_some_and(|i| i == name)
             {
                 Some(elem)
             } else {
@@ -92,7 +94,7 @@ impl HTMLFormControlsCollectionMethods for HTMLFormControlsCollection {
                 // specifically HTMLFormElement::Elements(),
                 // and the collection filter excludes image inputs.
                 Some(RadioNodeListOrElement::RadioNodeList(
-                    RadioNodeList::new_controls_except_image_inputs(window, &*self.form, &name),
+                    RadioNodeList::new_controls_except_image_inputs(window, &self.form, &name),
                 ))
             }
         // Step 3

@@ -5,12 +5,12 @@
 use dom_struct::dom_struct;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, SharedRwLock};
-use style::stylesheets::CssRules as StyleCssRules;
+use style::stylesheets::{CssRuleType, CssRuleTypes, CssRules as StyleCssRules};
 
 use crate::dom::bindings::codegen::Bindings::CSSGroupingRuleBinding::CSSGroupingRuleMethods;
 use crate::dom::bindings::error::{ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssrule::CSSRule;
@@ -18,7 +18,7 @@ use crate::dom::cssrulelist::{CSSRuleList, RulesSource};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 
 #[dom_struct]
-pub struct CSSGroupingRule {
+pub(crate) struct CSSGroupingRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -27,13 +27,13 @@ pub struct CSSGroupingRule {
 }
 
 impl CSSGroupingRule {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         parent_stylesheet: &CSSStyleSheet,
         rules: Arc<Locked<StyleCssRules>>,
     ) -> CSSGroupingRule {
         CSSGroupingRule {
             cssrule: CSSRule::new_inherited(parent_stylesheet),
-            rules: rules,
+            rules,
             rulelist: MutNullableDom::new(None),
         }
     }
@@ -49,16 +49,16 @@ impl CSSGroupingRule {
         })
     }
 
-    pub fn parent_stylesheet(&self) -> &CSSStyleSheet {
+    pub(crate) fn parent_stylesheet(&self) -> &CSSStyleSheet {
         self.cssrule.parent_stylesheet()
     }
 
-    pub fn shared_lock(&self) -> &SharedRwLock {
+    pub(crate) fn shared_lock(&self) -> &SharedRwLock {
         self.cssrule.shared_lock()
     }
 }
 
-impl CSSGroupingRuleMethods for CSSGroupingRule {
+impl CSSGroupingRuleMethods<crate::DomTypeHolder> for CSSGroupingRule {
     // https://drafts.csswg.org/cssom/#dom-cssgroupingrule-cssrules
     fn CssRules(&self) -> DomRoot<CSSRuleList> {
         // XXXManishearth check origin clean flag
@@ -67,7 +67,19 @@ impl CSSGroupingRuleMethods for CSSGroupingRule {
 
     // https://drafts.csswg.org/cssom/#dom-cssgroupingrule-insertrule
     fn InsertRule(&self, rule: DOMString, index: u32) -> Fallible<u32> {
-        self.rulelist().insert_rule(&rule, index, /* nested */ true)
+        // TODO: this should accumulate the rule types of all ancestors.
+        let rule_type = self.cssrule.as_specific().ty();
+        let containing_rule_types = CssRuleTypes::from(rule_type);
+        let parse_relative_rule_type = match rule_type {
+            CssRuleType::Style | CssRuleType::Scope => Some(rule_type),
+            _ => None,
+        };
+        self.rulelist().insert_rule(
+            &rule,
+            index,
+            containing_rule_types,
+            parse_relative_rule_type,
+        )
     }
 
     // https://drafts.csswg.org/cssom/#dom-cssgroupingrule-deleterule

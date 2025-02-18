@@ -7,23 +7,23 @@ use std::cell::Cell;
 use dom_struct::dom_struct;
 use servo_arc::Arc;
 use style::shared_lock::SharedRwLock;
-use style::stylesheets::Stylesheet as StyleStyleSheet;
+use style::stylesheets::{CssRuleTypes, Stylesheet as StyleStyleSheet};
 
 use crate::dom::bindings::codegen::Bindings::CSSStyleSheetBinding::CSSStyleSheetMethods;
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
-use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssrulelist::{CSSRuleList, RulesSource};
 use crate::dom::element::Element;
 use crate::dom::medialist::MediaList;
-use crate::dom::node::{stylesheets_owner_from_node, Node};
+use crate::dom::node::NodeTraits;
 use crate::dom::stylesheet::StyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CSSStyleSheet {
+pub(crate) struct CSSStyleSheet {
     stylesheet: StyleSheet,
     owner: MutNullableDom<Element>,
     rulelist: MutNullableDom<CSSRuleList>,
@@ -50,8 +50,8 @@ impl CSSStyleSheet {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         owner: &Element,
         type_: DOMString,
@@ -64,6 +64,7 @@ impl CSSStyleSheet {
                 owner, type_, href, title, stylesheet,
             )),
             window,
+            CanGc::note(),
         )
     }
 
@@ -74,38 +75,40 @@ impl CSSStyleSheet {
         })
     }
 
-    pub fn disabled(&self) -> bool {
+    pub(crate) fn disabled(&self) -> bool {
         self.style_stylesheet.disabled()
     }
 
-    pub fn get_owner(&self) -> Option<DomRoot<Element>> {
+    pub(crate) fn get_owner(&self) -> Option<DomRoot<Element>> {
         self.owner.get()
     }
 
-    pub fn set_disabled(&self, disabled: bool) {
+    pub(crate) fn set_disabled(&self, disabled: bool) {
         if self.style_stylesheet.set_disabled(disabled) && self.get_owner().is_some() {
-            stylesheets_owner_from_node(self.get_owner().unwrap().upcast::<Node>())
+            self.get_owner()
+                .unwrap()
+                .stylesheet_list_owner()
                 .invalidate_stylesheets();
         }
     }
 
-    pub fn set_owner(&self, value: Option<&Element>) {
+    pub(crate) fn set_owner(&self, value: Option<&Element>) {
         self.owner.set(value);
     }
 
-    pub fn shared_lock(&self) -> &SharedRwLock {
+    pub(crate) fn shared_lock(&self) -> &SharedRwLock {
         &self.style_stylesheet.shared_lock
     }
 
-    pub fn style_stylesheet(&self) -> &StyleStyleSheet {
+    pub(crate) fn style_stylesheet(&self) -> &StyleStyleSheet {
         &self.style_stylesheet
     }
 
-    pub fn set_origin_clean(&self, origin_clean: bool) {
+    pub(crate) fn set_origin_clean(&self, origin_clean: bool) {
         self.origin_clean.set(origin_clean);
     }
 
-    pub fn medialist(&self) -> DomRoot<MediaList> {
+    pub(crate) fn medialist(&self) -> DomRoot<MediaList> {
         MediaList::new(
             self.global().as_window(),
             self,
@@ -114,7 +117,7 @@ impl CSSStyleSheet {
     }
 }
 
-impl CSSStyleSheetMethods for CSSStyleSheet {
+impl CSSStyleSheetMethods<crate::DomTypeHolder> for CSSStyleSheet {
     // https://drafts.csswg.org/cssom/#dom-cssstylesheet-cssrules
     fn GetCssRules(&self) -> Fallible<DomRoot<CSSRuleList>> {
         if !self.origin_clean.get() {
@@ -129,7 +132,7 @@ impl CSSStyleSheetMethods for CSSStyleSheet {
             return Err(Error::Security);
         }
         self.rulelist()
-            .insert_rule(&rule, index, /* nested */ false)
+            .insert_rule(&rule, index, CssRuleTypes::default(), None)
     }
 
     // https://drafts.csswg.org/cssom/#dom-cssstylesheet-deleterule

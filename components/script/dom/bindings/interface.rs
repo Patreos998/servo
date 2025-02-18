@@ -5,6 +5,7 @@
 //! Machinery to initialise interface prototype objects and interface objects.
 
 use std::convert::TryFrom;
+use std::ffi::CStr;
 use std::ptr;
 
 use js::error::throw_type_error;
@@ -39,65 +40,64 @@ use crate::dom::bindings::conversions::{get_dom_class, DOM_OBJECT_SLOT};
 use crate::dom::bindings::guard::Guard;
 use crate::dom::bindings::principals::ServoJSPrincipals;
 use crate::dom::bindings::utils::{
-    callargs_is_constructing, get_proto_or_iface_array, DOMJSClass, ProtoOrIfaceArray,
-    DOM_PROTOTYPE_SLOT, JSCLASS_DOM_GLOBAL,
+    get_proto_or_iface_array, DOMJSClass, ProtoOrIfaceArray, DOM_PROTOTYPE_SLOT, JSCLASS_DOM_GLOBAL,
 };
 use crate::script_runtime::JSContext as SafeJSContext;
 
 /// The class of a non-callback interface object.
 #[derive(Clone, Copy)]
-pub struct NonCallbackInterfaceObjectClass {
+pub(crate) struct NonCallbackInterfaceObjectClass {
     /// The SpiderMonkey class structure.
-    pub class: JSClass,
+    pub(crate) _class: JSClass,
     /// The prototype id of that interface, used in the hasInstance hook.
-    pub proto_id: PrototypeList::ID,
+    pub(crate) _proto_id: PrototypeList::ID,
     /// The prototype depth of that interface, used in the hasInstance hook.
-    pub proto_depth: u16,
+    pub(crate) _proto_depth: u16,
     /// The string representation of the object.
-    pub representation: &'static [u8],
+    pub(crate) representation: &'static [u8],
 }
 
 unsafe impl Sync for NonCallbackInterfaceObjectClass {}
 
 impl NonCallbackInterfaceObjectClass {
     /// Create a new `NonCallbackInterfaceObjectClass` structure.
-    pub const fn new(
+    pub(crate) const fn new(
         constructor_behavior: &'static InterfaceConstructorBehavior,
         string_rep: &'static [u8],
         proto_id: PrototypeList::ID,
         proto_depth: u16,
     ) -> NonCallbackInterfaceObjectClass {
         NonCallbackInterfaceObjectClass {
-            class: JSClass {
-                name: b"Function\0" as *const _ as *const libc::c_char,
+            _class: JSClass {
+                name: c"Function".as_ptr(),
                 flags: 0,
                 cOps: &constructor_behavior.0,
                 spec: 0 as *const _,
                 ext: 0 as *const _,
                 oOps: &OBJECT_OPS,
             },
-            proto_id: proto_id,
-            proto_depth: proto_depth,
+            _proto_id: proto_id,
+            _proto_depth: proto_depth,
             representation: string_rep,
         }
     }
 
     /// cast own reference to `JSClass` reference
-    pub fn as_jsclass(&self) -> &JSClass {
+    pub(crate) fn as_jsclass(&self) -> &JSClass {
         unsafe { &*(self as *const _ as *const JSClass) }
     }
 }
 
 /// A constructor class hook.
-pub type ConstructorClassHook =
+pub(crate) type ConstructorClassHook =
     unsafe extern "C" fn(cx: *mut JSContext, argc: u32, vp: *mut Value) -> bool;
 
 /// The constructor behavior of a non-callback interface object.
-pub struct InterfaceConstructorBehavior(JSClassOps);
+pub(crate) struct InterfaceConstructorBehavior(JSClassOps);
 
 impl InterfaceConstructorBehavior {
     /// An interface constructor that unconditionally throws a type error.
-    pub const fn throw() -> Self {
+    pub(crate) const fn throw() -> Self {
         InterfaceConstructorBehavior(JSClassOps {
             addProperty: None,
             delProperty: None,
@@ -113,7 +113,7 @@ impl InterfaceConstructorBehavior {
     }
 
     /// An interface constructor that calls a native Rust function.
-    pub const fn call(hook: ConstructorClassHook) -> Self {
+    pub(crate) const fn call(hook: ConstructorClassHook) -> Self {
         InterfaceConstructorBehavior(JSClassOps {
             addProperty: None,
             delProperty: None,
@@ -130,10 +130,10 @@ impl InterfaceConstructorBehavior {
 }
 
 /// A trace hook.
-pub type TraceHook = unsafe extern "C" fn(trc: *mut JSTracer, obj: *mut JSObject);
+pub(crate) type TraceHook = unsafe extern "C" fn(trc: *mut JSTracer, obj: *mut JSObject);
 
 /// Create a global object with the given class.
-pub unsafe fn create_global_object(
+pub(crate) unsafe fn create_global_object(
     cx: SafeJSContext,
     class: &'static JSClass,
     private: *const libc::c_void,
@@ -146,7 +146,6 @@ pub unsafe fn create_global_object(
     let mut options = RealmOptions::default();
     options.creationOptions_.traceGlobal_ = Some(trace);
     options.creationOptions_.sharedMemoryAndAtomics_ = false;
-    options.creationOptions_.streams_ = true;
     select_compartment(cx, &mut options);
 
     let principal = ServoJSPrincipals::new(origin);
@@ -165,7 +164,7 @@ pub unsafe fn create_global_object(
     let private_val = PrivateValue(private);
     JS_SetReservedSlot(rval.get(), DOM_OBJECT_SLOT, &private_val);
     let proto_array: Box<ProtoOrIfaceArray> =
-        Box::new([0 as *mut JSObject; PrototypeList::PROTO_OR_IFACE_LENGTH]);
+        Box::new([ptr::null_mut::<JSObject>(); PrototypeList::PROTO_OR_IFACE_LENGTH]);
     let val = PrivateValue(Box::into_raw(proto_array) as *const libc::c_void);
     JS_SetReservedSlot(rval.get(), DOM_PROTOTYPE_SLOT, &val);
 
@@ -211,11 +210,11 @@ fn select_compartment(cx: SafeJSContext, options: &mut RealmOptions) {
 }
 
 /// Create and define the interface object of a callback interface.
-pub fn create_callback_interface_object(
+pub(crate) fn create_callback_interface_object(
     cx: SafeJSContext,
     global: HandleObject,
     constants: &[Guard<&[ConstantSpec]>],
-    name: &[u8],
+    name: &CStr,
     mut rval: MutableHandleObject,
 ) {
     assert!(!constants.is_empty());
@@ -229,7 +228,8 @@ pub fn create_callback_interface_object(
 }
 
 /// Create the interface prototype object of a non-callback interface.
-pub fn create_interface_prototype_object(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_interface_prototype_object(
     cx: SafeJSContext,
     global: HandleObject,
     proto: HandleObject,
@@ -237,7 +237,7 @@ pub fn create_interface_prototype_object(
     regular_methods: &[Guard<&'static [JSFunctionSpec]>],
     regular_properties: &[Guard<&'static [JSPropertySpec]>],
     constants: &[Guard<&[ConstantSpec]>],
-    unscopable_names: &[&[u8]],
+    unscopable_names: &[&CStr],
     rval: MutableHandleObject,
 ) {
     create_object(
@@ -273,7 +273,8 @@ pub fn create_interface_prototype_object(
 }
 
 /// Create and define the interface object of a non-callback interface.
-pub fn create_noncallback_interface_object(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_noncallback_interface_object(
     cx: SafeJSContext,
     global: HandleObject,
     proto: HandleObject,
@@ -282,9 +283,9 @@ pub fn create_noncallback_interface_object(
     static_properties: &[Guard<&'static [JSPropertySpec]>],
     constants: &[Guard<&[ConstantSpec]>],
     interface_prototype_object: HandleObject,
-    name: &[u8],
+    name: &CStr,
     length: u32,
-    legacy_window_alias_names: &[&[u8]],
+    legacy_window_alias_names: &[&CStr],
     rval: MutableHandleObject,
 ) {
     create_object(
@@ -316,25 +317,17 @@ pub fn create_noncallback_interface_object(
 }
 
 /// Create and define the named constructors of a non-callback interface.
-pub fn create_named_constructors(
+pub(crate) fn create_named_constructors(
     cx: SafeJSContext,
     global: HandleObject,
-    named_constructors: &[(ConstructorClassHook, &[u8], u32)],
+    named_constructors: &[(ConstructorClassHook, &CStr, u32)],
     interface_prototype_object: HandleObject,
 ) {
     rooted!(in(*cx) let mut constructor = ptr::null_mut::<JSObject>());
 
     for &(native, name, arity) in named_constructors {
-        assert_eq!(*name.last().unwrap(), b'\0');
-
         unsafe {
-            let fun = JS_NewFunction(
-                *cx,
-                Some(native),
-                arity,
-                JSFUN_CONSTRUCTOR,
-                name.as_ptr() as *const libc::c_char,
-            );
+            let fun = JS_NewFunction(*cx, Some(native), arity, JSFUN_CONSTRUCTOR, name.as_ptr());
             assert!(!fun.is_null());
             constructor.set(JS_GetFunctionObject(fun));
             assert!(!constructor.is_null());
@@ -342,7 +335,7 @@ pub fn create_named_constructors(
             assert!(JS_DefineProperty3(
                 *cx,
                 constructor.handle(),
-                b"prototype\0".as_ptr() as *const libc::c_char,
+                c"prototype".as_ptr(),
                 interface_prototype_object,
                 (JSPROP_PERMANENT | JSPROP_READONLY) as u32
             ));
@@ -353,7 +346,8 @@ pub fn create_named_constructors(
 }
 
 /// Create a new object with a unique type.
-pub fn create_object(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_object(
     cx: SafeJSContext,
     global: HandleObject,
     proto: HandleObject,
@@ -373,7 +367,7 @@ pub fn create_object(
 }
 
 /// Conditionally define constants on an object.
-pub fn define_guarded_constants(
+pub(crate) fn define_guarded_constants(
     cx: SafeJSContext,
     obj: HandleObject,
     constants: &[Guard<&[ConstantSpec]>],
@@ -387,7 +381,7 @@ pub fn define_guarded_constants(
 }
 
 /// Conditionally define methods on an object.
-pub fn define_guarded_methods(
+pub(crate) fn define_guarded_methods(
     cx: SafeJSContext,
     obj: HandleObject,
     methods: &[Guard<&'static [JSFunctionSpec]>],
@@ -403,7 +397,7 @@ pub fn define_guarded_methods(
 }
 
 /// Conditionally define properties on an object.
-pub fn define_guarded_properties(
+pub(crate) fn define_guarded_properties(
     cx: SafeJSContext,
     obj: HandleObject,
     properties: &[Guard<&'static [JSPropertySpec]>],
@@ -420,7 +414,7 @@ pub fn define_guarded_properties(
 
 /// Returns whether an interface with exposure set given by `globals` should
 /// be exposed in the global object `obj`.
-pub fn is_exposed_in(object: HandleObject, globals: Globals) -> bool {
+pub(crate) fn is_exposed_in(object: HandleObject, globals: Globals) -> bool {
     unsafe {
         let unwrapped = UncheckedUnwrapObject(object.get(), /* stopAtWindowProxy = */ false);
         let dom_class = get_dom_class(unwrapped).unwrap();
@@ -430,18 +424,17 @@ pub fn is_exposed_in(object: HandleObject, globals: Globals) -> bool {
 
 /// Define a property with a given name on the global object. Should be called
 /// through the resolve hook.
-pub fn define_on_global_object(
+pub(crate) fn define_on_global_object(
     cx: SafeJSContext,
     global: HandleObject,
-    name: &[u8],
+    name: &CStr,
     obj: HandleObject,
 ) {
-    assert_eq!(*name.last().unwrap(), b'\0');
     unsafe {
         assert!(JS_DefineProperty3(
             *cx,
             global,
-            name.as_ptr() as *const libc::c_char,
+            name.as_ptr(),
             obj,
             JSPROP_RESOLVING
         ));
@@ -474,18 +467,17 @@ unsafe extern "C" fn fun_to_string_hook(
     ret
 }
 
-fn create_unscopable_object(cx: SafeJSContext, names: &[&[u8]], mut rval: MutableHandleObject) {
+fn create_unscopable_object(cx: SafeJSContext, names: &[&CStr], mut rval: MutableHandleObject) {
     assert!(!names.is_empty());
     assert!(rval.is_null());
     unsafe {
         rval.set(JS_NewPlainObject(*cx));
         assert!(!rval.is_null());
         for &name in names {
-            assert_eq!(*name.last().unwrap(), b'\0');
             assert!(JS_DefineProperty(
                 *cx,
                 rval.handle(),
-                name.as_ptr() as *const libc::c_char,
+                name.as_ptr(),
                 HandleValue::from_raw(TrueHandleValue),
                 JSPROP_READONLY as u32,
             ));
@@ -493,16 +485,15 @@ fn create_unscopable_object(cx: SafeJSContext, names: &[&[u8]], mut rval: Mutabl
     }
 }
 
-fn define_name(cx: SafeJSContext, obj: HandleObject, name: &[u8]) {
-    assert_eq!(*name.last().unwrap(), b'\0');
+fn define_name(cx: SafeJSContext, obj: HandleObject, name: &CStr) {
     unsafe {
-        rooted!(in(*cx) let name = JS_AtomizeAndPinString(*cx, name.as_ptr() as *const libc::c_char));
+        rooted!(in(*cx) let name = JS_AtomizeAndPinString(*cx, name.as_ptr()));
         assert!(!name.is_null());
         assert!(JS_DefineProperty4(
             *cx,
             obj,
-            b"name\0".as_ptr() as *const libc::c_char,
-            name.handle().into(),
+            c"name".as_ptr(),
+            name.handle(),
             JSPROP_READONLY as u32
         ));
     }
@@ -513,7 +504,7 @@ fn define_length(cx: SafeJSContext, obj: HandleObject, length: i32) {
         assert!(JS_DefineProperty5(
             *cx,
             obj,
-            b"length\0".as_ptr() as *const libc::c_char,
+            c"length".as_ptr(),
             length,
             JSPROP_READONLY as u32
         ));
@@ -538,21 +529,21 @@ unsafe extern "C" fn non_new_constructor(
     false
 }
 
-pub enum ProtoOrIfaceIndex {
+pub(crate) enum ProtoOrIfaceIndex {
     ID(PrototypeList::ID),
     Constructor(PrototypeList::Constructor),
 }
 
-impl Into<usize> for ProtoOrIfaceIndex {
-    fn into(self) -> usize {
-        match self {
+impl From<ProtoOrIfaceIndex> for usize {
+    fn from(index: ProtoOrIfaceIndex) -> usize {
+        match index {
             ProtoOrIfaceIndex::ID(id) => id as usize,
             ProtoOrIfaceIndex::Constructor(constructor) => constructor as usize,
         }
     }
 }
 
-pub fn get_per_interface_object_handle(
+pub(crate) fn get_per_interface_object_handle(
     cx: SafeJSContext,
     global: HandleObject,
     id: ProtoOrIfaceIndex,
@@ -576,7 +567,7 @@ pub fn get_per_interface_object_handle(
     }
 }
 
-pub fn define_dom_interface(
+pub(crate) fn define_dom_interface(
     cx: SafeJSContext,
     global: HandleObject,
     id: ProtoOrIfaceIndex,
@@ -602,11 +593,11 @@ fn get_proto_id_for_new_target(new_target: HandleObject) -> Option<PrototypeList
             let dom_class = &(*domjsclass).dom_class;
             return Some(dom_class.interface_chain[dom_class.depth as usize]);
         }
-        return None;
+        None
     }
 }
 
-pub fn get_desired_proto(
+pub(crate) fn get_desired_proto(
     cx: SafeJSContext,
     args: &CallArgs,
     proto_id: PrototypeList::ID,
@@ -618,7 +609,7 @@ pub fn get_desired_proto(
         // https://heycam.github.io/webidl/#internally-create-a-new-object-implementing-the-interface
         // step 3.
 
-        assert!(callargs_is_constructing(args));
+        assert!(args.is_constructing());
 
         // The desired prototype depends on the actual constructor that was invoked,
         // which is passed to us as the newTarget in the callargs.  We want to do
@@ -638,7 +629,7 @@ pub fn get_desired_proto(
             // constructor.  CheckedUnwrapStatic is fine here, because we're looking for
             // DOM constructors and those can't be cross-origin objects.
             *new_target = CheckedUnwrapStatic(*new_target);
-            if !new_target.is_null() && &*new_target != &*original_new_target {
+            if !new_target.is_null() && *new_target != *original_new_target {
                 get_proto_id_for_new_target(new_target.handle())
             } else {
                 None
@@ -649,10 +640,8 @@ pub fn get_desired_proto(
             let global = GetNonCCWObjectGlobal(*new_target);
             let proto_or_iface_cache = get_proto_or_iface_array(global);
             desired_proto.set((*proto_or_iface_cache)[proto_id as usize]);
-            if &*new_target != &*original_new_target {
-                if !JS_WrapObject(*cx, desired_proto.into()) {
-                    return Err(());
-                }
+            if *new_target != *original_new_target && !JS_WrapObject(*cx, desired_proto.into()) {
+                return Err(());
             }
             return Ok(());
         }
@@ -665,7 +654,7 @@ pub fn get_desired_proto(
         if !JS_GetProperty(
             *cx,
             original_new_target.handle().into(),
-            b"prototype\0".as_ptr() as *const libc::c_char,
+            c"prototype".as_ptr(),
             proto_val.handle_mut().into(),
         ) {
             return Err(());
@@ -700,6 +689,6 @@ pub fn get_desired_proto(
         }
 
         maybe_wrap_object(*cx, desired_proto);
-        return Ok(());
+        Ok(())
     }
 }

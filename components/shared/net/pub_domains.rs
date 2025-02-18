@@ -16,33 +16,31 @@
 
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::sync::LazyLock;
 
 use embedder_traits::resources::{self, Resource};
-use lazy_static::lazy_static;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PubDomainRules {
     rules: HashSet<String>,
     wildcards: HashSet<String>,
     exceptions: HashSet<String>,
 }
 
-lazy_static! {
-    static ref PUB_DOMAINS: PubDomainRules = load_pub_domains();
-}
+static PUB_DOMAINS: LazyLock<PubDomainRules> = LazyLock::new(load_pub_domains);
 
 impl<'a> FromIterator<&'a str> for PubDomainRules {
     fn from_iter<T>(iter: T) -> Self
     where
         T: IntoIterator<Item = &'a str>,
     {
-        let mut result = PubDomainRules::new();
+        let mut result = PubDomainRules::default();
         for item in iter {
-            if item.starts_with("!") {
-                result.exceptions.insert(String::from(&item[1..]));
-            } else if item.starts_with("*.") {
-                result.wildcards.insert(String::from(&item[2..]));
+            if let Some(stripped) = item.strip_prefix('!') {
+                result.exceptions.insert(String::from(stripped));
+            } else if let Some(stripped) = item.strip_prefix("*.") {
+                result.wildcards.insert(String::from(stripped));
             } else {
                 result.rules.insert(String::from(item));
             }
@@ -52,13 +50,6 @@ impl<'a> FromIterator<&'a str> for PubDomainRules {
 }
 
 impl PubDomainRules {
-    pub fn new() -> PubDomainRules {
-        PubDomainRules {
-            rules: HashSet::new(),
-            wildcards: HashSet::new(),
-            exceptions: HashSet::new(),
-        }
-    }
     pub fn parse(content: &str) -> PubDomainRules {
         content
             .lines()
@@ -68,23 +59,21 @@ impl PubDomainRules {
             .collect()
     }
     fn suffix_pair<'a>(&self, domain: &'a str) -> (&'a str, &'a str) {
-        let domain = domain.trim_start_matches(".");
+        let domain = domain.trim_start_matches('.');
         let mut suffix = domain;
         let mut prev_suffix = domain;
-        for (index, _) in domain.match_indices(".") {
+        for (index, _) in domain.match_indices('.') {
             let next_suffix = &domain[index + 1..];
             if self.exceptions.contains(suffix) {
                 return (next_suffix, suffix);
-            } else if self.wildcards.contains(next_suffix) {
-                return (suffix, prev_suffix);
-            } else if self.rules.contains(suffix) {
-                return (suffix, prev_suffix);
-            } else {
-                prev_suffix = suffix;
-                suffix = next_suffix;
             }
+            if self.wildcards.contains(next_suffix) || self.rules.contains(suffix) {
+                return (suffix, prev_suffix);
+            }
+            prev_suffix = suffix;
+            suffix = next_suffix;
         }
-        return (suffix, prev_suffix);
+        (suffix, prev_suffix)
     }
     pub fn public_suffix<'a>(&self, domain: &'a str) -> &'a str {
         let (public, _) = self.suffix_pair(domain);
@@ -98,8 +87,8 @@ impl PubDomainRules {
         // Speeded-up version of
         // domain != "" &&
         // self.public_suffix(domain) == domain.
-        let domain = domain.trim_start_matches(".");
-        match domain.find(".") {
+        let domain = domain.trim_start_matches('.');
+        match domain.find('.') {
             None => !domain.is_empty(),
             Some(index) => {
                 !self.exceptions.contains(domain) && self.wildcards.contains(&domain[index + 1..]) ||
@@ -111,8 +100,8 @@ impl PubDomainRules {
         // Speeded-up version of
         // self.public_suffix(domain) != domain &&
         // self.registrable_suffix(domain) == domain.
-        let domain = domain.trim_start_matches(".");
-        match domain.find(".") {
+        let domain = domain.trim_start_matches('.');
+        match domain.find('.') {
             None => false,
             Some(index) => {
                 self.exceptions.contains(domain) ||
@@ -151,7 +140,7 @@ pub fn is_reg_domain(domain: &str) -> bool {
 pub fn reg_host(url: &ServoUrl) -> Option<Host> {
     match url.origin() {
         ImmutableOrigin::Tuple(_, Host::Domain(domain), _) => {
-            Some(Host::Domain(String::from(reg_suffix(&*domain))))
+            Some(Host::Domain(String::from(reg_suffix(&domain))))
         },
         ImmutableOrigin::Tuple(_, ip, _) => Some(ip),
         ImmutableOrigin::Opaque(_) => None,

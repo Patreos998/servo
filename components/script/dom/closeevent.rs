@@ -16,9 +16,10 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CloseEvent {
+pub(crate) struct CloseEvent {
     event: Event,
     was_clean: bool,
     code: u16,
@@ -27,16 +28,17 @@ pub struct CloseEvent {
 
 #[allow(non_snake_case)]
 impl CloseEvent {
-    pub fn new_inherited(was_clean: bool, code: u16, reason: DOMString) -> CloseEvent {
+    pub(crate) fn new_inherited(was_clean: bool, code: u16, reason: DOMString) -> CloseEvent {
         CloseEvent {
             event: Event::new_inherited(),
-            was_clean: was_clean,
-            code: code,
-            reason: reason,
+            was_clean,
+            code,
+            reason,
         }
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
         bubbles: EventBubbles,
@@ -44,12 +46,14 @@ impl CloseEvent {
         wasClean: bool,
         code: u16,
         reason: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<CloseEvent> {
         Self::new_with_proto(
-            global, None, type_, bubbles, cancelable, wasClean, code, reason,
+            global, None, type_, bubbles, cancelable, wasClean, code, reason, can_gc,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -59,19 +63,24 @@ impl CloseEvent {
         wasClean: bool,
         code: u16,
         reason: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<CloseEvent> {
         let event = Box::new(CloseEvent::new_inherited(wasClean, code, reason));
-        let ev = reflect_dom_object_with_proto(event, global, proto);
+        let ev = reflect_dom_object_with_proto(event, global, proto, can_gc);
         {
             let event = ev.upcast::<Event>();
             event.init_event(type_, bool::from(bubbles), bool::from(cancelable));
         }
         ev
     }
+}
 
-    pub fn Constructor(
+impl CloseEventMethods<crate::DomTypeHolder> for CloseEvent {
+    // https://websockets.spec.whatwg.org/#the-closeevent-interface
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &CloseEventBinding::CloseEventInit,
     ) -> Fallible<DomRoot<CloseEvent>> {
@@ -86,22 +95,21 @@ impl CloseEvent {
             init.wasClean,
             init.code,
             init.reason.clone(),
+            can_gc,
         ))
     }
-}
 
-impl CloseEventMethods for CloseEvent {
-    // https://html.spec.whatwg.org/multipage/#dom-closeevent-wasclean
+    // https://websockets.spec.whatwg.org/#dom-closeevent-wasclean
     fn WasClean(&self) -> bool {
         self.was_clean
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-closeevent-code
+    // https://websockets.spec.whatwg.org/#dom-closeevent-code
     fn Code(&self) -> u16 {
         self.code
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-closeevent-reason
+    // https://websockets.spec.whatwg.org/#dom-closeevent-reason
     fn Reason(&self) -> DOMString {
         self.reason.clone()
     }

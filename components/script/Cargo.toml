@@ -1,46 +1,57 @@
 [package]
 name = "script"
-version = "0.0.1"
-authors = ["The Servo Project Developers"]
-license = "MPL-2.0"
-edition = "2018"
-publish = false
-
 build = "build.rs"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "script"
 path = "lib.rs"
 
 [features]
+bluetooth = ['bluetooth_traits', 'script_bindings/bluetooth']
+crown = ['js/crown']
 debugmozjs = ['js/debugmozjs']
 jitspew = ['js/jitspew']
 profilemozjs = ['js/profilemozjs']
+tracing = ["dep:tracing"]
 webgl_backtrace = ["canvas_traits/webgl_backtrace"]
 js_backtrace = []
 refcell_backtrace = ["accountable-refcell"]
-xr-profile = ["webxr-api/profile"]
+webxr = ["webxr-api", "script_bindings/webxr"]
+webgpu = ["script_bindings/webgpu", "script_traits/webgpu"]
 
-[build-dependencies]
-phf_codegen = "0.10"
-phf_shared = "0.10"
-serde_json = { workspace = true }
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(crown)'] }
 
 [dependencies]
+aes = { workspace = true }
+aes-kw = { workspace = true }
+aes-gcm = { workspace = true }
 accountable-refcell = { workspace = true, optional = true }
 app_units = { workspace = true }
 arrayvec = { workspace = true }
 atomic_refcell = { workspace = true }
+background_hang_monitor_api = { workspace = true }
 backtrace = { workspace = true }
+base = { workspace = true }
 base64 = { workspace = true }
+bincode = { workspace = true }
 bitflags = { workspace = true }
-bluetooth_traits = { workspace = true }
+bluetooth_traits = { workspace = true, optional = true }
 canvas_traits = { workspace = true }
-chrono = "0.4"
+cbc = { workspace = true }
+cipher = { workspace = true }
+chrono = { workspace = true }
 content-security-policy = { workspace = true }
 cookie = { workspace = true }
 crossbeam-channel = { workspace = true }
 cssparser = { workspace = true }
+ctr = { workspace = true }
 data-url = { workspace = true }
 deny_public_fields = { path = "../deny_public_fields" }
 devtools_traits = { workspace = true }
@@ -48,11 +59,11 @@ dom_struct = { path = "../dom_struct" }
 domobject_derive = { path = "../domobject_derive" }
 embedder_traits = { workspace = true }
 encoding_rs = { workspace = true }
-enum-iterator = "0.3"
 euclid = { workspace = true }
 fnv = { workspace = true }
 fxhash = { workspace = true }
-gfx_traits = { workspace = true }
+fonts_traits = { workspace = true }
+fonts = { path = "../fonts" }
 headers = { workspace = true }
 html5ever = { workspace = true }
 http = { workspace = true }
@@ -61,60 +72,67 @@ image = { workspace = true }
 indexmap = { workspace = true }
 ipc-channel = { workspace = true }
 itertools = { workspace = true }
-js = { package = "mozjs", git = "https://github.com/servo/mozjs", features = ["streams"] }
+js = { workspace = true }
 jstraceable_derive = { path = "../jstraceable_derive" }
 keyboard-types = { workspace = true }
-lazy_static = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-malloc_size_of = { path = "../malloc_size_of" }
+malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
 media = { path = "../media" }
 metrics = { path = "../metrics" }
 mime = { workspace = true }
 mime_guess = { workspace = true }
-msg = { workspace = true }
 net_traits = { workspace = true }
+num_cpus = { workspace = true }
 num-traits = { workspace = true }
 parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
-phf = "0.10"
+phf = "0.11"
 pixels = { path = "../pixels" }
 profile_traits = { workspace = true }
 range = { path = "../range" }
 ref_filter_map = "1.0.1"
 regex = { workspace = true }
+aws-lc-rs = { workspace = true }
+script_bindings = { path = "../script_bindings" }
 script_layout_interface = { workspace = true }
 script_traits = { workspace = true }
-selectors = { path = "../selectors", features = ["shmem"] }
+selectors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_bytes = { workspace = true }
-servo-media = { git = "https://github.com/servo/media" }
+serde_json = { workspace = true }
+servo-media = { workspace = true }
 servo_allocator = { path = "../allocator" }
-servo_arc = { path = "../servo_arc" }
-servo_atoms = { path = "../atoms" }
+servo_arc = { workspace = true }
+servo_atoms = { workspace = true }
 servo_config = { path = "../config" }
 servo_geometry = { path = "../geometry" }
 servo_rand = { path = "../rand" }
 servo_url = { path = "../url" }
 smallvec = { workspace = true, features = ["union"] }
-sparkle = { workspace = true }
-style = { path = "../style", features = ["servo"] }
+style_malloc_size_of = { workspace = true }
+glow = { workspace = true }
+style = { workspace = true }
+style_dom = { workspace = true }
 style_traits = { workspace = true }
 swapper = "0.1"
 tempfile = "3"
 tendril = { version = "0.4.1", features = ["encoding_rs"] }
 time = { workspace = true }
+timers = { path = "../timers" }
+tracing = { workspace = true, optional = true }
 unicode-bidi = { workspace = true }
-unicode-segmentation = "1.1.0"
+unicode-segmentation = { workspace = true }
 url = { workspace = true }
 utf-8 = "0.7"
 uuid = { workspace = true, features = ["serde"] }
 webdriver = { workspace = true }
 webgpu = { path = "../webgpu" }
 webrender_api = { workspace = true }
-webxr-api = { git = "https://github.com/servo/webxr", features = ["ipc"] }
+webrender_traits = { workspace = true }
+webxr-api = { workspace = true, features = ["ipc"], optional = true }
 xml5ever = { workspace = true }
+nom = "7.1.3"
 
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 mozangle = { workspace = true }

@@ -5,11 +5,10 @@
 //! An actor-based remote devtools server implementation. Only tested with
 //! nightly Firefox versions at time of writing. Largely based on
 //! reverse-engineering of Firefox chrome devtool logs and reading of
-//! [code](http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/).
+//! [code](https://searchfox.org/mozilla-central/source/devtools/server).
 
 #![crate_name = "devtools"]
 #![crate_type = "rlib"]
-#![allow(non_snake_case)]
 #![deny(unsafe_code)]
 
 use std::borrow::ToOwned;
@@ -20,16 +19,16 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base::id::{BrowsingContextId, PipelineId};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use devtools_traits::{
-    ChromeToDevtoolsControlMsg, ConsoleMessage, DevtoolScriptControlMsg, DevtoolsControlMsg,
-    DevtoolsPageInfo, LogLevel, NavigationState, NetworkEvent, PageError,
+    ChromeToDevtoolsControlMsg, ConsoleMessage, ConsoleMessageBuilder, DevtoolScriptControlMsg,
+    DevtoolsControlMsg, DevtoolsPageInfo, LogLevel, NavigationState, NetworkEvent, PageError,
     ScriptToDevtoolsControlMsg, WorkerId,
 };
-use embedder_traits::{EmbedderMsg, EmbedderProxy, PromptDefinition, PromptOrigin, PromptResult};
+use embedder_traits::{AllowOrDeny, EmbedderMsg, EmbedderProxy};
 use ipc_channel::ipc::{self, IpcSender};
-use log::{debug, warn};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
+use log::{debug, trace, warn};
 use serde::Serialize;
 use servo_rand::RngCore;
 
@@ -48,12 +47,11 @@ use crate::actors::worker::{WorkerActor, WorkerType};
 use crate::protocol::JsonPacketStream;
 
 mod actor;
-/// Corresponds to <http://mxr.mozilla.org/mozilla-central/source/toolkit/devtools/server/actors/>
+/// <https://searchfox.org/mozilla-central/source/devtools/server/actors>
 mod actors {
     pub mod browsing_context;
     pub mod console;
     pub mod device;
-    pub mod emulation;
     pub mod framerate;
     pub mod inspector;
     pub mod memory;
@@ -62,12 +60,13 @@ mod actors {
     pub mod performance;
     pub mod preference;
     pub mod process;
-    pub mod profiler;
+    pub mod reflow;
     pub mod root;
     pub mod stylesheets;
     pub mod tab;
     pub mod thread;
     pub mod timeline;
+    pub mod watcher;
     pub mod worker;
 }
 mod protocol;
@@ -79,24 +78,27 @@ enum UniqueId {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct NetworkEventMsg {
     from: String,
     #[serde(rename = "type")]
     type_: String,
-    eventActor: EventActor,
+    event_actor: EventActor,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct NetworkEventUpdateMsg {
     from: String,
     #[serde(rename = "type")]
     type_: String,
-    updateType: String,
+    update_type: String,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct EventTimingsUpdateMsg {
-    totalTime: u64,
+    total_time: u64,
 }
 
 #[derive(Serialize)]
@@ -105,12 +107,18 @@ struct SecurityInfoUpdateMsg {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ResponseStartUpdateMsg {
     from: String,
     #[serde(rename = "type")]
     type_: String,
-    updateType: String,
+    update_type: String,
     response: ResponseStartMsg,
+}
+
+#[derive(Serialize)]
+pub struct EmptyReplyMsg {
+    pub from: String,
 }
 
 /// Spin up a devtools server that listens for connections on the specified port.
@@ -135,7 +143,7 @@ fn run_server(
     port: u16,
     embedder: EmbedderProxy,
 ) {
-    let bound = TcpListener::bind(&("0.0.0.0", port)).ok().and_then(|l| {
+    let bound = TcpListener::bind(("0.0.0.0", port)).ok().and_then(|l| {
         l.local_addr()
             .map(|addr| addr.port())
             .ok()
@@ -143,10 +151,10 @@ fn run_server(
     });
 
     // A token shared with the embedder to bypass permission prompt.
-    let token = format!("{:X}", servo_rand::ServoRng::new().next_u32());
+    let token = format!("{:X}", servo_rand::ServoRng::default().next_u32());
 
     let port = bound.as_ref().map(|(_, port)| *port).ok_or(());
-    embedder.send((None, EmbedderMsg::OnDevtoolsStarted(port, token.clone())));
+    embedder.send(EmbedderMsg::OnDevtoolsStarted(port, token.clone()));
 
     let listener = match bound {
         Some((l, _)) => l,
@@ -181,13 +189,11 @@ fn run_server(
 
     let actors = registry.create_shareable();
 
-    let mut accepted_connections: Vec<TcpStream> = Vec::new();
-
-    let mut browsing_contexts: HashMap<BrowsingContextId, String> = HashMap::new();
-    let mut pipelines: HashMap<PipelineId, BrowsingContextId> = HashMap::new();
-    let mut actor_requests: HashMap<String, String> = HashMap::new();
-
-    let mut actor_workers: HashMap<WorkerId, String> = HashMap::new();
+    let mut accepted_connections = HashMap::new();
+    let mut browsing_contexts: HashMap<_, String> = HashMap::new();
+    let mut pipelines = HashMap::new();
+    let mut actor_requests = HashMap::new();
+    let mut actor_workers = HashMap::new();
 
     /// Process the input from a single devtools client until EOF.
     fn handle_client(actors: Arc<Mutex<ActorRegistry>>, mut stream: TcpStream, id: StreamId) {
@@ -259,7 +265,7 @@ fn run_server(
             Some(bc) => bc,
             None => return,
         };
-        let name = match browsing_contexts.get(&bc) {
+        let name = match browsing_contexts.get(bc) {
             Some(name) => name,
             None => return,
         };
@@ -271,6 +277,7 @@ fn run_server(
     // We need separate actor representations for each script global that exists;
     // clients can theoretically connect to multiple globals simultaneously.
     // TODO: move this into the root or target modules?
+    #[allow(clippy::too_many_arguments)]
     fn handle_new_global(
         actors: Arc<Mutex<ActorRegistry>>,
         ids: (BrowsingContextId, PipelineId, Option<WorkerId>),
@@ -279,6 +286,7 @@ fn run_server(
         pipelines: &mut HashMap<PipelineId, BrowsingContextId>,
         actor_workers: &mut HashMap<WorkerId, String>,
         page_info: DevtoolsPageInfo,
+        connections: &HashMap<StreamId, TcpStream>,
     ) {
         let mut actors = actors.lock().unwrap();
 
@@ -299,7 +307,7 @@ fn run_server(
                 name: worker_name.clone(),
                 console: console_name.clone(),
                 thread: thread_name,
-                id: id,
+                id,
                 url: page_info.url.clone(),
                 type_: WorkerType::Dedicated,
                 script_chan: script_sender,
@@ -314,24 +322,30 @@ fn run_server(
             Root::DedicatedWorker(worker_name)
         } else {
             pipelines.insert(pipeline, browsing_context);
-            Root::BrowsingContext(
-                if let Some(actor) = browsing_contexts.get(&browsing_context) {
-                    actor.to_owned()
-                } else {
+            let name = browsing_contexts
+                .entry(browsing_context)
+                .or_insert_with(|| {
                     let browsing_context_actor = BrowsingContextActor::new(
                         console_name.clone(),
                         browsing_context,
                         page_info,
                         pipeline,
                         script_sender,
-                        &mut *actors,
+                        &mut actors,
                     );
                     let name = browsing_context_actor.name();
-                    browsing_contexts.insert(browsing_context, name.clone());
                     actors.register(Box::new(browsing_context_actor));
                     name
-                },
-            )
+                });
+
+            // Add existing streams to the new browsing context
+            let browsing_context = actors.find::<BrowsingContextActor>(name);
+            let mut streams = browsing_context.streams.borrow_mut();
+            for (id, stream) in connections {
+                streams.insert(*id, stream.try_clone().unwrap());
+            }
+
+            Root::BrowsingContext(name.clone())
         };
 
         let console = ConsoleActor {
@@ -366,7 +380,7 @@ fn run_server(
         let actors = actors.lock().unwrap();
         let console_actor = actors.find::<ConsoleActor>(&console_actor_name);
         let id = worker_id.map_or(UniqueId::Pipeline(id), UniqueId::Worker);
-        console_actor.handle_page_error(page_error, id, &*actors);
+        console_actor.handle_page_error(page_error, id, &actors);
     }
 
     fn handle_console_message(
@@ -392,7 +406,7 @@ fn run_server(
         let actors = actors.lock().unwrap();
         let console_actor = actors.find::<ConsoleActor>(&console_actor_name);
         let id = worker_id.map_or(UniqueId::Pipeline(id), UniqueId::Worker);
-        console_actor.handle_console_api(console_message, id, &*actors);
+        console_actor.handle_console_api(console_message, id, &actors);
     }
 
     fn find_console_actor(
@@ -419,6 +433,7 @@ fn run_server(
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_network_event(
         actors: Arc<Mutex<ActorRegistry>>,
         mut connections: Vec<TcpStream>,
@@ -455,7 +470,7 @@ fn run_server(
                 let msg = NetworkEventMsg {
                     from: console_actor_name,
                     type_: "networkEvent".to_owned(),
-                    eventActor: actor.event_actor(),
+                    event_actor: actor.event_actor(),
                 };
                 for stream in &mut connections {
                     let _ = stream.write_json_packet(&msg);
@@ -468,7 +483,7 @@ fn run_server(
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name.clone(),
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "requestHeaders".to_owned(),
+                    update_type: "requestHeaders".to_owned(),
                 };
                 for stream in &mut connections {
                     let _ = stream.write_merged_json_packet(&msg, &actor.request_headers());
@@ -477,7 +492,7 @@ fn run_server(
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name.clone(),
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "requestCookies".to_owned(),
+                    update_type: "requestCookies".to_owned(),
                 };
                 for stream in &mut connections {
                     let _ = stream.write_merged_json_packet(&msg, &actor.request_cookies());
@@ -487,7 +502,7 @@ fn run_server(
                 let msg = ResponseStartUpdateMsg {
                     from: netevent_actor_name.clone(),
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "responseStart".to_owned(),
+                    update_type: "responseStart".to_owned(),
                     response: actor.response_start(),
                 };
 
@@ -497,10 +512,10 @@ fn run_server(
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name.clone(),
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "eventTimings".to_owned(),
+                    update_type: "eventTimings".to_owned(),
                 };
                 let extra = EventTimingsUpdateMsg {
-                    totalTime: actor.total_time(),
+                    total_time: actor.total_time().as_millis() as u64,
                 };
                 for stream in &mut connections {
                     let _ = stream.write_merged_json_packet(&msg, &extra);
@@ -509,7 +524,7 @@ fn run_server(
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name.clone(),
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "securityInfo".to_owned(),
+                    update_type: "securityInfo".to_owned(),
                 };
                 let extra = SecurityInfoUpdateMsg {
                     state: "insecure".to_owned(),
@@ -521,7 +536,7 @@ fn run_server(
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name.clone(),
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "responseContent".to_owned(),
+                    update_type: "responseContent".to_owned(),
                 };
                 for stream in &mut connections {
                     let _ = stream.write_merged_json_packet(&msg, &actor.response_content());
@@ -530,7 +545,7 @@ fn run_server(
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name.clone(),
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "responseCookies".to_owned(),
+                    update_type: "responseCookies".to_owned(),
                 };
                 for stream in &mut connections {
                     let _ = stream.write_merged_json_packet(&msg, &actor.response_cookies());
@@ -539,7 +554,7 @@ fn run_server(
                 let msg = NetworkEventUpdateMsg {
                     from: netevent_actor_name,
                     type_: "networkEventUpdate".to_owned(),
-                    updateType: "responseHeaders".to_owned(),
+                    update_type: "responseHeaders".to_owned(),
                 };
                 for stream in &mut connections {
                     let _ = stream.write_merged_json_packet(&msg, &actor.response_headers());
@@ -592,13 +607,21 @@ fn run_server(
 
     let mut next_id = StreamId(0);
     while let Ok(msg) = receiver.recv() {
-        debug!("{:?}", msg);
+        trace!("{:?}", msg);
         match msg {
             DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::AddClient(stream)) => {
                 let actors = actors.clone();
                 let id = next_id;
                 next_id = StreamId(id.0 + 1);
-                accepted_connections.push(stream.try_clone().unwrap());
+                accepted_connections.insert(id, stream.try_clone().unwrap());
+
+                // Inform every browsing context of the new stream
+                for name in browsing_contexts.values() {
+                    let actors = actors.lock().unwrap();
+                    let browsing_context = actors.find::<BrowsingContextActor>(name);
+                    let mut streams = browsing_context.streams.borrow_mut();
+                    streams.insert(id, stream.try_clone().unwrap());
+                }
                 thread::Builder::new()
                     .name("DevtoolsClientHandler".to_owned())
                     .spawn(move || handle_client(actors, stream.try_clone().unwrap(), id))
@@ -630,6 +653,7 @@ fn run_server(
                 &mut pipelines,
                 &mut actor_workers,
                 pageinfo,
+                &accepted_connections,
             ),
             DevtoolsControlMsg::FromScript(ScriptToDevtoolsControlMsg::Navigate(
                 browsing_context,
@@ -664,18 +688,19 @@ fn run_server(
                 id,
                 css_error,
             )) => {
-                let console_message = ConsoleMessage {
-                    message: css_error.msg,
-                    logLevel: LogLevel::Warn,
-                    filename: css_error.filename,
-                    lineNumber: css_error.line as usize,
-                    columnNumber: css_error.column as usize,
-                };
+                let mut console_message = ConsoleMessageBuilder::new(
+                    LogLevel::Warn,
+                    css_error.filename,
+                    css_error.line,
+                    css_error.column,
+                );
+                console_message.add_argument(css_error.msg.into());
+
                 handle_console_message(
                     actors.clone(),
                     id,
                     None,
-                    console_message,
+                    console_message.finish(),
                     &browsing_contexts,
                     &actor_workers,
                     &pipelines,
@@ -687,7 +712,7 @@ fn run_server(
             )) => {
                 // copy the accepted_connections vector
                 let mut connections = Vec::<TcpStream>::new();
-                for stream in &accepted_connections {
+                for stream in accepted_connections.values() {
                     connections.push(stream.try_clone().unwrap());
                 }
 
@@ -710,7 +735,7 @@ fn run_server(
             DevtoolsControlMsg::FromChrome(ChromeToDevtoolsControlMsg::ServerExitMsg) => break,
         }
     }
-    for connection in &mut accepted_connections {
+    for connection in accepted_connections.values_mut() {
         let _ = connection.shutdown(Shutdown::Both);
     }
 }
@@ -737,10 +762,7 @@ fn allow_devtools_client(stream: &mut TcpStream, embedder: &EmbedderProxy, token
     };
 
     // No token found. Prompt user
-    let (embedder_sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
-    let message = "Accept incoming devtools connection?".to_owned();
-    let prompt = PromptDefinition::YesNo(message, embedder_sender);
-    let msg = EmbedderMsg::Prompt(prompt, PromptOrigin::Trusted);
-    embedder.send((None, msg));
-    receiver.recv().unwrap() == PromptResult::Primary
+    let (request_sender, request_receiver) = ipc::channel().expect("Failed to create IPC channel!");
+    embedder.send(EmbedderMsg::RequestDevtoolsConnection(request_sender));
+    request_receiver.recv().unwrap() == AllowOrDeny::Allow
 }

@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::cmp;
 use std::ptr::{self, NonNull};
+#[cfg(feature = "webxr")]
 use std::rc::Rc;
 
 #[cfg(feature = "webgl_backtrace")]
@@ -22,11 +23,8 @@ use dom_struct::dom_struct;
 use euclid::default::{Point2D, Rect, Size2D};
 use ipc_channel::ipc::{self, IpcSharedMemory};
 use js::jsapi::{JSContext, JSObject, Type};
-use js::jsval::{
-    BooleanValue, DoubleValue, Int32Value, JSVal, NullValue, ObjectValue, UInt32Value,
-    UndefinedValue,
-};
-use js::rust::CustomAutoRooterGuard;
+use js::jsval::{BooleanValue, DoubleValue, Int32Value, NullValue, ObjectValue, UInt32Value};
+use js::rust::{CustomAutoRooterGuard, MutableHandleValue};
 use js::typedarray::{
     ArrayBufferView, CreateWith, Float32, Float32Array, Int32, Int32Array, TypedArray,
     TypedArrayElementCreator, Uint32Array,
@@ -48,20 +46,20 @@ use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::{
     WebGLRenderingContextMethods,
 };
 use crate::dom::bindings::codegen::UnionTypes::{
-    ArrayBufferViewOrArrayBuffer, Float32ArrayOrUnrestrictedFloatSequence, Int32ArrayOrLongSequence,
+    ArrayBufferViewOrArrayBuffer, Float32ArrayOrUnrestrictedFloatSequence,
+    HTMLCanvasElementOrOffscreenCanvas, Int32ArrayOrLongSequence,
 };
 use crate::dom::bindings::conversions::{DerivedFrom, ToJSValConvertible};
 use crate::dom::bindings::error::{Error, ErrorResult, Fallible};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
-use crate::dom::bindings::root::{Dom, DomOnceCell, DomRoot, LayoutDom, MutNullableDom};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal, DomObject, Reflector};
+use crate::dom::bindings::root::{DomOnceCell, DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::cors_setting_for_element;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
-use crate::dom::htmlcanvaselement::{
-    utils as canvas_utils, HTMLCanvasElement, LayoutCanvasRenderingContextHelpers,
-};
-use crate::dom::node::{document_from_node, window_from_node, Node, NodeDamage};
+use crate::dom::htmlcanvaselement::{utils as canvas_utils, LayoutCanvasRenderingContextHelpers};
+use crate::dom::node::{Node, NodeDamage, NodeTraits};
+#[cfg(feature = "webxr")]
 use crate::dom::promise::Promise;
 use crate::dom::vertexarrayobject::VertexAttribData;
 use crate::dom::webgl_extensions::WebGLExtensions;
@@ -88,7 +86,7 @@ use crate::dom::webgluniformlocation::WebGLUniformLocation;
 use crate::dom::webglvertexarrayobject::WebGLVertexArrayObject;
 use crate::dom::webglvertexarrayobjectoes::WebGLVertexArrayObjectOES;
 use crate::dom::window::Window;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 // From the GLES 2.0.25 spec, page 85:
 //
@@ -121,7 +119,7 @@ fn has_invalid_blend_constants(arg1: u32, arg2: u32) -> bool {
     }
 }
 
-pub fn uniform_get<T, F>(triple: (&WebGLRenderingContext, WebGLProgramId, i32), f: F) -> T
+pub(crate) fn uniform_get<T, F>(triple: (&WebGLRenderingContext, WebGLProgramId, i32), f: F) -> T
 where
     F: FnOnce(WebGLProgramId, i32, WebGLSender<T>) -> WebGLCommand,
     T: for<'de> Deserialize<'de> + Serialize,
@@ -132,14 +130,17 @@ where
 }
 
 #[allow(unsafe_code)]
-pub unsafe fn uniform_typed<T>(cx: *mut JSContext, value: &[T::Element]) -> JSVal
-where
+pub(crate) unsafe fn uniform_typed<T>(
+    cx: *mut JSContext,
+    value: &[T::Element],
+    mut retval: MutableHandleValue,
+) where
     T: TypedArrayElementCreator,
 {
     rooted!(in(cx) let mut rval = ptr::null_mut::<JSObject>());
-    <TypedArray<T, *mut JSObject>>::create(cx, CreateWith::Slice(&value), rval.handle_mut())
+    <TypedArray<T, *mut JSObject>>::create(cx, CreateWith::Slice(value), rval.handle_mut())
         .unwrap();
-    ObjectValue(rval.get())
+    retval.set(ObjectValue(rval.get()));
 }
 
 /// Set of bitflags for texture unpacking (texImage2d, etc...)
@@ -155,20 +156,20 @@ bitflags! {
 }
 
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf)]
-pub enum VertexAttrib {
+pub(crate) enum VertexAttrib {
     Float(f32, f32, f32, f32),
     Int(i32, i32, i32, i32),
     Uint(u32, u32, u32, u32),
 }
 
 #[derive(Clone, Copy, Debug)]
-pub enum Operation {
+pub(crate) enum Operation {
     Fallible,
     Infallible,
 }
 
 #[dom_struct]
-pub struct WebGLRenderingContext {
+pub(crate) struct WebGLRenderingContext {
     reflector_: Reflector,
     #[ignore_malloc_size_of = "Channels are hard"]
     webgl_sender: WebGLMessageSender,
@@ -182,7 +183,7 @@ pub struct WebGLRenderingContext {
     #[ignore_malloc_size_of = "Defined in surfman"]
     #[no_trace]
     limits: GLLimits,
-    canvas: Dom<HTMLCanvasElement>,
+    canvas: HTMLCanvasElementOrOffscreenCanvas,
     #[ignore_malloc_size_of = "Defined in canvas_traits"]
     #[no_trace]
     last_error: Cell<Option<WebGLError>>,
@@ -216,14 +217,14 @@ pub struct WebGLRenderingContext {
 }
 
 impl WebGLRenderingContext {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         window: &Window,
-        canvas: &HTMLCanvasElement,
+        canvas: &HTMLCanvasElementOrOffscreenCanvas,
         webgl_version: WebGLVersion,
         size: Size2D<u32>,
         attrs: GLContextAttributes,
     ) -> Result<WebGLRenderingContext, String> {
-        if pref!(webgl.testing.context_creation_error) {
+        if pref!(webgl_testing_context_creation_error) {
             return Err("WebGL context creation error forced by pref `webgl.testing.context_creation_error`".into());
         }
 
@@ -248,7 +249,7 @@ impl WebGLRenderingContext {
                 webgl_version,
                 glsl_version: ctx_data.glsl_version,
                 limits: ctx_data.limits,
-                canvas: Dom::from_ref(canvas),
+                canvas: canvas.clone(),
                 last_error: Cell::new(None),
                 texture_packing_alignment: Cell::new(4),
                 texture_unpacking_settings: Cell::new(TextureUnpacking::CONVERT_COLORSPACE),
@@ -282,16 +283,17 @@ impl WebGLRenderingContext {
         })
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
-        canvas: &HTMLCanvasElement,
+        canvas: &HTMLCanvasElementOrOffscreenCanvas,
         webgl_version: WebGLVersion,
         size: Size2D<u32>,
         attrs: GLContextAttributes,
+        can_gc: CanGc,
     ) -> Option<DomRoot<WebGLRenderingContext>> {
         match WebGLRenderingContext::new_inherited(window, canvas, webgl_version, size, attrs) {
-            Ok(ctx) => Some(reflect_dom_object(Box::new(ctx), window)),
+            Ok(ctx) => Some(reflect_dom_object(Box::new(ctx), window, can_gc)),
             Err(msg) => {
                 error!("Couldn't create WebGLRenderingContext: {}", msg);
                 let event = WebGLContextEvent::new(
@@ -300,26 +302,34 @@ impl WebGLRenderingContext {
                     EventBubbles::DoesNotBubble,
                     EventCancelable::Cancelable,
                     DOMString::from(msg),
+                    can_gc,
                 );
-                event.upcast::<Event>().fire(canvas.upcast());
+                match canvas {
+                    HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => {
+                        event.upcast::<Event>().fire(canvas.upcast(), can_gc);
+                    },
+                    HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(canvas) => {
+                        event.upcast::<Event>().fire(canvas.upcast(), can_gc);
+                    },
+                }
                 None
             },
         }
     }
 
-    pub fn webgl_version(&self) -> WebGLVersion {
+    pub(crate) fn webgl_version(&self) -> WebGLVersion {
         self.webgl_version
     }
 
-    pub fn limits(&self) -> &GLLimits {
+    pub(crate) fn limits(&self) -> &GLLimits {
         &self.limits
     }
 
-    pub fn texture_unpacking_alignment(&self) -> u32 {
+    pub(crate) fn texture_unpacking_alignment(&self) -> u32 {
         self.texture_unpacking_alignment.get()
     }
 
-    pub fn current_vao(&self) -> DomRoot<WebGLVertexArrayObjectOES> {
+    pub(crate) fn current_vao(&self) -> DomRoot<WebGLVertexArrayObjectOES> {
         self.current_vao.or_init(|| {
             DomRoot::from_ref(
                 self.default_vao
@@ -328,7 +338,7 @@ impl WebGLRenderingContext {
         })
     }
 
-    pub fn current_vao_webgl2(&self) -> DomRoot<WebGLVertexArrayObject> {
+    pub(crate) fn current_vao_webgl2(&self) -> DomRoot<WebGLVertexArrayObject> {
         self.current_vao_webgl2.or_init(|| {
             DomRoot::from_ref(
                 self.default_vao_webgl2
@@ -337,11 +347,11 @@ impl WebGLRenderingContext {
         })
     }
 
-    pub fn current_vertex_attribs(&self) -> RefMut<Box<[VertexAttrib]>> {
+    pub(crate) fn current_vertex_attribs(&self) -> RefMut<Box<[VertexAttrib]>> {
         self.current_vertex_attribs.borrow_mut()
     }
 
-    pub fn recreate(&self, size: Size2D<u32>) {
+    pub(crate) fn recreate(&self, size: Size2D<u32>) {
         let (sender, receiver) = webgl_channel().unwrap();
         self.webgl_sender.send_resize(size, sender).unwrap();
         // FIXME(#21718) The backend is allowed to choose a size smaller than
@@ -390,28 +400,33 @@ impl WebGLRenderingContext {
         }
     }
 
-    pub fn context_id(&self) -> WebGLContextId {
+    pub(crate) fn context_id(&self) -> WebGLContextId {
         self.webgl_sender.context_id()
     }
 
-    pub fn onscreen(&self) -> bool {
-        self.canvas.upcast::<Node>().is_connected()
+    pub(crate) fn onscreen(&self) -> bool {
+        match self.canvas {
+            HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                canvas.upcast::<Node>().is_connected()
+            },
+            HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => false,
+        }
     }
 
     #[inline]
-    pub fn send_command(&self, command: WebGLCommand) {
+    pub(crate) fn send_command(&self, command: WebGLCommand) {
         self.webgl_sender
             .send(command, capture_webgl_backtrace(self))
             .unwrap();
     }
 
-    pub fn send_command_ignored(&self, command: WebGLCommand) {
+    pub(crate) fn send_command_ignored(&self, command: WebGLCommand) {
         let _ = self
             .webgl_sender
             .send(command, capture_webgl_backtrace(self));
     }
 
-    pub fn webgl_error(&self, err: WebGLError) {
+    pub(crate) fn webgl_error(&self, err: WebGLError) {
         // TODO(emilio): Add useful debug messages to this
         warn!(
             "WebGL error: {:?}, previous error was {:?}",
@@ -444,7 +459,7 @@ impl WebGLRenderingContext {
     //
     // The WebGL spec mentions a couple more operations that trigger
     // this: clear() and getParameter(IMPLEMENTATION_COLOR_READ_*).
-    pub fn validate_framebuffer(&self) -> WebGLResult<()> {
+    pub(crate) fn validate_framebuffer(&self) -> WebGLResult<()> {
         match self.bound_draw_framebuffer.get() {
             Some(fb) => match fb.check_status_for_rendering() {
                 CompleteForRendering::Complete => Ok(()),
@@ -455,7 +470,7 @@ impl WebGLRenderingContext {
         }
     }
 
-    pub fn validate_ownership<T>(&self, object: &T) -> WebGLResult<()>
+    pub(crate) fn validate_ownership<T>(&self, object: &T) -> WebGLResult<()>
     where
         T: DerivedFrom<WebGLObject>,
     {
@@ -465,7 +480,7 @@ impl WebGLRenderingContext {
         Ok(())
     }
 
-    pub fn with_location<F>(&self, location: Option<&WebGLUniformLocation>, f: F)
+    pub(crate) fn with_location<F>(&self, location: Option<&WebGLUniformLocation>, f: F)
     where
         F: FnOnce(&WebGLUniformLocation) -> WebGLResult<()>,
     {
@@ -482,7 +497,7 @@ impl WebGLRenderingContext {
         handle_potential_webgl_error!(self, f(location));
     }
 
-    pub fn textures(&self) -> &Textures {
+    pub(crate) fn textures(&self) -> &Textures {
         &self.textures
     }
 
@@ -523,7 +538,7 @@ impl WebGLRenderingContext {
         }
     }
 
-    pub fn mark_as_dirty(&self) {
+    pub(crate) fn mark_as_dirty(&self) {
         // If we have a bound framebuffer, then don't mark the canvas as dirty.
         if self.bound_draw_framebuffer.get().is_some() {
             return;
@@ -535,12 +550,13 @@ impl WebGLRenderingContext {
             return;
         }
 
-        self.canvas
-            .upcast::<Node>()
-            .dirty(NodeDamage::OtherNodeDamage);
-
-        let document = document_from_node(&*self.canvas);
-        document.add_dirty_webgl_canvas(self);
+        match self.canvas {
+            HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                canvas.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+                canvas.owner_document().add_dirty_webgl_canvas(self);
+            },
+            HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => {},
+        }
     }
 
     fn vertex_attrib(&self, indx: u32, x: f32, y: f32, z: f32, w: f32) {
@@ -561,16 +577,16 @@ impl WebGLRenderingContext {
         self.send_command(WebGLCommand::VertexAttrib(indx, x, y, z, w));
     }
 
-    pub fn get_current_framebuffer_size(&self) -> Option<(i32, i32)> {
+    pub(crate) fn get_current_framebuffer_size(&self) -> Option<(i32, i32)> {
         match self.bound_draw_framebuffer.get() {
-            Some(fb) => return fb.size(),
+            Some(fb) => fb.size(),
 
             // The window system framebuffer is bound
-            None => return Some((self.DrawingBufferWidth(), self.DrawingBufferHeight())),
+            None => Some((self.DrawingBufferWidth(), self.DrawingBufferHeight())),
         }
     }
 
-    pub fn get_texture_packing_alignment(&self) -> u8 {
+    pub(crate) fn get_texture_packing_alignment(&self) -> u8 {
         self.texture_packing_alignment.get()
     }
 
@@ -627,20 +643,19 @@ impl WebGLRenderingContext {
     }
 
     fn validate_stencil_actions(&self, action: u32) -> bool {
-        match action {
-            0 |
-            constants::KEEP |
-            constants::REPLACE |
-            constants::INCR |
-            constants::DECR |
-            constants::INVERT |
-            constants::INCR_WRAP |
-            constants::DECR_WRAP => true,
-            _ => false,
-        }
+        matches!(
+            action,
+            0 | constants::KEEP |
+                constants::REPLACE |
+                constants::INCR |
+                constants::DECR |
+                constants::INVERT |
+                constants::INCR_WRAP |
+                constants::DECR_WRAP
+        )
     }
 
-    pub fn get_image_pixels(&self, source: TexImageSource) -> Fallible<Option<TexPixels>> {
+    pub(crate) fn get_image_pixels(&self, source: TexImageSource) -> Fallible<Option<TexPixels>> {
         Ok(Some(match source {
             TexImageSource::ImageData(image_data) => TexPixels::new(
                 image_data.to_shared_memory(),
@@ -649,7 +664,15 @@ impl WebGLRenderingContext {
                 false,
             ),
             TexImageSource::HTMLImageElement(image) => {
-                let document = document_from_node(&*self.canvas);
+                let document = match self.canvas {
+                    HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                        canvas.owner_document()
+                    },
+                    HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(ref _canvas) => {
+                        // TODO: Support retrieving image pixels here for OffscreenCanvas
+                        return Ok(None);
+                    },
+                };
                 if !image.same_origin(document.origin()) {
                     return Err(Error::Security);
                 }
@@ -659,7 +682,13 @@ impl WebGLRenderingContext {
                     None => return Ok(None),
                 };
 
-                let window = window_from_node(&*self.canvas);
+                let window = match self.canvas {
+                    HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(ref canvas) => {
+                        canvas.owner_window()
+                    },
+                    // This is marked as unreachable as we should have returned already
+                    HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(_) => unreachable!(),
+                };
                 let cors_setting = cors_setting_for_element(image.upcast());
 
                 let img =
@@ -703,7 +732,7 @@ impl WebGLRenderingContext {
     }
 
     // TODO(emilio): Move this logic to a validator.
-    pub fn validate_tex_image_2d_data(
+    pub(crate) fn validate_tex_image_2d_data(
         &self,
         width: u32,
         height: u32,
@@ -736,7 +765,7 @@ impl WebGLRenderingContext {
 
         // NOTE: width and height are positive or zero due to validate()
         if height == 0 {
-            return Ok(0);
+            Ok(0)
         } else {
             // We need to be careful here to not count unpack
             // alignment at the end of the image, otherwise (for
@@ -744,11 +773,12 @@ impl WebGLRenderingContext {
             // GL_ALPHA/GL_UNSIGNED_BYTE texture would throw an error.
             let cpp = element_size * components / components_per_element;
             let stride = (width * cpp + unpacking_alignment - 1) & !(unpacking_alignment - 1);
-            return Ok(stride * (height - 1) + width * cpp);
+            Ok(stride * (height - 1) + width * cpp)
         }
     }
 
-    pub fn tex_image_2d(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn tex_image_2d(
         &self,
         texture: &WebGLTexture,
         target: TexImageTarget,
@@ -831,10 +861,11 @@ impl WebGLRenderingContext {
         }
 
         if let Some(fb) = self.bound_draw_framebuffer.get() {
-            fb.invalidate_texture(&*texture);
+            fb.invalidate_texture(texture);
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tex_sub_image_2d(
         &self,
         texture: DomRoot<WebGLTexture>,
@@ -872,10 +903,10 @@ impl WebGLRenderingContext {
         }
 
         // See https://www.khronos.org/registry/webgl/specs/latest/2.0/#4.1.6
-        if self.webgl_version() == WebGLVersion::WebGL1 {
-            if data_type != image_info.data_type().unwrap() {
-                return self.webgl_error(InvalidOperation);
-            }
+        if self.webgl_version() == WebGLVersion::WebGL1 &&
+            data_type != image_info.data_type().unwrap()
+        {
+            return self.webgl_error(InvalidOperation);
         }
 
         let settings = self.texture_unpacking_settings.get();
@@ -927,7 +958,7 @@ impl WebGLRenderingContext {
     }
 
     // https://www.khronos.org/registry/webgl/extensions/ANGLE_instanced_arrays/
-    pub fn draw_arrays_instanced(
+    pub(crate) fn draw_arrays_instanced(
         &self,
         mode: u32,
         first: i32,
@@ -995,7 +1026,7 @@ impl WebGLRenderingContext {
     }
 
     // https://www.khronos.org/registry/webgl/extensions/ANGLE_instanced_arrays/
-    pub fn draw_elements_instanced(
+    pub(crate) fn draw_elements_instanced(
         &self,
         mode: u32,
         count: i32,
@@ -1088,7 +1119,7 @@ impl WebGLRenderingContext {
         Ok(())
     }
 
-    pub fn vertex_attrib_divisor(&self, index: u32, divisor: u32) {
+    pub(crate) fn vertex_attrib_divisor(&self, index: u32, divisor: u32) {
         if index >= self.limits.max_vertex_attribs {
             return self.webgl_error(InvalidValue);
         }
@@ -1108,7 +1139,7 @@ impl WebGLRenderingContext {
     // can fail and that it is UB what happens in that case.
     //
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#2.2
-    pub fn get_image_data(&self, mut size: Size2D<u32>) -> Option<Vec<u8>> {
+    pub(crate) fn get_image_data(&self, mut size: Size2D<u32>) -> Option<Vec<u8>> {
         handle_potential_webgl_error!(self, self.validate_framebuffer(), return None);
 
         let (fb_width, fb_height) = handle_potential_webgl_error!(
@@ -1129,15 +1160,15 @@ impl WebGLRenderingContext {
         Some(receiver.recv().unwrap())
     }
 
-    pub fn array_buffer(&self) -> Option<DomRoot<WebGLBuffer>> {
+    pub(crate) fn array_buffer(&self) -> Option<DomRoot<WebGLBuffer>> {
         self.bound_buffer_array.get()
     }
 
-    pub fn array_buffer_slot(&self) -> &MutNullableDom<WebGLBuffer> {
+    pub(crate) fn array_buffer_slot(&self) -> &MutNullableDom<WebGLBuffer> {
         &self.bound_buffer_array
     }
 
-    pub fn bound_buffer(&self, target: u32) -> WebGLResult<Option<DomRoot<WebGLBuffer>>> {
+    pub(crate) fn bound_buffer(&self, target: u32) -> WebGLResult<Option<DomRoot<WebGLBuffer>>> {
         match target {
             constants::ARRAY_BUFFER => Ok(self.bound_buffer_array.get()),
             constants::ELEMENT_ARRAY_BUFFER => Ok(self.current_vao().element_array_buffer().get()),
@@ -1145,14 +1176,14 @@ impl WebGLRenderingContext {
         }
     }
 
-    pub fn buffer_usage(&self, usage: u32) -> WebGLResult<u32> {
+    pub(crate) fn buffer_usage(&self, usage: u32) -> WebGLResult<u32> {
         match usage {
             constants::STREAM_DRAW | constants::STATIC_DRAW | constants::DYNAMIC_DRAW => Ok(usage),
             _ => Err(WebGLError::InvalidEnum),
         }
     }
 
-    pub fn create_vertex_array(&self) -> Option<DomRoot<WebGLVertexArrayObjectOES>> {
+    pub(crate) fn create_vertex_array(&self) -> Option<DomRoot<WebGLVertexArrayObjectOES>> {
         let (sender, receiver) = webgl_channel().unwrap();
         self.send_command(WebGLCommand::CreateVertexArray(sender));
         receiver
@@ -1161,7 +1192,7 @@ impl WebGLRenderingContext {
             .map(|id| WebGLVertexArrayObjectOES::new(self, Some(id)))
     }
 
-    pub fn create_vertex_array_webgl2(&self) -> Option<DomRoot<WebGLVertexArrayObject>> {
+    pub(crate) fn create_vertex_array_webgl2(&self) -> Option<DomRoot<WebGLVertexArrayObject>> {
         let (sender, receiver) = webgl_channel().unwrap();
         self.send_command(WebGLCommand::CreateVertexArray(sender));
         receiver
@@ -1170,7 +1201,7 @@ impl WebGLRenderingContext {
             .map(|id| WebGLVertexArrayObject::new(self, Some(id)))
     }
 
-    pub fn delete_vertex_array(&self, vao: Option<&WebGLVertexArrayObjectOES>) {
+    pub(crate) fn delete_vertex_array(&self, vao: Option<&WebGLVertexArrayObjectOES>) {
         if let Some(vao) = vao {
             handle_potential_webgl_error!(self, self.validate_ownership(vao), return);
             // The default vertex array has no id and should never be passed around.
@@ -1188,7 +1219,7 @@ impl WebGLRenderingContext {
         }
     }
 
-    pub fn delete_vertex_array_webgl2(&self, vao: Option<&WebGLVertexArrayObject>) {
+    pub(crate) fn delete_vertex_array_webgl2(&self, vao: Option<&WebGLVertexArrayObject>) {
         if let Some(vao) = vao {
             handle_potential_webgl_error!(self, self.validate_ownership(vao), return);
             // The default vertex array has no id and should never be passed around.
@@ -1206,23 +1237,23 @@ impl WebGLRenderingContext {
         }
     }
 
-    pub fn is_vertex_array(&self, vao: Option<&WebGLVertexArrayObjectOES>) -> bool {
-        vao.map_or(false, |vao| {
+    pub(crate) fn is_vertex_array(&self, vao: Option<&WebGLVertexArrayObjectOES>) -> bool {
+        vao.is_some_and(|vao| {
             // The default vertex array has no id and should never be passed around.
             assert!(vao.id().is_some());
             self.validate_ownership(vao).is_ok() && vao.ever_bound() && !vao.is_deleted()
         })
     }
 
-    pub fn is_vertex_array_webgl2(&self, vao: Option<&WebGLVertexArrayObject>) -> bool {
-        vao.map_or(false, |vao| {
+    pub(crate) fn is_vertex_array_webgl2(&self, vao: Option<&WebGLVertexArrayObject>) -> bool {
+        vao.is_some_and(|vao| {
             // The default vertex array has no id and should never be passed around.
             assert!(vao.id().is_some());
             self.validate_ownership(vao).is_ok() && vao.ever_bound() && !vao.is_deleted()
         })
     }
 
-    pub fn bind_vertex_array(&self, vao: Option<&WebGLVertexArrayObjectOES>) {
+    pub(crate) fn bind_vertex_array(&self, vao: Option<&WebGLVertexArrayObjectOES>) {
         if let Some(vao) = vao {
             // The default vertex array has no id and should never be passed around.
             assert!(vao.id().is_some());
@@ -1238,7 +1269,7 @@ impl WebGLRenderingContext {
         self.current_vao.set(vao);
     }
 
-    pub fn bind_vertex_array_webgl2(&self, vao: Option<&WebGLVertexArrayObject>) {
+    pub(crate) fn bind_vertex_array_webgl2(&self, vao: Option<&WebGLVertexArrayObject>) {
         if let Some(vao) = vao {
             // The default vertex array has no id and should never be passed around.
             assert!(vao.id().is_some());
@@ -1268,7 +1299,7 @@ impl WebGLRenderingContext {
         }
     }
 
-    pub fn initialize_framebuffer(&self, clear_bits: u32) {
+    pub(crate) fn initialize_framebuffer(&self, clear_bits: u32) {
         if clear_bits == 0 {
             return;
         }
@@ -1279,12 +1310,12 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn extension_manager(&self) -> &WebGLExtensions {
+    pub(crate) fn extension_manager(&self) -> &WebGLExtensions {
         &self.extension_manager
     }
 
     #[allow(unsafe_code)]
-    pub fn buffer_data(
+    pub(crate) fn buffer_data(
         &self,
         target: u32,
         data: Option<ArrayBufferViewOrArrayBuffer>,
@@ -1305,7 +1336,7 @@ impl WebGLRenderingContext {
         handle_potential_webgl_error!(self, bound_buffer.buffer_data(target, data, usage));
     }
 
-    pub fn buffer_data_(
+    pub(crate) fn buffer_data_(
         &self,
         target: u32,
         size: i64,
@@ -1326,7 +1357,7 @@ impl WebGLRenderingContext {
     }
 
     #[allow(unsafe_code)]
-    pub fn buffer_sub_data(
+    pub(crate) fn buffer_sub_data(
         &self,
         target: u32,
         offset: i64,
@@ -1359,7 +1390,7 @@ impl WebGLRenderingContext {
         sender.send(data).unwrap();
     }
 
-    pub fn bind_buffer_maybe(
+    pub(crate) fn bind_buffer_maybe(
         &self,
         slot: &MutNullableDom<WebGLBuffer>,
         target: u32,
@@ -1383,11 +1414,11 @@ impl WebGLRenderingContext {
         slot.set(buffer);
     }
 
-    pub fn current_program(&self) -> Option<DomRoot<WebGLProgram>> {
+    pub(crate) fn current_program(&self) -> Option<DomRoot<WebGLProgram>> {
         self.current_program.get()
     }
 
-    pub fn uniform_check_program(
+    pub(crate) fn uniform_check_program(
         &self,
         program: &WebGLProgram,
         location: &WebGLUniformLocation,
@@ -1436,7 +1467,7 @@ impl WebGLRenderingContext {
         self.uniform_vec_section::<f32>(vec, offset, length, uniform_size, uniform_location)
     }
 
-    pub fn uniform_vec_section<T: Clone>(
+    pub(crate) fn uniform_vec_section<T: Clone>(
         &self,
         vec: Vec<T>,
         offset: u32,
@@ -1474,7 +1505,7 @@ impl WebGLRenderingContext {
         Ok(vec)
     }
 
-    pub fn uniform_matrix_section(
+    pub(crate) fn uniform_matrix_section(
         &self,
         vec: Float32ArrayOrUnrestrictedFloatSequence,
         offset: u32,
@@ -1493,15 +1524,15 @@ impl WebGLRenderingContext {
         self.uniform_vec_section::<f32>(vec, offset, length, uniform_size, uniform_location)
     }
 
-    pub fn get_draw_framebuffer_slot(&self) -> &MutNullableDom<WebGLFramebuffer> {
+    pub(crate) fn get_draw_framebuffer_slot(&self) -> &MutNullableDom<WebGLFramebuffer> {
         &self.bound_draw_framebuffer
     }
 
-    pub fn get_read_framebuffer_slot(&self) -> &MutNullableDom<WebGLFramebuffer> {
+    pub(crate) fn get_read_framebuffer_slot(&self) -> &MutNullableDom<WebGLFramebuffer> {
         &self.bound_read_framebuffer
     }
 
-    pub fn validate_new_framebuffer_binding(
+    pub(crate) fn validate_new_framebuffer_binding(
         &self,
         framebuffer: Option<&WebGLFramebuffer>,
     ) -> WebGLResult<()> {
@@ -1519,7 +1550,7 @@ impl WebGLRenderingContext {
         Ok(())
     }
 
-    pub fn bind_framebuffer_to(
+    pub(crate) fn bind_framebuffer_to(
         &self,
         target: u32,
         framebuffer: Option<&WebGLFramebuffer>,
@@ -1537,7 +1568,7 @@ impl WebGLRenderingContext {
         slot.set(framebuffer);
     }
 
-    pub fn renderbuffer_storage(
+    pub(crate) fn renderbuffer_storage(
         &self,
         target: u32,
         samples: i32,
@@ -1565,18 +1596,19 @@ impl WebGLRenderingContext {
             rb.storage(self.api_type, samples, internal_format, width, height)
         );
         if let Some(fb) = self.bound_draw_framebuffer.get() {
-            fb.invalidate_renderbuffer(&*rb);
+            fb.invalidate_renderbuffer(&rb);
         }
 
         // FIXME: https://github.com/servo/servo/issues/13710
     }
 
-    pub fn valid_color_attachment_enum(&self, attachment: u32) -> bool {
+    pub(crate) fn valid_color_attachment_enum(&self, attachment: u32) -> bool {
         let last_slot = constants::COLOR_ATTACHMENT0 + self.limits().max_color_attachments - 1;
         constants::COLOR_ATTACHMENT0 <= attachment && attachment <= last_slot
     }
 
-    pub fn compressed_tex_image_2d<'a>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compressed_tex_image_2d(
         &self,
         target: u32,
         level: i32,
@@ -1584,7 +1616,7 @@ impl WebGLRenderingContext {
         width: i32,
         height: i32,
         border: i32,
-        data: &'a [u8],
+        data: &[u8],
     ) {
         let validator = CompressedTexImage2DValidator::new(
             self,
@@ -1639,11 +1671,12 @@ impl WebGLRenderingContext {
         });
 
         if let Some(fb) = self.bound_draw_framebuffer.get() {
-            fb.invalidate_texture(&*texture);
+            fb.invalidate_texture(&texture);
         }
     }
 
-    pub fn compressed_tex_sub_image_2d<'a>(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compressed_tex_sub_image_2d(
         &self,
         target: u32,
         level: i32,
@@ -1652,7 +1685,7 @@ impl WebGLRenderingContext {
         width: i32,
         height: i32,
         format: u32,
-        data: &'a [u8],
+        data: &[u8],
     ) {
         let validator = CompressedTexSubImage2DValidator::new(
             self,
@@ -1692,7 +1725,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform1iv(
+    pub(crate) fn uniform1iv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Int32ArrayOrLongSequence,
@@ -1728,7 +1761,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform1fv(
+    pub(crate) fn uniform1fv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Float32ArrayOrUnrestrictedFloatSequence,
@@ -1746,7 +1779,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform2fv(
+    pub(crate) fn uniform2fv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Float32ArrayOrUnrestrictedFloatSequence,
@@ -1764,7 +1797,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform2iv(
+    pub(crate) fn uniform2iv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Int32ArrayOrLongSequence,
@@ -1782,7 +1815,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform3fv(
+    pub(crate) fn uniform3fv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Float32ArrayOrUnrestrictedFloatSequence,
@@ -1800,7 +1833,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform3iv(
+    pub(crate) fn uniform3iv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Int32ArrayOrLongSequence,
@@ -1818,7 +1851,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform4iv(
+    pub(crate) fn uniform4iv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Int32ArrayOrLongSequence,
@@ -1836,7 +1869,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform4fv(
+    pub(crate) fn uniform4fv(
         &self,
         location: Option<&WebGLUniformLocation>,
         val: Float32ArrayOrUnrestrictedFloatSequence,
@@ -1854,7 +1887,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform_matrix_2fv(
+    pub(crate) fn uniform_matrix_2fv(
         &self,
         location: Option<&WebGLUniformLocation>,
         transpose: bool,
@@ -1874,7 +1907,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform_matrix_3fv(
+    pub(crate) fn uniform_matrix_3fv(
         &self,
         location: Option<&WebGLUniformLocation>,
         transpose: bool,
@@ -1894,7 +1927,7 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn uniform_matrix_4fv(
+    pub(crate) fn uniform_matrix_4fv(
         &self,
         location: Option<&WebGLUniformLocation>,
         transpose: bool,
@@ -1914,30 +1947,38 @@ impl WebGLRenderingContext {
         });
     }
 
-    pub fn get_buffer_param(&self, buffer: Option<DomRoot<WebGLBuffer>>, parameter: u32) -> JSVal {
-        let buffer =
-            handle_potential_webgl_error!(self, buffer.ok_or(InvalidOperation), return NullValue());
+    pub(crate) fn get_buffer_param(
+        &self,
+        buffer: Option<DomRoot<WebGLBuffer>>,
+        parameter: u32,
+        mut retval: MutableHandleValue,
+    ) {
+        let buffer = handle_potential_webgl_error!(
+            self,
+            buffer.ok_or(InvalidOperation),
+            return retval.set(NullValue())
+        );
 
-        match parameter {
+        retval.set(match parameter {
             constants::BUFFER_SIZE => Int32Value(buffer.capacity() as i32),
             constants::BUFFER_USAGE => Int32Value(buffer.usage() as i32),
             _ => {
                 self.webgl_error(InvalidEnum);
                 NullValue()
             },
-        }
+        })
     }
 }
 
 #[cfg(not(feature = "webgl_backtrace"))]
 #[inline]
-pub fn capture_webgl_backtrace<T: DomObject>(_: &T) -> WebGLCommandBacktrace {
+pub(crate) fn capture_webgl_backtrace<T: DomObject>(_: &T) -> WebGLCommandBacktrace {
     WebGLCommandBacktrace {}
 }
 
 #[cfg(feature = "webgl_backtrace")]
 #[cfg_attr(feature = "webgl_backtrace", allow(unsafe_code))]
-pub fn capture_webgl_backtrace<T: DomObject>(obj: &T) -> WebGLCommandBacktrace {
+pub(crate) fn capture_webgl_backtrace<T: DomObject>(obj: &T) -> WebGLCommandBacktrace {
     let bt = Backtrace::new();
     unsafe {
         capture_stack!(in(*obj.global().get_cx()) let stack);
@@ -1954,10 +1995,10 @@ impl Drop for WebGLRenderingContext {
     }
 }
 
-impl WebGLRenderingContextMethods for WebGLRenderingContext {
+impl WebGLRenderingContextMethods<crate::DomTypeHolder> for WebGLRenderingContext {
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.1
-    fn Canvas(&self) -> DomRoot<HTMLCanvasElement> {
-        DomRoot::from_ref(&*self.canvas)
+    fn Canvas(&self) -> HTMLCanvasElementOrOffscreenCanvas {
+        self.canvas.clone()
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.11
@@ -1987,42 +2028,53 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.5
-    fn GetBufferParameter(&self, _cx: SafeJSContext, target: u32, parameter: u32) -> JSVal {
-        let buffer =
-            handle_potential_webgl_error!(self, self.bound_buffer(target), return NullValue());
-        self.get_buffer_param(buffer, parameter)
+    fn GetBufferParameter(
+        &self,
+        _cx: SafeJSContext,
+        target: u32,
+        parameter: u32,
+        mut retval: MutableHandleValue,
+    ) {
+        let buffer = handle_potential_webgl_error!(
+            self,
+            self.bound_buffer(target),
+            return retval.set(NullValue())
+        );
+        self.get_buffer_param(buffer, parameter, retval)
     }
 
     #[allow(unsafe_code)]
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.3
-    fn GetParameter(&self, cx: SafeJSContext, parameter: u32) -> JSVal {
+    fn GetParameter(&self, cx: SafeJSContext, parameter: u32, mut retval: MutableHandleValue) {
         if !self
             .extension_manager
             .is_get_parameter_name_enabled(parameter)
         {
             self.webgl_error(WebGLError::InvalidEnum);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         match parameter {
             constants::ARRAY_BUFFER_BINDING => unsafe {
-                return optional_root_object_to_js_or_null!(*cx, &self.bound_buffer_array.get());
+                self.bound_buffer_array.get().to_jsval(*cx, retval);
+                return;
             },
             constants::CURRENT_PROGRAM => unsafe {
-                return optional_root_object_to_js_or_null!(*cx, &self.current_program.get());
+                self.current_program.get().to_jsval(*cx, retval);
+                return;
             },
             constants::ELEMENT_ARRAY_BUFFER_BINDING => unsafe {
                 let buffer = self.current_vao().element_array_buffer().get();
-                return optional_root_object_to_js_or_null!(*cx, buffer);
+                buffer.to_jsval(*cx, retval);
+                return;
             },
             constants::FRAMEBUFFER_BINDING => unsafe {
-                return optional_root_object_to_js_or_null!(
-                    *cx,
-                    &self.bound_draw_framebuffer.get()
-                );
+                self.bound_draw_framebuffer.get().to_jsval(*cx, retval);
+                return;
             },
             constants::RENDERBUFFER_BINDING => unsafe {
-                return optional_root_object_to_js_or_null!(*cx, &self.bound_renderbuffer.get());
+                self.bound_renderbuffer.get().to_jsval(*cx, retval);
+                return;
             },
             constants::TEXTURE_BINDING_2D => unsafe {
                 let texture = self
@@ -2030,7 +2082,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                     .active_texture_slot(constants::TEXTURE_2D, self.webgl_version())
                     .unwrap()
                     .get();
-                return optional_root_object_to_js_or_null!(*cx, texture);
+                texture.to_jsval(*cx, retval);
+                return;
             },
             constants::TEXTURE_BINDING_CUBE_MAP => unsafe {
                 let texture = self
@@ -2038,11 +2091,13 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                     .active_texture_slot(constants::TEXTURE_CUBE_MAP, self.webgl_version())
                     .unwrap()
                     .get();
-                return optional_root_object_to_js_or_null!(*cx, texture);
+                texture.to_jsval(*cx, retval);
+                return;
             },
             OESVertexArrayObjectConstants::VERTEX_ARRAY_BINDING_OES => unsafe {
                 let vao = self.current_vao.get().filter(|vao| vao.id().is_some());
-                return optional_root_object_to_js_or_null!(*cx, vao);
+                vao.to_jsval(*cx, retval);
+                return;
             },
             // In readPixels we currently support RGBA/UBYTE only.  If
             // we wanted to support other formats, we could ask the
@@ -2052,61 +2107,67 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             constants::IMPLEMENTATION_COLOR_READ_FORMAT => {
                 if self.validate_framebuffer().is_err() {
                     self.webgl_error(InvalidOperation);
-                    return NullValue();
+                    return retval.set(NullValue());
                 }
-                return Int32Value(constants::RGBA as i32);
+                return retval.set(Int32Value(constants::RGBA as i32));
             },
             constants::IMPLEMENTATION_COLOR_READ_TYPE => {
                 if self.validate_framebuffer().is_err() {
                     self.webgl_error(InvalidOperation);
-                    return NullValue();
+                    return retval.set(NullValue());
                 }
-                return Int32Value(constants::UNSIGNED_BYTE as i32);
+                return retval.set(Int32Value(constants::UNSIGNED_BYTE as i32));
             },
             constants::COMPRESSED_TEXTURE_FORMATS => unsafe {
                 let format_ids = self.extension_manager.get_tex_compression_ids();
 
                 rooted!(in(*cx) let mut rval = ptr::null_mut::<JSObject>());
-                let _ = Uint32Array::create(*cx, CreateWith::Slice(&format_ids), rval.handle_mut())
+                Uint32Array::create(*cx, CreateWith::Slice(&format_ids), rval.handle_mut())
                     .unwrap();
-                return ObjectValue(rval.get());
+                return retval.set(ObjectValue(rval.get()));
             },
             constants::VERSION => unsafe {
-                rooted!(in(*cx) let mut rval = UndefinedValue());
-                "WebGL 1.0".to_jsval(*cx, rval.handle_mut());
-                return rval.get();
+                "WebGL 1.0".to_jsval(*cx, retval);
+                return;
             },
             constants::RENDERER | constants::VENDOR => unsafe {
-                rooted!(in(*cx) let mut rval = UndefinedValue());
-                "Mozilla/Servo".to_jsval(*cx, rval.handle_mut());
-                return rval.get();
+                "Mozilla/Servo".to_jsval(*cx, retval);
+                return;
             },
             constants::SHADING_LANGUAGE_VERSION => unsafe {
-                rooted!(in(*cx) let mut rval = UndefinedValue());
-                "WebGL GLSL ES 1.0".to_jsval(*cx, rval.handle_mut());
-                return rval.get();
+                "WebGL GLSL ES 1.0".to_jsval(*cx, retval);
+                return;
             },
             constants::UNPACK_FLIP_Y_WEBGL => {
                 let unpack = self.texture_unpacking_settings.get();
-                return BooleanValue(unpack.contains(TextureUnpacking::FLIP_Y_AXIS));
+                retval.set(BooleanValue(unpack.contains(TextureUnpacking::FLIP_Y_AXIS)));
+                return;
             },
             constants::UNPACK_PREMULTIPLY_ALPHA_WEBGL => {
                 let unpack = self.texture_unpacking_settings.get();
-                return BooleanValue(unpack.contains(TextureUnpacking::PREMULTIPLY_ALPHA));
+                retval.set(BooleanValue(
+                    unpack.contains(TextureUnpacking::PREMULTIPLY_ALPHA),
+                ));
+                return;
             },
             constants::PACK_ALIGNMENT => {
-                return UInt32Value(self.texture_packing_alignment.get() as u32);
+                retval.set(UInt32Value(self.texture_packing_alignment.get() as u32));
+                return;
             },
             constants::UNPACK_ALIGNMENT => {
-                return UInt32Value(self.texture_unpacking_alignment.get());
+                retval.set(UInt32Value(self.texture_unpacking_alignment.get()));
+                return;
             },
             constants::UNPACK_COLORSPACE_CONVERSION_WEBGL => {
                 let unpack = self.texture_unpacking_settings.get();
-                return UInt32Value(if unpack.contains(TextureUnpacking::CONVERT_COLORSPACE) {
-                    constants::BROWSER_DEFAULT_WEBGL
-                } else {
-                    constants::NONE
-                });
+                retval.set(UInt32Value(
+                    if unpack.contains(TextureUnpacking::CONVERT_COLORSPACE) {
+                        constants::BROWSER_DEFAULT_WEBGL
+                    } else {
+                        constants::NONE
+                    },
+                ));
+                return;
             },
             _ => {},
         }
@@ -2133,103 +2194,109 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             _ => None,
         };
         if let Some(limit) = limit {
-            return UInt32Value(limit);
+            retval.set(UInt32Value(limit));
+            return;
         }
 
         if let Ok(value) = self.capabilities.is_enabled(parameter) {
-            return BooleanValue(value);
+            retval.set(BooleanValue(value));
+            return;
         }
 
         match handle_potential_webgl_error!(
             self,
             Parameter::from_u32(parameter),
-            return NullValue()
+            return retval.set(NullValue())
         ) {
             Parameter::Bool(param) => {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterBool(param, sender));
-                BooleanValue(receiver.recv().unwrap())
+                retval.set(BooleanValue(receiver.recv().unwrap()))
             },
             Parameter::Bool4(param) => unsafe {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterBool4(param, sender));
-                rooted!(in(*cx) let mut rval = UndefinedValue());
-                receiver.recv().unwrap().to_jsval(*cx, rval.handle_mut());
-                rval.get()
+                receiver.recv().unwrap().to_jsval(*cx, retval);
             },
             Parameter::Int(param) => {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterInt(param, sender));
-                Int32Value(receiver.recv().unwrap())
+                retval.set(Int32Value(receiver.recv().unwrap()))
             },
             Parameter::Int2(param) => unsafe {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterInt2(param, sender));
                 rooted!(in(*cx) let mut rval = ptr::null_mut::<JSObject>());
-                let _ = Int32Array::create(
+                Int32Array::create(
                     *cx,
                     CreateWith::Slice(&receiver.recv().unwrap()),
                     rval.handle_mut(),
                 )
                 .unwrap();
-                ObjectValue(rval.get())
+                retval.set(ObjectValue(rval.get()))
             },
             Parameter::Int4(param) => unsafe {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterInt4(param, sender));
                 rooted!(in(*cx) let mut rval = ptr::null_mut::<JSObject>());
-                let _ = Int32Array::create(
+                Int32Array::create(
                     *cx,
                     CreateWith::Slice(&receiver.recv().unwrap()),
                     rval.handle_mut(),
                 )
                 .unwrap();
-                ObjectValue(rval.get())
+                retval.set(ObjectValue(rval.get()))
             },
             Parameter::Float(param) => {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterFloat(param, sender));
-                DoubleValue(receiver.recv().unwrap() as f64)
+                retval.set(DoubleValue(receiver.recv().unwrap() as f64))
             },
             Parameter::Float2(param) => unsafe {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterFloat2(param, sender));
                 rooted!(in(*cx) let mut rval = ptr::null_mut::<JSObject>());
-                let _ = Float32Array::create(
+                Float32Array::create(
                     *cx,
                     CreateWith::Slice(&receiver.recv().unwrap()),
                     rval.handle_mut(),
                 )
                 .unwrap();
-                ObjectValue(rval.get())
+                retval.set(ObjectValue(rval.get()))
             },
             Parameter::Float4(param) => unsafe {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetParameterFloat4(param, sender));
                 rooted!(in(*cx) let mut rval = ptr::null_mut::<JSObject>());
-                let _ = Float32Array::create(
+                Float32Array::create(
                     *cx,
                     CreateWith::Slice(&receiver.recv().unwrap()),
                     rval.handle_mut(),
                 )
                 .unwrap();
-                ObjectValue(rval.get())
+                retval.set(ObjectValue(rval.get()))
             },
         }
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
-    fn GetTexParameter(&self, _cx: SafeJSContext, target: u32, pname: u32) -> JSVal {
+    fn GetTexParameter(
+        &self,
+        _cx: SafeJSContext,
+        target: u32,
+        pname: u32,
+        mut retval: MutableHandleValue,
+    ) {
         let texture_slot = handle_potential_webgl_error!(
             self,
             self.textures
                 .active_texture_slot(target, self.webgl_version()),
-            return NullValue()
+            return retval.set(NullValue())
         );
         let texture = handle_potential_webgl_error!(
             self,
             texture_slot.get().ok_or(InvalidOperation),
-            return NullValue()
+            return retval.set(NullValue())
         );
 
         if !self
@@ -2237,45 +2304,49 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             .is_get_tex_parameter_name_enabled(pname)
         {
             self.webgl_error(InvalidEnum);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         match pname {
-            constants::TEXTURE_MAG_FILTER => return UInt32Value(texture.mag_filter()),
-            constants::TEXTURE_MIN_FILTER => return UInt32Value(texture.min_filter()),
+            constants::TEXTURE_MAG_FILTER => return retval.set(UInt32Value(texture.mag_filter())),
+            constants::TEXTURE_MIN_FILTER => return retval.set(UInt32Value(texture.min_filter())),
             _ => {},
         }
 
-        let texparam =
-            handle_potential_webgl_error!(self, TexParameter::from_u32(pname), return NullValue());
+        let texparam = handle_potential_webgl_error!(
+            self,
+            TexParameter::from_u32(pname),
+            return retval.set(NullValue())
+        );
         if self.webgl_version() < texparam.required_webgl_version() {
             self.webgl_error(InvalidEnum);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         if let Some(value) = texture.maybe_get_tex_parameter(texparam) {
             match value {
-                TexParameterValue::Float(v) => return DoubleValue(v as f64),
-                TexParameterValue::Int(v) => return Int32Value(v),
-                TexParameterValue::Bool(v) => return BooleanValue(v),
+                TexParameterValue::Float(v) => retval.set(DoubleValue(v as f64)),
+                TexParameterValue::Int(v) => retval.set(Int32Value(v)),
+                TexParameterValue::Bool(v) => retval.set(BooleanValue(v)),
             }
+            return;
         }
 
         match texparam {
             TexParameter::Float(param) => {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetTexParameterFloat(target, param, sender));
-                DoubleValue(receiver.recv().unwrap() as f64)
+                retval.set(DoubleValue(receiver.recv().unwrap() as f64))
             },
             TexParameter::Int(param) => {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetTexParameterInt(target, param, sender));
-                Int32Value(receiver.recv().unwrap())
+                retval.set(Int32Value(receiver.recv().unwrap()))
             },
             TexParameter::Bool(param) => {
                 let (sender, receiver) = webgl_channel().unwrap();
                 self.send_command(WebGLCommand::GetTexParameterBool(target, param, sender));
-                BooleanValue(receiver.recv().unwrap())
+                retval.set(BooleanValue(receiver.recv().unwrap()))
             },
         }
     }
@@ -2442,7 +2513,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             },
             _ => return self.webgl_error(InvalidEnum),
         };
-        self.bind_buffer_maybe(&slot, target, buffer);
+        self.bind_buffer_maybe(slot, target, buffer);
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6
@@ -2664,15 +2735,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         // NB: TexImage2D depth is always equal to 1
         handle_potential_webgl_error!(
             self,
-            texture.initialize(
-                target,
-                width as u32,
-                height as u32,
-                1,
-                internal_format,
-                level as u32,
-                None
-            )
+            texture.initialize(target, width, height, 1, internal_format, level, None)
         );
 
         let msg = WebGLCommand::CopyTexImage2D(
@@ -2918,11 +2981,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             return;
         }
         self.current_vao().unbind_buffer(buffer);
-        if self
-            .bound_buffer_array
-            .get()
-            .map_or(false, |b| buffer == &*b)
-        {
+        if self.bound_buffer_array.get().is_some_and(|b| buffer == &*b) {
             self.bound_buffer_array.set(None);
             buffer.decrement_attached_counter(Operation::Infallible);
         }
@@ -3074,7 +3133,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             Ok(ret) => Some(ret),
             Err(e) => {
                 self.webgl_error(e);
-                return None;
+                None
             },
         }
     }
@@ -3103,15 +3162,20 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         target: u32,
         attachment: u32,
         pname: u32,
-    ) -> JSVal {
+        mut retval: MutableHandleValue,
+    ) {
         // Check if currently bound framebuffer is non-zero as per spec.
         if let Some(fb) = self.bound_draw_framebuffer.get() {
             // Opaque framebuffers cannot have their attachments inspected
             // https://immersive-web.github.io/webxr/#opaque-framebuffer
-            handle_potential_webgl_error!(self, fb.validate_transparent(), return NullValue());
+            handle_potential_webgl_error!(
+                self,
+                fb.validate_transparent(),
+                return retval.set(NullValue())
+            );
         } else {
             self.webgl_error(InvalidOperation);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         // Note: commented out stuff is for the WebGL2 standard.
@@ -3154,28 +3218,25 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             .attachment(attachment)
         {
             Some(attachment_root) => match attachment_root {
-                WebGLFramebufferAttachmentRoot::Renderbuffer(_) => match pname {
+                WebGLFramebufferAttachmentRoot::Renderbuffer(_) => matches!(
+                    pname,
                     constants::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE |
-                    constants::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME => true,
-                    _ => false,
-                },
-                WebGLFramebufferAttachmentRoot::Texture(_) => match pname {
+                        constants::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME
+                ),
+                WebGLFramebufferAttachmentRoot::Texture(_) => matches!(
+                    pname,
                     constants::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE |
-                    constants::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME |
-                    constants::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL |
-                    constants::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE => true,
-                    _ => false,
-                },
+                        constants::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME |
+                        constants::FRAMEBUFFER_ATTACHMENT_TEXTURE_LEVEL |
+                        constants::FRAMEBUFFER_ATTACHMENT_TEXTURE_CUBE_MAP_FACE
+                ),
             },
-            _ => match pname {
-                constants::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE => true,
-                _ => false,
-            },
+            _ => matches!(pname, constants::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE),
         };
 
         if !target_matches || !attachment_matches || !pname_matches || !bound_attachment_matches {
             self.webgl_error(InvalidEnum);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         // From the GLES2 spec:
@@ -3191,19 +3252,17 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             if let Some(webgl_attachment) = fb.attachment(attachment) {
                 match webgl_attachment {
                     WebGLFramebufferAttachmentRoot::Renderbuffer(rb) => unsafe {
-                        rooted!(in(*cx) let mut rval = NullValue());
-                        rb.to_jsval(*cx, rval.handle_mut());
-                        return rval.get();
+                        rb.to_jsval(*cx, retval);
+                        return;
                     },
                     WebGLFramebufferAttachmentRoot::Texture(texture) => unsafe {
-                        rooted!(in(*cx) let mut rval = NullValue());
-                        texture.to_jsval(*cx, rval.handle_mut());
-                        return rval.get();
+                        texture.to_jsval(*cx, retval);
+                        return;
                     },
                 }
             }
             self.webgl_error(InvalidEnum);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         let (sender, receiver) = webgl_channel().unwrap();
@@ -3211,36 +3270,42 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             target, attachment, pname, sender,
         ));
 
-        Int32Value(receiver.recv().unwrap())
+        retval.set(Int32Value(receiver.recv().unwrap()))
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7
-    fn GetRenderbufferParameter(&self, _cx: SafeJSContext, target: u32, pname: u32) -> JSVal {
+    fn GetRenderbufferParameter(
+        &self,
+        _cx: SafeJSContext,
+        target: u32,
+        pname: u32,
+        mut retval: MutableHandleValue,
+    ) {
         // We do not check to see if the renderbuffer came from an opaque framebuffer
         // https://github.com/immersive-web/webxr/issues/862
         let target_matches = target == constants::RENDERBUFFER;
 
-        let pname_matches = match pname {
+        let pname_matches = matches!(
+            pname,
             constants::RENDERBUFFER_WIDTH |
-            constants::RENDERBUFFER_HEIGHT |
-            constants::RENDERBUFFER_INTERNAL_FORMAT |
-            constants::RENDERBUFFER_RED_SIZE |
-            constants::RENDERBUFFER_GREEN_SIZE |
-            constants::RENDERBUFFER_BLUE_SIZE |
-            constants::RENDERBUFFER_ALPHA_SIZE |
-            constants::RENDERBUFFER_DEPTH_SIZE |
-            constants::RENDERBUFFER_STENCIL_SIZE => true,
-            _ => false,
-        };
+                constants::RENDERBUFFER_HEIGHT |
+                constants::RENDERBUFFER_INTERNAL_FORMAT |
+                constants::RENDERBUFFER_RED_SIZE |
+                constants::RENDERBUFFER_GREEN_SIZE |
+                constants::RENDERBUFFER_BLUE_SIZE |
+                constants::RENDERBUFFER_ALPHA_SIZE |
+                constants::RENDERBUFFER_DEPTH_SIZE |
+                constants::RENDERBUFFER_STENCIL_SIZE
+        );
 
         if !target_matches || !pname_matches {
             self.webgl_error(InvalidEnum);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         if self.bound_renderbuffer.get().is_none() {
             self.webgl_error(InvalidOperation);
-            return NullValue();
+            return retval.set(NullValue());
         }
 
         let result = if pname == constants::RENDERBUFFER_INTERNAL_FORMAT {
@@ -3254,7 +3319,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             receiver.recv().unwrap()
         };
 
-        Int32Value(result)
+        retval.set(Int32Value(result))
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
@@ -3270,13 +3335,23 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
-    fn GetProgramParameter(&self, _: SafeJSContext, program: &WebGLProgram, param: u32) -> JSVal {
-        handle_potential_webgl_error!(self, self.validate_ownership(program), return NullValue());
+    fn GetProgramParameter(
+        &self,
+        _: SafeJSContext,
+        program: &WebGLProgram,
+        param: u32,
+        mut retval: MutableHandleValue,
+    ) {
+        handle_potential_webgl_error!(
+            self,
+            self.validate_ownership(program),
+            return retval.set(NullValue())
+        );
         if program.is_deleted() {
             self.webgl_error(InvalidOperation);
-            return NullValue();
+            return retval.set(NullValue());
         }
-        match param {
+        retval.set(match param {
             constants::DELETE_STATUS => BooleanValue(program.is_marked_for_deletion()),
             constants::LINK_STATUS => BooleanValue(program.is_linked()),
             constants::VALIDATE_STATUS => {
@@ -3301,7 +3376,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 self.webgl_error(InvalidEnum);
                 NullValue()
             },
-        }
+        })
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
@@ -3311,13 +3386,23 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
-    fn GetShaderParameter(&self, _: SafeJSContext, shader: &WebGLShader, param: u32) -> JSVal {
-        handle_potential_webgl_error!(self, self.validate_ownership(shader), return NullValue());
+    fn GetShaderParameter(
+        &self,
+        _: SafeJSContext,
+        shader: &WebGLShader,
+        param: u32,
+        mut retval: MutableHandleValue,
+    ) {
+        handle_potential_webgl_error!(
+            self,
+            self.validate_ownership(shader),
+            return retval.set(NullValue())
+        );
         if shader.is_deleted() {
             self.webgl_error(InvalidValue);
-            return NullValue();
+            return retval.set(NullValue());
         }
-        match param {
+        retval.set(match param {
             constants::DELETE_STATUS => BooleanValue(shader.is_marked_for_deletion()),
             constants::COMPILE_STATUS => BooleanValue(shader.successfully_compiled()),
             constants::SHADER_TYPE => UInt32Value(shader.gl_type()),
@@ -3325,7 +3410,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 self.webgl_error(InvalidEnum);
                 NullValue()
             },
-        }
+        })
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
@@ -3383,8 +3468,14 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     #[allow(unsafe_code)]
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
-    fn GetVertexAttrib(&self, cx: SafeJSContext, index: u32, param: u32) -> JSVal {
-        let get_attrib = |data: Ref<VertexAttribData>| -> JSVal {
+    fn GetVertexAttrib(
+        &self,
+        cx: SafeJSContext,
+        index: u32,
+        param: u32,
+        mut retval: MutableHandleValue,
+    ) {
+        let mut get_attrib = |data: Ref<VertexAttribData>| {
             if param == constants::CURRENT_VERTEX_ATTRIB {
                 let attrib = self.current_vertex_attribs.borrow()[index as usize];
                 match attrib {
@@ -3392,39 +3483,35 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                         let value = [x, y, z, w];
                         unsafe {
                             rooted!(in(*cx) let mut result = ptr::null_mut::<JSObject>());
-                            let _ = Float32Array::create(
+                            Float32Array::create(
                                 *cx,
                                 CreateWith::Slice(&value),
                                 result.handle_mut(),
                             )
                             .unwrap();
-                            return ObjectValue(result.get());
+                            return retval.set(ObjectValue(result.get()));
                         }
                     },
                     VertexAttrib::Int(x, y, z, w) => {
                         let value = [x, y, z, w];
                         unsafe {
                             rooted!(in(*cx) let mut result = ptr::null_mut::<JSObject>());
-                            let _ = Int32Array::create(
-                                *cx,
-                                CreateWith::Slice(&value),
-                                result.handle_mut(),
-                            )
-                            .unwrap();
-                            return ObjectValue(result.get());
+                            Int32Array::create(*cx, CreateWith::Slice(&value), result.handle_mut())
+                                .unwrap();
+                            return retval.set(ObjectValue(result.get()));
                         }
                     },
                     VertexAttrib::Uint(x, y, z, w) => {
                         let value = [x, y, z, w];
                         unsafe {
                             rooted!(in(*cx) let mut result = ptr::null_mut::<JSObject>());
-                            let _ = Uint32Array::create(
+                            Uint32Array::create(
                                 *cx,
                                 CreateWith::Slice(&value),
                                 result.handle_mut(),
                             )
                             .unwrap();
-                            return ObjectValue(result.get());
+                            return retval.set(ObjectValue(result.get()));
                         }
                     },
                 };
@@ -3434,28 +3521,32 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 .is_get_vertex_attrib_name_enabled(param)
             {
                 self.webgl_error(WebGLError::InvalidEnum);
-                return NullValue();
+                return retval.set(NullValue());
             }
 
             match param {
-                constants::VERTEX_ATTRIB_ARRAY_ENABLED => BooleanValue(data.enabled_as_array),
-                constants::VERTEX_ATTRIB_ARRAY_SIZE => Int32Value(data.size as i32),
-                constants::VERTEX_ATTRIB_ARRAY_TYPE => Int32Value(data.type_ as i32),
-                constants::VERTEX_ATTRIB_ARRAY_NORMALIZED => BooleanValue(data.normalized),
-                constants::VERTEX_ATTRIB_ARRAY_STRIDE => Int32Value(data.stride as i32),
+                constants::VERTEX_ATTRIB_ARRAY_ENABLED => {
+                    retval.set(BooleanValue(data.enabled_as_array))
+                },
+                constants::VERTEX_ATTRIB_ARRAY_SIZE => retval.set(Int32Value(data.size as i32)),
+                constants::VERTEX_ATTRIB_ARRAY_TYPE => retval.set(Int32Value(data.type_ as i32)),
+                constants::VERTEX_ATTRIB_ARRAY_NORMALIZED => {
+                    retval.set(BooleanValue(data.normalized))
+                },
+                constants::VERTEX_ATTRIB_ARRAY_STRIDE => retval.set(Int32Value(data.stride as i32)),
                 constants::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING => unsafe {
-                    rooted!(in(*cx) let mut jsval = NullValue());
                     if let Some(buffer) = data.buffer() {
-                        buffer.to_jsval(*cx, jsval.handle_mut());
+                        buffer.to_jsval(*cx, retval);
+                    } else {
+                        retval.set(NullValue());
                     }
-                    jsval.get()
                 },
                 ANGLEInstancedArraysConstants::VERTEX_ATTRIB_ARRAY_DIVISOR_ANGLE => {
-                    UInt32Value(data.divisor)
+                    retval.set(UInt32Value(data.divisor))
                 },
                 _ => {
                     self.webgl_error(InvalidEnum);
-                    NullValue()
+                    retval.set(NullValue())
                 },
             }
         };
@@ -3466,7 +3557,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 let data = handle_potential_webgl_error!(
                     self,
                     current_vao.get_vertex_attrib(index).ok_or(InvalidValue),
-                    return NullValue()
+                    return retval.set(NullValue())
                 );
                 get_attrib(data)
             },
@@ -3475,7 +3566,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
                 let data = handle_potential_webgl_error!(
                     self,
                     current_vao.get_vertex_attrib(index).ok_or(InvalidValue),
-                    return NullValue()
+                    return retval.set(NullValue())
                 );
                 get_attrib(data)
             },
@@ -3529,7 +3620,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.5
     fn IsBuffer(&self, buffer: Option<&WebGLBuffer>) -> bool {
-        buffer.map_or(false, |buf| {
+        buffer.is_some_and(|buf| {
             self.validate_ownership(buf).is_ok() && buf.target().is_some() && !buf.is_deleted()
         })
     }
@@ -3541,35 +3632,31 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.6
     fn IsFramebuffer(&self, frame_buffer: Option<&WebGLFramebuffer>) -> bool {
-        frame_buffer.map_or(false, |buf| {
+        frame_buffer.is_some_and(|buf| {
             self.validate_ownership(buf).is_ok() && buf.target().is_some() && !buf.is_deleted()
         })
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
     fn IsProgram(&self, program: Option<&WebGLProgram>) -> bool {
-        program.map_or(false, |p| {
-            self.validate_ownership(p).is_ok() && !p.is_deleted()
-        })
+        program.is_some_and(|p| self.validate_ownership(p).is_ok() && !p.is_deleted())
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.7
     fn IsRenderbuffer(&self, render_buffer: Option<&WebGLRenderbuffer>) -> bool {
-        render_buffer.map_or(false, |buf| {
+        render_buffer.is_some_and(|buf| {
             self.validate_ownership(buf).is_ok() && buf.ever_bound() && !buf.is_deleted()
         })
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.9
     fn IsShader(&self, shader: Option<&WebGLShader>) -> bool {
-        shader.map_or(false, |s| {
-            self.validate_ownership(s).is_ok() && !s.is_deleted()
-        })
+        shader.is_some_and(|s| self.validate_ownership(s).is_ok() && !s.is_deleted())
     }
 
     // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.14.8
     fn IsTexture(&self, texture: Option<&WebGLTexture>) -> bool {
-        texture.map_or(false, |tex| {
+        texture.is_some_and(|tex| {
             self.validate_ownership(tex).is_ok() && tex.target().is_some() && !tex.is_invalid()
         })
     }
@@ -3805,7 +3892,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             constants::FRONT | constants::BACK | constants::FRONT_AND_BACK => {
                 self.send_command(WebGLCommand::StencilMaskSeparate(face, mask))
             },
-            _ => return self.webgl_error(InvalidEnum),
+            _ => self.webgl_error(InvalidEnum),
         };
     }
 
@@ -4053,61 +4140,92 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         cx: SafeJSContext,
         program: &WebGLProgram,
         location: &WebGLUniformLocation,
-    ) -> JSVal {
+        mut rval: MutableHandleValue,
+    ) {
         handle_potential_webgl_error!(
             self,
             self.uniform_check_program(program, location),
-            return NullValue()
+            return rval.set(NullValue())
         );
 
         let triple = (self, program.id(), location.id());
 
         match location.type_() {
-            constants::BOOL => BooleanValue(uniform_get(triple, WebGLCommand::GetUniformBool)),
+            constants::BOOL => rval.set(BooleanValue(uniform_get(
+                triple,
+                WebGLCommand::GetUniformBool,
+            ))),
             constants::BOOL_VEC2 => unsafe {
-                rooted!(in(*cx) let mut rval = NullValue());
-                uniform_get(triple, WebGLCommand::GetUniformBool2).to_jsval(*cx, rval.handle_mut());
-                rval.get()
+                uniform_get(triple, WebGLCommand::GetUniformBool2).to_jsval(*cx, rval);
             },
             constants::BOOL_VEC3 => unsafe {
-                rooted!(in(*cx) let mut rval = NullValue());
-                uniform_get(triple, WebGLCommand::GetUniformBool3).to_jsval(*cx, rval.handle_mut());
-                rval.get()
+                uniform_get(triple, WebGLCommand::GetUniformBool3).to_jsval(*cx, rval);
             },
             constants::BOOL_VEC4 => unsafe {
-                rooted!(in(*cx) let mut rval = NullValue());
-                uniform_get(triple, WebGLCommand::GetUniformBool4).to_jsval(*cx, rval.handle_mut());
-                rval.get()
+                uniform_get(triple, WebGLCommand::GetUniformBool4).to_jsval(*cx, rval);
             },
             constants::INT | constants::SAMPLER_2D | constants::SAMPLER_CUBE => {
-                Int32Value(uniform_get(triple, WebGLCommand::GetUniformInt))
+                rval.set(Int32Value(uniform_get(triple, WebGLCommand::GetUniformInt)))
             },
             constants::INT_VEC2 => unsafe {
-                uniform_typed::<Int32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformInt2))
+                uniform_typed::<Int32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformInt2),
+                    rval,
+                )
             },
             constants::INT_VEC3 => unsafe {
-                uniform_typed::<Int32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformInt3))
+                uniform_typed::<Int32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformInt3),
+                    rval,
+                )
             },
             constants::INT_VEC4 => unsafe {
-                uniform_typed::<Int32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformInt4))
+                uniform_typed::<Int32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformInt4),
+                    rval,
+                )
             },
-            constants::FLOAT => {
-                DoubleValue(uniform_get(triple, WebGLCommand::GetUniformFloat) as f64)
-            },
+            constants::FLOAT => rval
+                .set(DoubleValue(
+                    uniform_get(triple, WebGLCommand::GetUniformFloat) as f64,
+                )),
             constants::FLOAT_VEC2 => unsafe {
-                uniform_typed::<Float32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformFloat2))
+                uniform_typed::<Float32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformFloat2),
+                    rval,
+                )
             },
             constants::FLOAT_VEC3 => unsafe {
-                uniform_typed::<Float32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformFloat3))
+                uniform_typed::<Float32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformFloat3),
+                    rval,
+                )
             },
             constants::FLOAT_VEC4 | constants::FLOAT_MAT2 => unsafe {
-                uniform_typed::<Float32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformFloat4))
+                uniform_typed::<Float32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformFloat4),
+                    rval,
+                )
             },
             constants::FLOAT_MAT3 => unsafe {
-                uniform_typed::<Float32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformFloat9))
+                uniform_typed::<Float32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformFloat9),
+                    rval,
+                )
             },
             constants::FLOAT_MAT4 => unsafe {
-                uniform_typed::<Float32>(*cx, &uniform_get(triple, WebGLCommand::GetUniformFloat16))
+                uniform_typed::<Float32>(
+                    *cx,
+                    &uniform_get(triple, WebGLCommand::GetUniformFloat16),
+                    rval,
+                )
             },
             _ => panic!("wrong uniform type"),
         }
@@ -4152,7 +4270,7 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
             Float32ArrayOrUnrestrictedFloatSequence::Float32Array(v) => v.to_vec(),
             Float32ArrayOrUnrestrictedFloatSequence::UnrestrictedFloatSequence(v) => v,
         };
-        if values.len() < 1 {
+        if values.is_empty() {
             // https://github.com/KhronosGroup/WebGL/issues/2700
             return self.webgl_error(InvalidValue);
         }
@@ -4258,7 +4376,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         pixels: CustomAutoRooterGuard<Option<ArrayBufferView>>,
     ) -> ErrorResult {
         if !self.extension_manager.is_tex_type_enabled(data_type) {
-            return Ok(self.webgl_error(InvalidEnum));
+            self.webgl_error(InvalidEnum);
+            return Ok(());
         }
 
         let validator = TexImage2DValidator::new(
@@ -4289,24 +4408,28 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         };
 
         if !internal_format.compatible_data_types().contains(&data_type) {
-            return Ok(self.webgl_error(InvalidOperation));
+            return {
+                self.webgl_error(InvalidOperation);
+                Ok(())
+            };
         }
         if texture.is_immutable() {
-            return Ok(self.webgl_error(InvalidOperation));
+            return {
+                self.webgl_error(InvalidOperation);
+                Ok(())
+            };
         }
 
         let unpacking_alignment = self.texture_unpacking_alignment.get();
 
-        let expected_byte_length = match {
-            self.validate_tex_image_2d_data(
-                width,
-                height,
-                format,
-                data_type,
-                unpacking_alignment,
-                pixels.as_ref(),
-            )
-        } {
+        let expected_byte_length = match self.validate_tex_image_2d_data(
+            width,
+            height,
+            format,
+            data_type,
+            unpacking_alignment,
+            pixels.as_ref(),
+        ) {
             Ok(byte_length) => byte_length,
             Err(()) => return Ok(()),
         };
@@ -4325,7 +4448,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         //      type, and pixel storage parameters, generates an
         //      INVALID_OPERATION error."
         if buff.len() < expected_byte_length as usize {
-            return Ok(self.webgl_error(InvalidOperation));
+            return {
+                self.webgl_error(InvalidOperation);
+                Ok(())
+            };
         }
 
         let size = Size2D::new(width, height);
@@ -4372,7 +4498,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         source: TexImageSource,
     ) -> ErrorResult {
         if !self.extension_manager.is_tex_type_enabled(data_type) {
-            return Ok(self.webgl_error(InvalidEnum));
+            self.webgl_error(InvalidEnum);
+            return Ok(());
         }
 
         let pixels = match self.get_image_pixels(source)? {
@@ -4407,10 +4534,16 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         };
 
         if !internal_format.compatible_data_types().contains(&data_type) {
-            return Ok(self.webgl_error(InvalidOperation));
+            return {
+                self.webgl_error(InvalidOperation);
+                Ok(())
+            };
         }
         if texture.is_immutable() {
-            return Ok(self.webgl_error(InvalidOperation));
+            return {
+                self.webgl_error(InvalidOperation);
+                Ok(())
+            };
         }
 
         if !self.validate_filterable_texture(
@@ -4474,16 +4607,14 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
 
         let unpacking_alignment = self.texture_unpacking_alignment.get();
 
-        let expected_byte_length = match {
-            self.validate_tex_image_2d_data(
-                width,
-                height,
-                format,
-                data_type,
-                unpacking_alignment,
-                pixels.as_ref(),
-            )
-        } {
+        let expected_byte_length = match self.validate_tex_image_2d_data(
+            width,
+            height,
+            format,
+            data_type,
+            unpacking_alignment,
+            pixels.as_ref(),
+        ) {
             Ok(byte_length) => byte_length,
             Err(()) => return Ok(()),
         };
@@ -4504,7 +4635,10 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         //      type, and pixel storage parameters, generates an
         //      INVALID_OPERATION error."
         if buff.len() < expected_byte_length as usize {
-            return Ok(self.webgl_error(InvalidOperation));
+            return {
+                self.webgl_error(InvalidOperation);
+                Ok(())
+            };
         }
 
         self.tex_sub_image_2d(
@@ -4589,8 +4723,8 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
         }
 
         match self.bound_draw_framebuffer.get() {
-            Some(fb) => return fb.check_status(),
-            None => return constants::FRAMEBUFFER_COMPLETE,
+            Some(fb) => fb.check_status(),
+            None => constants::FRAMEBUFFER_COMPLETE,
         }
     }
 
@@ -4663,17 +4797,17 @@ impl WebGLRenderingContextMethods for WebGLRenderingContext {
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-webglrenderingcontextbase-makexrcompatible>
-    fn MakeXRCompatible(&self) -> Rc<Promise> {
+    #[cfg(feature = "webxr")]
+    fn MakeXRCompatible(&self, can_gc: CanGc) -> Rc<Promise> {
         // XXXManishearth Fill in with compatibility checks when rust-webxr supports this
-        let p = Promise::new(&self.global());
+        let p = Promise::new(&self.global(), can_gc);
         p.resolve_native(&());
         p
     }
 }
 
 impl LayoutCanvasRenderingContextHelpers for LayoutDom<'_, WebGLRenderingContext> {
-    #[allow(unsafe_code)]
-    unsafe fn canvas_data_source(self) -> HTMLCanvasDataSource {
+    fn canvas_data_source(self) -> HTMLCanvasDataSource {
         (*self.unsafe_get()).layout_handle()
     }
 }
@@ -4715,7 +4849,7 @@ macro_rules! capabilities {
     };
     ($prev:ident, [$($name:ident = $value:expr;)*]) => {
         #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
-        pub struct CapFlags(u16);
+        pub(crate) struct CapFlags(u16);
 
         bitflags! {
             impl CapFlags: u16 {
@@ -4746,9 +4880,9 @@ capabilities! {
     STENCIL_TEST,
 }
 
-#[crown::unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
-pub struct Textures {
+pub(crate) struct Textures {
     active_unit: Cell<u32>,
     units: Box<[TextureUnit]>,
 }
@@ -4764,7 +4898,7 @@ impl Textures {
         }
     }
 
-    pub fn active_unit_enum(&self) -> u32 {
+    pub(crate) fn active_unit_enum(&self) -> u32 {
         self.active_unit.get() + constants::TEXTURE0
     }
 
@@ -4777,7 +4911,7 @@ impl Textures {
         Ok(())
     }
 
-    pub fn active_texture_slot(
+    pub(crate) fn active_texture_slot(
         &self,
         target: u32,
         webgl_version: WebGLVersion,
@@ -4795,7 +4929,7 @@ impl Textures {
         }
     }
 
-    pub fn active_texture_for_image_target(
+    pub(crate) fn active_texture_for_image_target(
         &self,
         target: TexImageTarget,
     ) -> Option<DomRoot<WebGLTexture>> {
@@ -4826,7 +4960,7 @@ impl Textures {
     }
 }
 
-#[crown::unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(Default, JSTraceable, MallocSizeOf)]
 struct TextureUnit {
     tex_2d: MutNullableDom<WebGLTexture>,
@@ -4847,7 +4981,7 @@ impl TextureUnit {
             (&self.tex_3d, WebGL2RenderingContextConstants::TEXTURE_3D),
         ];
         for &(slot, target) in &fields {
-            if slot.get().map_or(false, |t| texture == &*t) {
+            if slot.get().is_some_and(|t| texture == &*t) {
                 slot.set(None);
                 return Some(target);
             }
@@ -4856,7 +4990,7 @@ impl TextureUnit {
     }
 }
 
-pub struct TexPixels {
+pub(crate) struct TexPixels {
     data: IpcSharedMemory,
     size: Size2D<u32>,
     pixel_format: Option<PixelFormat>,
@@ -4878,7 +5012,7 @@ impl TexPixels {
         }
     }
 
-    pub fn from_array(data: IpcSharedMemory, size: Size2D<u32>) -> Self {
+    pub(crate) fn from_array(data: IpcSharedMemory, size: Size2D<u32>) -> Self {
         Self {
             data,
             size,
@@ -4887,28 +5021,28 @@ impl TexPixels {
         }
     }
 
-    pub fn size(&self) -> Size2D<u32> {
+    pub(crate) fn size(&self) -> Size2D<u32> {
         self.size
     }
 }
 
-pub enum TexSource {
+pub(crate) enum TexSource {
     Pixels(TexPixels),
     BufferOffset(i64),
 }
 
 #[derive(JSTraceable)]
-pub struct WebGLCommandSender {
+pub(crate) struct WebGLCommandSender {
     #[no_trace]
     sender: WebGLChan,
 }
 
 impl WebGLCommandSender {
-    pub fn new(sender: WebGLChan) -> WebGLCommandSender {
+    pub(crate) fn new(sender: WebGLChan) -> WebGLCommandSender {
         WebGLCommandSender { sender }
     }
 
-    pub fn send(&self, msg: WebGLMsg) -> WebGLSendResult {
+    pub(crate) fn send(&self, msg: WebGLMsg) -> WebGLSendResult {
         self.sender.send(msg)
     }
 }
@@ -4928,19 +5062,23 @@ impl Clone for WebGLMessageSender {
 }
 
 impl WebGLMessageSender {
-    pub fn new(sender: WebGLMsgSender) -> WebGLMessageSender {
+    pub(crate) fn new(sender: WebGLMsgSender) -> WebGLMessageSender {
         WebGLMessageSender { sender }
     }
 
-    pub fn context_id(&self) -> WebGLContextId {
+    pub(crate) fn context_id(&self) -> WebGLContextId {
         self.sender.context_id()
     }
 
-    pub fn send(&self, msg: WebGLCommand, backtrace: WebGLCommandBacktrace) -> WebGLSendResult {
+    pub(crate) fn send(
+        &self,
+        msg: WebGLCommand,
+        backtrace: WebGLCommandBacktrace,
+    ) -> WebGLSendResult {
         self.sender.send(msg, backtrace)
     }
 
-    pub fn send_resize(
+    pub(crate) fn send_resize(
         &self,
         size: Size2D<u32>,
         sender: WebGLSender<Result<(), String>>,
@@ -4948,18 +5086,8 @@ impl WebGLMessageSender {
         self.sender.send_resize(size, sender)
     }
 
-    pub fn send_remove(&self) -> WebGLSendResult {
+    pub(crate) fn send_remove(&self) -> WebGLSendResult {
         self.sender.send_remove()
-    }
-}
-
-pub trait Size2DExt {
-    fn to_u64(&self) -> Size2D<u64>;
-}
-
-impl Size2DExt for Size2D<u32> {
-    fn to_u64(&self) -> Size2D<u64> {
-        return Size2D::new(self.width as u64, self.height as u64);
     }
 }
 
@@ -4972,6 +5100,7 @@ fn array_buffer_type_to_sized_type(type_: Type) -> Option<SizedDataType> {
         Type::Int16 => Some(SizedDataType::Int16),
         Type::Int32 => Some(SizedDataType::Int32),
         Type::Float32 => Some(SizedDataType::Float32),
+        Type::Float16 |
         Type::Float64 |
         Type::BigInt64 |
         Type::BigUint64 |

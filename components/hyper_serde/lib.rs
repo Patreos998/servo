@@ -20,7 +20,6 @@
 //! * `hyper::Method`
 //! * `hyper::Uri`
 //! * `mime::Mime`
-//! * `time::Tm`
 //!
 //! # How do I use a data type with a `HeaderMap` member with Serde?
 //!
@@ -78,7 +77,6 @@ use serde::de::{self, Error, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_bytes::{ByteBuf, Bytes};
-use time::{strptime, Tm};
 
 /// Deserialises a `T` value with a given deserializer.
 ///
@@ -138,7 +136,7 @@ impl<T> De<T> {
     /// Returns a new `De` wrapper
     #[inline(always)]
     pub fn new(v: T) -> Self {
-        De { v: v }
+        De { v }
     }
 }
 
@@ -289,7 +287,7 @@ impl<'de> Deserialize<'de> for De<ContentType> {
     }
 }
 
-impl<'a> Serialize for Ser<'a, ContentType> {
+impl Serialize for Ser<'_, ContentType> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -305,7 +303,7 @@ impl<'de> Deserialize<'de> for De<Cookie<'static>> {
     {
         struct CookieVisitor;
 
-        impl<'de> Visitor<'de> for CookieVisitor {
+        impl Visitor<'_> for CookieVisitor {
             type Value = De<Cookie<'static>>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -327,7 +325,7 @@ impl<'de> Deserialize<'de> for De<Cookie<'static>> {
     }
 }
 
-impl<'a, 'cookie> Serialize for Ser<'a, Cookie<'cookie>> {
+impl Serialize for Ser<'_, Cookie<'_>> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -366,7 +364,7 @@ impl<'de> Deserialize<'de> for De<HeaderMap> {
                     for v in values.0.iter() {
                         headers.append(
                             HeaderName::from_str(&k).map_err(V::Error::custom)?,
-                            HeaderValue::from_bytes(&v).map_err(V::Error::custom)?,
+                            HeaderValue::from_bytes(v).map_err(V::Error::custom)?,
                         );
                     }
                 }
@@ -419,14 +417,14 @@ impl<'de> Deserialize<'de> for De<HeaderMap> {
     }
 }
 
-impl<'a> Serialize for Ser<'a, HeaderMap> {
+impl Serialize for Ser<'_, HeaderMap> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         struct Value<'headers>(&'headers [Vec<u8>], bool);
 
-        impl<'headers> Serialize for Value<'headers> {
+        impl Serialize for Value<'_> {
             fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
             where
                 S: Serializer,
@@ -453,7 +451,7 @@ impl<'a> Serialize for Ser<'a, HeaderMap> {
                 &Value(
                     &values
                         .iter()
-                        .map(|v| v.as_bytes().iter().cloned().collect())
+                        .map(|v| v.as_bytes().to_vec())
                         .collect::<Vec<Vec<u8>>>(),
                     self.pretty,
                 ),
@@ -470,7 +468,7 @@ impl<'de> Deserialize<'de> for De<Method> {
     {
         struct MethodVisitor;
 
-        impl<'de> Visitor<'de> for MethodVisitor {
+        impl Visitor<'_> for MethodVisitor {
             type Value = De<Method>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -489,7 +487,7 @@ impl<'de> Deserialize<'de> for De<Method> {
     }
 }
 
-impl<'a> Serialize for Ser<'a, Method> {
+impl Serialize for Ser<'_, Method> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -505,7 +503,7 @@ impl<'de> Deserialize<'de> for De<Mime> {
     {
         struct MimeVisitor;
 
-        impl<'de> Visitor<'de> for MimeVisitor {
+        impl Visitor<'_> for MimeVisitor {
             type Value = De<Mime>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -526,12 +524,12 @@ impl<'de> Deserialize<'de> for De<Mime> {
     }
 }
 
-impl<'a> Serialize for Ser<'a, Mime> {
+impl Serialize for Ser<'_, Mime> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.v.to_string())
+        serializer.serialize_str(self.v.as_ref())
     }
 }
 
@@ -547,7 +545,7 @@ impl<'de> Deserialize<'de> for De<StatusCode> {
     }
 }
 
-impl<'a> Serialize for Ser<'a, StatusCode> {
+impl Serialize for Ser<'_, StatusCode> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -556,7 +554,7 @@ impl<'a> Serialize for Ser<'a, StatusCode> {
     }
 }
 
-impl<'a> Serialize for Ser<'a, (StatusCode, String)> {
+impl Serialize for Ser<'_, (StatusCode, String)> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -604,43 +602,6 @@ impl<'de> Visitor<'de> for StatusVisitor {
     }
 }
 
-impl<'de> Deserialize<'de> for De<Tm> {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct TmVisitor;
-
-        impl<'de> Visitor<'de> for TmVisitor {
-            type Value = De<Tm>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(formatter, "a date and time according to RFC 3339")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                strptime(v, "%Y-%m-%dT%H:%M:%SZ")
-                    .map(De::new)
-                    .map_err(|e| E::custom(e.to_string()))
-            }
-        }
-
-        deserializer.deserialize_string(TmVisitor)
-    }
-}
-
-impl<'a> Serialize for Ser<'a, Tm> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.v.rfc3339().to_string())
-    }
-}
-
 impl<'de> Deserialize<'de> for De<Uri> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -648,7 +609,7 @@ impl<'de> Deserialize<'de> for De<Uri> {
     {
         struct UriVisitor;
 
-        impl<'de> Visitor<'de> for UriVisitor {
+        impl Visitor<'_> for UriVisitor {
             type Value = De<Uri>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -669,7 +630,7 @@ impl<'de> Deserialize<'de> for De<Uri> {
     }
 }
 
-impl<'a> Serialize for Ser<'a, Uri> {
+impl Serialize for Ser<'_, Uri> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,

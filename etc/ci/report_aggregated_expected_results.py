@@ -37,7 +37,7 @@ class Item:
     def from_result(cls, result: dict, title: Optional[str] = None, print_stack=True):
         expected = result["expected"]
         actual = result["actual"]
-        title = title if title else result["path"]
+        title = title if title else f'`{result["path"]}`'
         if expected != actual:
             title = f"{actual} [expected {expected}] {title}"
         else:
@@ -51,12 +51,15 @@ class Item:
 
         stack = result["stack"] if result["stack"] and print_stack else ""
         body = f"{result['message']}\n{stack}".strip()
+        if body:
+            body = f"\n```\n{body}\n```\n"
 
         subtest_results = result.get("unexpected_subtest_results", [])
         children = [
             cls.from_result(
                 subtest_result,
-                f"subtest: {subtest_result['subtest']} {subtest_result.get('message', '')}",
+                f"subtest: `{subtest_result['subtest']}`"
+                + (f" \n```\n{subtest_result['message']}\n```\n" if subtest_result['message'] else ""),
                 False)
             for subtest_result in subtest_results
         ]
@@ -69,7 +72,7 @@ class Item:
                                       " " * len(indent + bullet))
         output += "\n".join([child.to_string("• ", indent + "  ")
                              for child in self.children])
-        return output.rstrip()
+        return output.rstrip().replace("`", "")
 
     def to_html(self, level: int = 0) -> ElementTree.Element:
         if level == 0:
@@ -181,7 +184,16 @@ def get_pr_number() -> Optional[str]:
     return None
 
 
-def create_check_run(body: str, tag: str = ""):
+def create_github_reports(body: str, tag: str = ""):
+    # GitHub will set a special environment variable which points to a file where
+    # a job summary can be appended. This is produced in addition to the GitHub
+    # check run below, as it has a larger length limit.
+    if "GITHUB_STEP_SUMMARY" in os.environ:
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            print(body, file=f)
+
+    # Create a GitHub check run. This is more user friendly than a job summary,
+    # but has a very limited size -- thus it may fail.
     # This process is based on the documentation here:
     # https://docs.github.com/en/rest/checks/runs?apiVersion=2022-11-28#create-a-check-runs
     results = json.loads(os.environ.get("RESULTS", "{}"))
@@ -234,16 +246,16 @@ def main():
     results = get_results(filenames, args.tag)
     if not results:
         print("Did not find any unexpected results.")
-        create_check_run("Did not find any unexpected results.", args.tag)
+        create_github_reports("Did not find any unexpected results.", args.tag)
         return
 
     print(results.to_string())
 
-    pr_number = get_pr_number()
     html_string = ElementTree.tostring(
         results.to_html(), encoding="unicode")
-    create_check_run(html_string, args.tag)
+    create_github_reports(html_string, args.tag)
 
+    pr_number = get_pr_number()
     if pr_number:
         process = subprocess.Popen(
             ['gh', 'pr', 'comment', pr_number, '-F', '-'], stdin=subprocess.PIPE)

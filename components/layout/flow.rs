@@ -31,16 +31,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use app_units::Au;
+use base::print_tree::PrintTree;
 use bitflags::bitflags;
 use euclid::default::{Point2D, Rect, Size2D, Vector2D};
-use gfx_traits::print_tree::PrintTree;
-use gfx_traits::StackingContextId;
 use log::debug;
 use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 use servo_geometry::{au_rect_to_f32_rect, f32_rect_to_au_rect, MaxRect};
-use style::computed_values::clear::T as Clear;
-use style::computed_values::float::T as Float;
 use style::computed_values::overflow_x::T as StyleOverflow;
 use style::computed_values::position::T as Position;
 use style::computed_values::text_align::T as TextAlign;
@@ -54,9 +51,11 @@ use webrender_api::units::LayoutTransform;
 use crate::block::{BlockFlow, FormattingContextType};
 use crate::context::LayoutContext;
 use crate::display_list::items::ClippingAndScrolling;
-use crate::display_list::{DisplayListBuildState, StackingContextCollectionState};
+use crate::display_list::{
+    DisplayListBuildState, StackingContextCollectionState, StackingContextId,
+};
 use crate::flex::FlexFlow;
-use crate::floats::{Floats, SpeculatedFloatPlacement};
+use crate::floats::{ClearType, FloatKind, Floats, SpeculatedFloatPlacement};
 use crate::flow_list::{FlowList, FlowListIterator, MutFlowListIterator};
 use crate::flow_ref::{FlowRef, WeakFlowRef};
 use crate::fragment::{CoordinateSystem, Fragment, FragmentBorderBoxIterator, Overflow};
@@ -73,8 +72,11 @@ use crate::table_wrapper::TableWrapperFlow;
 /// This marker trait indicates that a type is a struct with `#[repr(C)]` whose first field
 /// is of type `BaseFlow` or some type that also implements this trait.
 ///
-/// In other words, the memory representation of `BaseFlow` must be a prefix
-/// of the memory representation of types implementing `HasBaseFlow`.
+/// # Safety
+///
+/// The memory representation of `BaseFlow` must be a prefix of the memory representation of types
+/// implementing `HasBaseFlow`. If this isn't the case, calling [`GetBaseFlow::base`] or
+/// [`GetBaseFlow::mut_base`] could lead to memory errors.
 #[allow(unsafe_code)]
 pub unsafe trait HasBaseFlow {}
 
@@ -250,7 +252,7 @@ pub trait Flow: HasBaseFlow + fmt::Debug + Sync + Send + 'static {
     fn collect_stacking_contexts(&mut self, state: &mut StackingContextCollectionState);
 
     /// If this is a float, places it. The default implementation does nothing.
-    fn place_float_if_applicable<'a>(&mut self) {}
+    fn place_float_if_applicable(&mut self) {}
 
     /// Assigns block-sizes in-order; or, if this is a float, places the float. The default
     /// implementation simply assigns block-sizes if this flow might have floats in. Returns true
@@ -505,6 +507,7 @@ pub trait Flow: HasBaseFlow + fmt::Debug + Sync + Send + 'static {
     }
 }
 
+#[allow(clippy::wrong_self_convention)]
 pub trait ImmutableFlowUtils {
     // Convenience functions
 
@@ -603,18 +606,18 @@ pub enum FlowClass {
 
 impl FlowClass {
     fn is_block_like(self) -> bool {
-        match self {
+        matches!(
+            self,
             FlowClass::Block |
-            FlowClass::ListItem |
-            FlowClass::Table |
-            FlowClass::TableRowGroup |
-            FlowClass::TableRow |
-            FlowClass::TableCaption |
-            FlowClass::TableCell |
-            FlowClass::TableWrapper |
-            FlowClass::Flex => true,
-            _ => false,
-        }
+                FlowClass::ListItem |
+                FlowClass::Table |
+                FlowClass::TableRowGroup |
+                FlowClass::TableRow |
+                FlowClass::TableCaption |
+                FlowClass::TableCell |
+                FlowClass::TableWrapper |
+                FlowClass::Flex
+        )
     }
 }
 
@@ -667,13 +670,13 @@ bitflags! {
 
 impl FlowFlags {
     #[inline]
-    pub fn float_kind(&self) -> Float {
+    pub fn float_kind(&self) -> Option<FloatKind> {
         if self.contains(FlowFlags::FLOATS_LEFT) {
-            Float::Left
+            Some(FloatKind::Left)
         } else if self.contains(FlowFlags::FLOATS_RIGHT) {
-            Float::Right
+            Some(FloatKind::Right)
         } else {
-            Float::None
+            None
         }
     }
 
@@ -739,6 +742,12 @@ impl AbsoluteDescendants {
         for descendant_info in self.descendant_links.iter_mut() {
             descendant_info.has_reached_containing_block = true
         }
+    }
+}
+
+impl Default for AbsoluteDescendants {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -823,6 +832,12 @@ impl LateAbsolutePositionInfo {
         LateAbsolutePositionInfo {
             stacking_relative_position_of_absolute_containing_block: Point2D::zero(),
         }
+    }
+}
+
+impl Default for LateAbsolutePositionInfo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -944,7 +959,7 @@ impl fmt::Debug for BaseFlow {
             "".to_owned()
         };
 
-        let absolute_descendants_string = if self.abs_descendants.len() > 0 {
+        let absolute_descendants_string = if !self.abs_descendants.is_empty() {
             format!("\nabs-descendents={}", self.abs_descendants.len())
         } else {
             "".to_owned()
@@ -995,7 +1010,6 @@ impl fmt::Debug for BaseFlow {
 impl Serialize for BaseFlow {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut serializer = serializer.serialize_struct("base", 5)?;
-        serializer.serialize_field("id", &self.debug_id())?;
         serializer.serialize_field(
             "stacking_relative_position",
             &self.stacking_relative_position,
@@ -1053,18 +1067,22 @@ impl BaseFlow {
                 }
 
                 if force_nonfloated == ForceNonfloatedFlag::FloatIfNecessary {
-                    match style.get_box().float {
-                        Float::None => {},
-                        Float::Left => flags.insert(FlowFlags::FLOATS_LEFT),
-                        Float::Right => flags.insert(FlowFlags::FLOATS_RIGHT),
+                    // FIXME: this should use the writing mode of the containing block.
+                    match FloatKind::from_property_and_writing_mode(
+                        style.get_box().float,
+                        style.writing_mode,
+                    ) {
+                        None => {},
+                        Some(FloatKind::Left) => flags.insert(FlowFlags::FLOATS_LEFT),
+                        Some(FloatKind::Right) => flags.insert(FlowFlags::FLOATS_RIGHT),
                     }
                 }
 
-                match style.get_box().clear {
-                    Clear::None => {},
-                    Clear::Left => flags.insert(FlowFlags::CLEARS_LEFT),
-                    Clear::Right => flags.insert(FlowFlags::CLEARS_RIGHT),
-                    Clear::Both => {
+                match ClearType::from_style(style) {
+                    None => {},
+                    Some(ClearType::Left) => flags.insert(FlowFlags::CLEARS_LEFT),
+                    Some(ClearType::Right) => flags.insert(FlowFlags::CLEARS_RIGHT),
+                    Some(ClearType::Both) => {
                         flags.insert(FlowFlags::CLEARS_LEFT);
                         flags.insert(FlowFlags::CLEARS_RIGHT);
                     },
@@ -1144,7 +1162,7 @@ impl BaseFlow {
     /// Return a new BaseFlow like this one but with the given children list
     pub fn clone_with_children(&self, children: FlowList) -> BaseFlow {
         BaseFlow {
-            children: children,
+            children,
             restyle_damage: self.restyle_damage |
                 ServoRestyleDamage::REPAINT |
                 ServoRestyleDamage::REFLOW_OUT_OF_FLOW |
@@ -1153,7 +1171,7 @@ impl BaseFlow {
             floats: self.floats.clone(),
             abs_descendants: self.abs_descendants.clone(),
             absolute_cb: self.absolute_cb.clone(),
-            clip: self.clip.clone(),
+            clip: self.clip,
 
             ..*self
         }
@@ -1166,11 +1184,6 @@ impl BaseFlow {
 
     pub fn child_iter_mut(&mut self) -> MutFlowListIterator {
         self.children.iter_mut()
-    }
-
-    pub fn debug_id(&self) -> usize {
-        let p = self as *const _;
-        p as usize
     }
 
     pub fn collect_stacking_contexts_for_children(
@@ -1212,7 +1225,7 @@ impl BaseFlow {
     }
 }
 
-impl<'a> ImmutableFlowUtils for &'a dyn Flow {
+impl ImmutableFlowUtils for &dyn Flow {
     /// Returns true if this flow is a block flow or subclass thereof.
     fn is_block_like(self) -> bool {
         self.class().is_block_like()
@@ -1220,50 +1233,32 @@ impl<'a> ImmutableFlowUtils for &'a dyn Flow {
 
     /// Returns true if this flow is a table row flow.
     fn is_table_row(self) -> bool {
-        match self.class() {
-            FlowClass::TableRow => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::TableRow)
     }
 
     /// Returns true if this flow is a table cell flow.
     fn is_table_cell(self) -> bool {
-        match self.class() {
-            FlowClass::TableCell => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::TableCell)
     }
 
     /// Returns true if this flow is a table colgroup flow.
     fn is_table_colgroup(self) -> bool {
-        match self.class() {
-            FlowClass::TableColGroup => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::TableColGroup)
     }
 
     /// Returns true if this flow is a table flow.
     fn is_table(self) -> bool {
-        match self.class() {
-            FlowClass::Table => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::Table)
     }
 
     /// Returns true if this flow is a table caption flow.
     fn is_table_caption(self) -> bool {
-        match self.class() {
-            FlowClass::TableCaption => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::TableCaption)
     }
 
     /// Returns true if this flow is a table rowgroup flow.
     fn is_table_rowgroup(self) -> bool {
-        match self.class() {
-            FlowClass::TableRowGroup => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::TableRowGroup)
     }
 
     /// Returns the number of children that this flow possesses.
@@ -1273,18 +1268,12 @@ impl<'a> ImmutableFlowUtils for &'a dyn Flow {
 
     /// Returns true if this flow is a block flow.
     fn is_block_flow(self) -> bool {
-        match self.class() {
-            FlowClass::Block => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::Block)
     }
 
     /// Returns true if this flow is an inline flow.
     fn is_inline_flow(self) -> bool {
-        match self.class() {
-            FlowClass::Inline => true,
-            _ => false,
-        }
+        matches!(self.class(), FlowClass::Inline)
     }
 
     /// Dumps the flow tree for debugging.
@@ -1337,7 +1326,7 @@ impl<'a> ImmutableFlowUtils for &'a dyn Flow {
     }
 }
 
-impl<'a> MutableFlowUtils for &'a mut dyn Flow {
+impl MutableFlowUtils for &mut dyn Flow {
     /// Calls `repair_style` and `bubble_inline_sizes`. You should use this method instead of
     /// calling them individually, since there is no reason not to perform both operations.
     fn repair_style_and_bubble_inline_sizes(self, style: &crate::ServoArc<ComputedValues>) {
@@ -1380,7 +1369,7 @@ impl MutableOwnedFlowUtils for FlowRef {
         for descendant_link in abs_descendants.descendant_links.iter_mut() {
             // TODO(servo#30573) revert to debug_assert!() once underlying bug is fixed
             #[cfg(debug_assertions)]
-            if !(!descendant_link.has_reached_containing_block) {
+            if descendant_link.has_reached_containing_block {
                 log::warn!("debug assertion failed! !descendant_link.has_reached_containing_block");
             }
             let descendant_base = FlowRef::deref_mut(&mut descendant_link.flow).mut_base();

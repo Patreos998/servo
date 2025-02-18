@@ -23,7 +23,7 @@ use js::rust::{HandleId, HandleValue, IdVector, MutableHandleValue};
 use crate::dom::bindings::conversions::jsid_to_string;
 use crate::dom::bindings::str::{ByteString, DOMString, USVString};
 
-pub trait RecordKey: Eq + Hash + Sized {
+pub(crate) trait RecordKey: Eq + Hash + Sized {
     fn to_utf16_vec(&self) -> Vec<u16>;
     unsafe fn from_id(cx: *mut JSContext, id: HandleId) -> Result<ConversionResult<Self>, ()>;
 }
@@ -71,14 +71,14 @@ impl RecordKey for ByteString {
 
 /// The `Record` (open-ended dictionary) type.
 #[derive(Clone, JSTraceable)]
-pub struct Record<K: RecordKey, V> {
+pub(crate) struct Record<K: RecordKey, V> {
     #[custom_trace]
     map: IndexMap<K, V>,
 }
 
 impl<K: RecordKey, V> Record<K, V> {
     /// Create an empty `Record`.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Record {
             map: IndexMap::new(),
         }
@@ -163,7 +163,7 @@ where
             map.insert(key, property);
         }
 
-        Ok(ConversionResult::Success(Record { map: map }))
+        Ok(ConversionResult::Success(Record { map }))
     }
 }
 
@@ -193,5 +193,11 @@ where
         }
 
         rval.set(ObjectValue(js_object.handle().get()));
+    }
+}
+
+impl<K: RecordKey, V> Default for Record<K, V> {
+    fn default() -> Self {
+        Self::new()
     }
 }

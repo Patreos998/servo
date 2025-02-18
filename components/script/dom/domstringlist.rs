@@ -9,16 +9,17 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct DOMStringList {
+pub(crate) struct DOMStringList {
     reflector_: Reflector,
     strings: Vec<DOMString>,
 }
 
 impl DOMStringList {
     #[allow(unused)]
-    pub fn new_inherited(strings: Vec<DOMString>) -> DOMStringList {
+    pub(crate) fn new_inherited(strings: Vec<DOMString>) -> DOMStringList {
         DOMStringList {
             reflector_: Reflector::new(),
             strings,
@@ -26,13 +27,17 @@ impl DOMStringList {
     }
 
     #[allow(unused)]
-    pub fn new(window: &Window, strings: Vec<DOMString>) -> DomRoot<DOMStringList> {
-        reflect_dom_object(Box::new(DOMStringList::new_inherited(strings)), window)
+    pub(crate) fn new(window: &Window, strings: Vec<DOMString>) -> DomRoot<DOMStringList> {
+        reflect_dom_object(
+            Box::new(DOMStringList::new_inherited(strings)),
+            window,
+            CanGc::note(),
+        )
     }
 }
 
 // https://html.spec.whatwg.org/multipage/#domstringlist
-impl DOMStringListMethods for DOMStringList {
+impl DOMStringListMethods<crate::DomTypeHolder> for DOMStringList {
     // https://html.spec.whatwg.org/multipage/#dom-domstringlist-length
     fn Length(&self) -> u32 {
         self.strings.len() as u32

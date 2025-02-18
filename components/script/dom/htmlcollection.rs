@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
+use std::cmp::Ordering;
 
 use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, ns, LocalName, QualName};
@@ -17,16 +18,17 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::JSTraceable;
 use crate::dom::bindings::xmlname::namespace_from_domstring;
 use crate::dom::element::Element;
-use crate::dom::node::{document_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
-pub trait CollectionFilter: JSTraceable {
+pub(crate) trait CollectionFilter: JSTraceable {
     fn filter<'a>(&self, elem: &'a Element, root: &'a Node) -> bool;
 }
 
-// An optional u32, using maxint to represent None.
-// It would be nicer just to use Option<u32> for this, but that would produce word
-// alignment issues since Option<u32> uses 33 bits.
+/// An optional `u32`, using `u32::MAX` to represent None.  It would be nicer
+/// just to use `Option<u32>` for this, but that would produce word alignment
+/// issues since `Option<u32>` uses 33 bits.
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
 struct OptionU32 {
     bits: u32,
@@ -34,7 +36,7 @@ struct OptionU32 {
 
 impl OptionU32 {
     fn to_option(self) -> Option<u32> {
-        if self.bits == u32::max_value() {
+        if self.bits == u32::MAX {
             None
         } else {
             Some(self.bits)
@@ -42,22 +44,20 @@ impl OptionU32 {
     }
 
     fn some(bits: u32) -> OptionU32 {
-        assert_ne!(bits, u32::max_value());
-        OptionU32 { bits: bits }
+        assert_ne!(bits, u32::MAX);
+        OptionU32 { bits }
     }
 
     fn none() -> OptionU32 {
-        OptionU32 {
-            bits: u32::max_value(),
-        }
+        OptionU32 { bits: u32::MAX }
     }
 }
 
 #[dom_struct]
-pub struct HTMLCollection {
+pub(crate) struct HTMLCollection {
     reflector_: Reflector,
     root: Dom<Node>,
-    #[ignore_malloc_size_of = "Contains a trait object; can't measure due to #6870"]
+    #[ignore_malloc_size_of = "Trait object (Box<dyn CollectionFilter>) cannot be sized"]
     filter: Box<dyn CollectionFilter + 'static>,
     // We cache the version of the root node and all its decendents,
     // the length of the collection, and a cursor into the collection.
@@ -69,15 +69,15 @@ pub struct HTMLCollection {
 }
 
 impl HTMLCollection {
-    #[allow(crown::unrooted_must_root)]
-    pub fn new_inherited(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new_inherited(
         root: &Node,
         filter: Box<dyn CollectionFilter + 'static>,
     ) -> HTMLCollection {
         HTMLCollection {
             reflector_: Reflector::new(),
             root: Dom::from_ref(root),
-            filter: filter,
+            filter,
             // Default values for the cache
             cached_version: Cell::new(root.inclusive_descendants_version()),
             cached_cursor_element: MutNullableDom::new(None),
@@ -87,7 +87,7 @@ impl HTMLCollection {
     }
 
     /// Returns a collection which is always empty.
-    pub fn always_empty(window: &Window, root: &Node) -> DomRoot<Self> {
+    pub(crate) fn always_empty(window: &Window, root: &Node) -> DomRoot<Self> {
         #[derive(JSTraceable)]
         struct NoFilter;
         impl CollectionFilter for NoFilter {
@@ -99,24 +99,51 @@ impl HTMLCollection {
         Self::new(window, root, Box::new(NoFilter))
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         root: &Node,
         filter: Box<dyn CollectionFilter + 'static>,
-    ) -> DomRoot<HTMLCollection> {
+    ) -> DomRoot<Self> {
         reflect_dom_object(
-            Box::new(HTMLCollection::new_inherited(root, filter)),
+            Box::new(Self::new_inherited(root, filter)),
             window,
+            CanGc::note(),
         )
     }
 
-    pub fn create(
+    /// Create a new  [`HTMLCollection`] that just filters element using a static function.
+    pub(crate) fn new_with_filter_fn(
+        window: &Window,
+        root: &Node,
+        filter_function: fn(&Element, &Node) -> bool,
+    ) -> DomRoot<Self> {
+        #[derive(JSTraceable, MallocSizeOf)]
+        pub(crate) struct StaticFunctionFilter(
+            // The function *must* be static so that it never holds references to DOM objects, which
+            // would cause issues with garbage collection -- since it isn't traced.
+            #[no_trace]
+            #[ignore_malloc_size_of = "Static function pointer"]
+            fn(&Element, &Node) -> bool,
+        );
+        impl CollectionFilter for StaticFunctionFilter {
+            fn filter(&self, element: &Element, root: &Node) -> bool {
+                (self.0)(element, root)
+            }
+        }
+        Self::new(
+            window,
+            root,
+            Box::new(StaticFunctionFilter(filter_function)),
+        )
+    }
+
+    pub(crate) fn create(
         window: &Window,
         root: &Node,
         filter: Box<dyn CollectionFilter + 'static>,
-    ) -> DomRoot<HTMLCollection> {
-        HTMLCollection::new(window, root, filter)
+    ) -> DomRoot<Self> {
+        Self::new(window, root, filter)
     }
 
     fn validate_cache(&self) {
@@ -146,8 +173,8 @@ impl HTMLCollection {
         }
     }
 
-    // https://dom.spec.whatwg.org/#concept-getelementsbytagname
-    pub fn by_qualified_name(
+    /// <https://dom.spec.whatwg.org/#concept-getelementsbytagname>
+    pub(crate) fn by_qualified_name(
         window: &Window,
         root: &Node,
         qualified_name: LocalName,
@@ -185,7 +212,7 @@ impl HTMLCollection {
 
         let filter = HtmlDocumentFilter {
             ascii_lower_qualified_name: qualified_name.to_ascii_lowercase(),
-            qualified_name: qualified_name,
+            qualified_name,
         };
         HTMLCollection::create(window, root, Box::new(filter))
     }
@@ -195,13 +222,13 @@ impl HTMLCollection {
             None => elem.local_name() == qualified_name,
             Some(prefix) => {
                 qualified_name.starts_with(&**prefix) &&
-                    qualified_name.find(":") == Some(prefix.len()) &&
+                    qualified_name.find(':') == Some(prefix.len()) &&
                     qualified_name.ends_with(&**elem.local_name())
             },
         }
     }
 
-    pub fn by_tag_name_ns(
+    pub(crate) fn by_tag_name_ns(
         window: &Window,
         root: &Node,
         tag: DOMString,
@@ -213,7 +240,7 @@ impl HTMLCollection {
         HTMLCollection::by_qual_tag_name(window, root, qname)
     }
 
-    pub fn by_qual_tag_name(
+    pub(crate) fn by_qual_tag_name(
         window: &Window,
         root: &Node,
         qname: QualName,
@@ -230,11 +257,11 @@ impl HTMLCollection {
                         (self.qname.local == *elem.local_name()))
             }
         }
-        let filter = TagNameNSFilter { qname: qname };
+        let filter = TagNameNSFilter { qname };
         HTMLCollection::create(window, root, Box::new(filter))
     }
 
-    pub fn by_class_name(
+    pub(crate) fn by_class_name(
         window: &Window,
         root: &Node,
         classes: DOMString,
@@ -243,7 +270,7 @@ impl HTMLCollection {
         HTMLCollection::by_atomic_class_name(window, root, class_atoms)
     }
 
-    pub fn by_atomic_class_name(
+    pub(crate) fn by_atomic_class_name(
         window: &Window,
         root: &Node,
         classes: Vec<Atom>,
@@ -255,7 +282,8 @@ impl HTMLCollection {
         }
         impl CollectionFilter for ClassNameFilter {
             fn filter(&self, elem: &Element, _root: &Node) -> bool {
-                let case_sensitivity = document_from_node(elem)
+                let case_sensitivity = elem
+                    .owner_document()
                     .quirks_mode()
                     .classes_and_ids_case_sensitivity();
 
@@ -269,22 +297,17 @@ impl HTMLCollection {
             return HTMLCollection::always_empty(window, root);
         }
 
-        let filter = ClassNameFilter { classes: classes };
+        let filter = ClassNameFilter { classes };
         HTMLCollection::create(window, root, Box::new(filter))
     }
 
-    pub fn children(window: &Window, root: &Node) -> DomRoot<HTMLCollection> {
-        #[derive(JSTraceable, MallocSizeOf)]
-        struct ElementChildFilter;
-        impl CollectionFilter for ElementChildFilter {
-            fn filter(&self, elem: &Element, root: &Node) -> bool {
-                root.is_parent_of(elem.upcast())
-            }
-        }
-        HTMLCollection::create(window, root, Box::new(ElementChildFilter))
+    pub(crate) fn children(window: &Window, root: &Node) -> DomRoot<HTMLCollection> {
+        HTMLCollection::new_with_filter_fn(window, root, |element, root| {
+            root.is_parent_of(element.upcast())
+        })
     }
 
-    pub fn elements_iter_after<'a>(
+    pub(crate) fn elements_iter_after<'a>(
         &'a self,
         after: &'a Node,
     ) -> impl Iterator<Item = DomRoot<Element>> + 'a {
@@ -292,15 +315,15 @@ impl HTMLCollection {
         after
             .following_nodes(&self.root)
             .filter_map(DomRoot::downcast)
-            .filter(move |element| self.filter.filter(&element, &self.root))
+            .filter(move |element| self.filter.filter(element, &self.root))
     }
 
-    pub fn elements_iter<'a>(&'a self) -> impl Iterator<Item = DomRoot<Element>> + 'a {
+    pub(crate) fn elements_iter(&self) -> impl Iterator<Item = DomRoot<Element>> + '_ {
         // Iterate forwards from the root.
-        self.elements_iter_after(&*self.root)
+        self.elements_iter_after(&self.root)
     }
 
-    pub fn elements_iter_before<'a>(
+    pub(crate) fn elements_iter_before<'a>(
         &'a self,
         before: &'a Node,
     ) -> impl Iterator<Item = DomRoot<Element>> + 'a {
@@ -308,16 +331,16 @@ impl HTMLCollection {
         before
             .preceding_nodes(&self.root)
             .filter_map(DomRoot::downcast)
-            .filter(move |element| self.filter.filter(&element, &self.root))
+            .filter(move |element| self.filter.filter(element, &self.root))
     }
 
-    pub fn root_node(&self) -> DomRoot<Node> {
+    pub(crate) fn root_node(&self) -> DomRoot<Node> {
         DomRoot::from_ref(&self.root)
     }
 }
 
-impl HTMLCollectionMethods for HTMLCollection {
-    // https://dom.spec.whatwg.org/#dom-htmlcollection-length
+impl HTMLCollectionMethods<crate::DomTypeHolder> for HTMLCollection {
+    /// <https://dom.spec.whatwg.org/#dom-htmlcollection-length>
     fn Length(&self) -> u32 {
         self.validate_cache();
 
@@ -332,30 +355,34 @@ impl HTMLCollectionMethods for HTMLCollection {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-htmlcollection-item
+    /// <https://dom.spec.whatwg.org/#dom-htmlcollection-item>
     fn Item(&self, index: u32) -> Option<DomRoot<Element>> {
         self.validate_cache();
 
         if let Some(element) = self.cached_cursor_element.get() {
             // Cache hit, the cursor element is set
             if let Some(cached_index) = self.cached_cursor_index.get().to_option() {
-                if cached_index == index {
-                    // The cursor is the element we're looking for
-                    Some(element)
-                } else if cached_index < index {
-                    // The cursor is before the element we're looking for
-                    // Iterate forwards, starting at the cursor.
-                    let offset = index - (cached_index + 1);
-                    let node: DomRoot<Node> = DomRoot::upcast(element);
-                    let mut iter = self.elements_iter_after(&node);
-                    self.set_cached_cursor(index, iter.nth(offset as usize))
-                } else {
-                    // The cursor is after the element we're looking for
-                    // Iterate backwards, starting at the cursor.
-                    let offset = cached_index - (index + 1);
-                    let node: DomRoot<Node> = DomRoot::upcast(element);
-                    let mut iter = self.elements_iter_before(&node);
-                    self.set_cached_cursor(index, iter.nth(offset as usize))
+                match cached_index.cmp(&index) {
+                    Ordering::Equal => {
+                        // The cursor is the element we're looking for
+                        Some(element)
+                    },
+                    Ordering::Less => {
+                        // The cursor is before the element we're looking for
+                        // Iterate forwards, starting at the cursor.
+                        let offset = index - (cached_index + 1);
+                        let node: DomRoot<Node> = DomRoot::upcast(element);
+                        let mut iter = self.elements_iter_after(&node);
+                        self.set_cached_cursor(index, iter.nth(offset as usize))
+                    },
+                    Ordering::Greater => {
+                        // The cursor is after the element we're looking for
+                        // Iterate backwards, starting at the cursor.
+                        let offset = cached_index - (index + 1);
+                        let node: DomRoot<Node> = DomRoot::upcast(element);
+                        let mut iter = self.elements_iter_before(&node);
+                        self.set_cached_cursor(index, iter.nth(offset as usize))
+                    },
                 }
             } else {
                 // Cache miss
@@ -369,7 +396,7 @@ impl HTMLCollectionMethods for HTMLCollection {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-htmlcollection-nameditem
+    /// <https://dom.spec.whatwg.org/#dom-htmlcollection-nameditem>
     fn NamedItem(&self, key: DOMString) -> Option<DomRoot<Element>> {
         // Step 1.
         if key.is_empty() {
@@ -380,8 +407,8 @@ impl HTMLCollectionMethods for HTMLCollection {
 
         // Step 2.
         self.elements_iter().find(|elem| {
-            elem.get_id().map_or(false, |id| id == key) ||
-                (elem.namespace() == &ns!(html) && elem.get_name().map_or(false, |id| id == key))
+            elem.get_id().is_some_and(|id| id == key) ||
+                (elem.namespace() == &ns!(html) && elem.get_name().is_some_and(|id| id == key))
         })
     }
 

@@ -5,12 +5,12 @@
 use std::default::Default;
 use std::str::FromStr;
 
-use cssparser::RGBA;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use ipc_channel::ipc::{IpcBytesReceiver, IpcBytesSender, IpcSender, IpcSharedMemory};
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
+use style::color::AbsoluteColor;
 use style::properties::style_structs::Font as FontStyleStruct;
 use webrender_api::ImageKey;
 
@@ -23,12 +23,12 @@ pub enum FillRule {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct CanvasId(pub u64);
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub enum CanvasMsg {
     Canvas2d(Canvas2dMsg, CanvasId),
     FromLayout(FromLayoutMsg, CanvasId),
     FromScript(FromScriptMsg, CanvasId),
-    Recreate(Size2D<u64>, CanvasId),
+    Recreate(Option<Size2D<u64>>, CanvasId),
     Close(CanvasId),
 }
 
@@ -58,6 +58,7 @@ pub enum Canvas2dMsg {
     IsPointInPath(f64, f64, FillRule, IpcSender<bool>),
     LineTo(Point2D<f32>),
     MoveTo(Point2D<f32>),
+    MeasureText(String, IpcSender<TextMetrics>),
     PutImageData(Rect<u64>, IpcBytesReceiver),
     QuadraticCurveTo(Point2D<f32>, Point2D<f32>),
     Rect(Rect<f32>),
@@ -75,7 +76,7 @@ pub enum Canvas2dMsg {
     SetShadowOffsetX(f64),
     SetShadowOffsetY(f64),
     SetShadowBlur(f64),
-    SetShadowColor(RGBA),
+    SetShadowColor(AbsoluteColor),
     SetFont(FontStyleStruct),
     SetTextAlign(TextAlign),
     SetTextBaseline(TextBaseline),
@@ -94,7 +95,7 @@ pub enum FromScriptMsg {
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct CanvasGradientStop {
     pub offset: f64,
-    pub color: RGBA,
+    pub color: AbsoluteColor,
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -115,11 +116,11 @@ impl LinearGradientStyle {
         stops: Vec<CanvasGradientStop>,
     ) -> LinearGradientStyle {
         LinearGradientStyle {
-            x0: x0,
-            y0: y0,
-            x1: x1,
-            y1: y1,
-            stops: stops,
+            x0,
+            y0,
+            x1,
+            y1,
+            stops,
         }
     }
 }
@@ -146,13 +147,13 @@ impl RadialGradientStyle {
         stops: Vec<CanvasGradientStop>,
     ) -> RadialGradientStyle {
         RadialGradientStyle {
-            x0: x0,
-            y0: y0,
-            r0: r0,
-            x1: x1,
-            y1: y1,
-            r1: r1,
-            stops: stops,
+            x0,
+            y0,
+            r0,
+            x1,
+            y1,
+            r1,
+            stops,
         }
     }
 }
@@ -183,7 +184,7 @@ impl SurfaceStyle {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FillOrStrokeStyle {
-    Color(RGBA),
+    Color(AbsoluteColor),
     LinearGradient(LinearGradientStyle),
     RadialGradient(RadialGradientStyle),
     Surface(SurfaceStyle),
@@ -402,8 +403,9 @@ impl FromStr for CompositionOrBlending {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum TextAlign {
+    #[default]
     Start,
     End,
     Left,
@@ -426,17 +428,12 @@ impl FromStr for TextAlign {
     }
 }
 
-impl Default for TextAlign {
-    fn default() -> TextAlign {
-        TextAlign::Start
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum TextBaseline {
     Top,
     Hanging,
     Middle,
+    #[default]
     Alphabetic,
     Ideographic,
     Bottom,
@@ -458,16 +455,11 @@ impl FromStr for TextBaseline {
     }
 }
 
-impl Default for TextBaseline {
-    fn default() -> TextBaseline {
-        TextBaseline::Alphabetic
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum Direction {
     Ltr,
     Rtl,
+    #[default]
     Inherit,
 }
 
@@ -484,8 +476,18 @@ impl FromStr for Direction {
     }
 }
 
-impl Default for Direction {
-    fn default() -> Direction {
-        Direction::Inherit
-    }
+#[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, Serialize)]
+pub struct TextMetrics {
+    pub width: f32,
+    pub actual_boundingbox_left: f32,
+    pub actual_boundingbox_right: f32,
+    pub actual_boundingbox_ascent: f32,
+    pub actual_boundingbox_descent: f32,
+    pub font_boundingbox_ascent: f32,
+    pub font_boundingbox_descent: f32,
+    pub em_height_ascent: f32,
+    pub em_height_descent: f32,
+    pub hanging_baseline: f32,
+    pub alphabetic_baseline: f32,
+    pub ideographic_baseline: f32,
 }

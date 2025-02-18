@@ -10,9 +10,9 @@
 import os
 import shutil
 import subprocess
-from typing import Dict, Optional
+from typing import Optional
 
-from .. import util
+from .build_target import BuildTarget
 
 
 class Base:
@@ -23,11 +23,8 @@ class Base:
         self.is_linux = False
         self.is_macos = False
 
-    def gstreamer_root(self, _cross_compilation_target: Optional[str]) -> Optional[str]:
+    def gstreamer_root(self, target: BuildTarget) -> Optional[str]:
         raise NotImplementedError("Do not know how to get GStreamer path for platform.")
-
-    def library_path_variable_name(self):
-        raise NotImplementedError("Do not know how to set library path for platform.")
 
     def executable_suffix(self) -> str:
         return ""
@@ -35,13 +32,13 @@ class Base:
     def _platform_bootstrap(self, _force: bool) -> bool:
         raise NotImplementedError("Bootstrap installation detection not yet available.")
 
-    def _platform_bootstrap_gstreamer(self, _force: bool) -> bool:
+    def _platform_bootstrap_gstreamer(self, _target: BuildTarget, _force: bool) -> bool:
         raise NotImplementedError(
             "GStreamer bootstrap support is not yet available for your OS."
         )
 
-    def is_gstreamer_installed(self, cross_compilation_target: Optional[str]) -> bool:
-        gstreamer_root = self.gstreamer_root(cross_compilation_target)
+    def is_gstreamer_installed(self, target: BuildTarget) -> bool:
+        gstreamer_root = self.gstreamer_root(target)
         if gstreamer_root:
             pkg_config = os.path.join(gstreamer_root, "bin", "pkg-config")
         else:
@@ -59,10 +56,15 @@ class Base:
         except FileNotFoundError:
             return False
 
-    def bootstrap(self, force: bool):
-        installed_something = self._platform_bootstrap(force)
-        installed_something |= self.install_taplo(force)
-        installed_something |= self.install_crown(force)
+    def bootstrap(self, force: bool, skip_platform: bool, skip_lints: bool):
+        installed_something = False
+        if not skip_platform:
+            installed_something |= self._platform_bootstrap(force)
+        if not skip_lints:
+            installed_something |= self.install_taplo(force)
+            installed_something |= self.install_cargo_deny(force)
+            installed_something |= self.install_crown(force)
+
         if not installed_something:
             print("Dependencies were already installed!")
 
@@ -74,6 +76,24 @@ class Base:
         if subprocess.call(["cargo", "install", "taplo-cli", "--locked"]) != 0:
             raise EnvironmentError("Installation of taplo failed.")
 
+        return True
+
+    def install_cargo_deny(self, force: bool) -> bool:
+        def cargo_deny_installed():
+            if force or not shutil.which("cargo-deny"):
+                return False
+            # Tidy needs at least version 0.16.3 installed.
+            result = subprocess.run(["cargo-deny", "--version"],
+                                    encoding='utf-8', capture_output=True)
+            (major, minor, micro) = result.stdout.strip().split(" ")[1].split(".", 2)
+            return (int(major), int(minor), int(micro)) >= (0, 16, 3)
+
+        if cargo_deny_installed():
+            return False
+
+        print(" * Installing cargo-deny...")
+        if subprocess.call(["cargo", "install", "cargo-deny", "--locked"]) != 0:
+            raise EnvironmentError("Installation of cargo-deny failed.")
         return True
 
     def install_crown(self, force: bool) -> bool:
@@ -90,8 +110,9 @@ class Base:
         return False
 
     def bootstrap_gstreamer(self, force: bool):
-        if not self._platform_bootstrap_gstreamer(force):
-            root = self.gstreamer_root(None)
+        target = BuildTarget.from_triple(self.triple)
+        if not self._platform_bootstrap_gstreamer(target, force):
+            root = self.gstreamer_root(target)
             if root:
                 print(f"GStreamer found at: {root}")
             else:

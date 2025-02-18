@@ -9,8 +9,8 @@
 //! as possible.
 
 use std::collections::{HashMap, LinkedList};
+use std::sync::LazyLock;
 
-use lazy_static::lazy_static;
 use script_layout_interface::wrapper_traits::PseudoElementType;
 use smallvec::SmallVec;
 use style::computed_values::list_style_type::T as ListStyleType;
@@ -20,7 +20,7 @@ use style::servo::restyle_damage::ServoRestyleDamage;
 use style::values::generics::counters::ContentItem;
 use style::values::specified::list::{QuotePair, Quotes};
 
-use crate::context::{with_thread_local_font_context, LayoutContext};
+use crate::context::LayoutContext;
 use crate::display_list::items::OpaqueNode;
 use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
 use crate::fragment::{
@@ -29,8 +29,8 @@ use crate::fragment::{
 use crate::text::TextRunScanner;
 use crate::traversal::InorderFlowTraversal;
 
-lazy_static! {
-    static ref INITIAL_QUOTES: style::ArcSlice<QuotePair> = style::ArcSlice::from_iter_leaked(
+static INITIAL_QUOTES: LazyLock<style::ArcSlice<QuotePair>> = LazyLock::new(|| {
+    style::ArcSlice::from_iter_leaked(
         vec![
             QuotePair {
                 opening: "\u{201c}".to_owned().into(),
@@ -41,9 +41,9 @@ lazy_static! {
                 closing: "\u{2019}".to_owned().into(),
             },
         ]
-        .into_iter()
-    );
-}
+        .into_iter(),
+    )
+});
 
 // Decimal styles per CSS-COUNTER-STYLES § 6.1:
 static DECIMAL: [char; 10] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
@@ -125,7 +125,7 @@ impl<'a> ResolveGeneratedContent<'a> {
     /// Creates a new generated content resolution traversal.
     pub fn new(layout_context: &'a LayoutContext) -> ResolveGeneratedContent<'a> {
         ResolveGeneratedContent {
-            layout_context: layout_context,
+            layout_context,
             list_item: Counter::new(),
             counters: HashMap::new(),
             quote: 0,
@@ -133,12 +133,12 @@ impl<'a> ResolveGeneratedContent<'a> {
     }
 }
 
-impl<'a> InorderFlowTraversal for ResolveGeneratedContent<'a> {
+impl InorderFlowTraversal for ResolveGeneratedContent<'_> {
     #[inline]
     fn process(&mut self, flow: &mut dyn Flow, level: u32) {
         let mut mutator = ResolveGeneratedContentFragmentMutator {
             traversal: self,
-            level: level,
+            level,
             is_block: flow.is_block_like(),
             incremented: false,
         };
@@ -168,7 +168,7 @@ struct ResolveGeneratedContentFragmentMutator<'a, 'b: 'a> {
     incremented: bool,
 }
 
-impl<'a, 'b> ResolveGeneratedContentFragmentMutator<'a, 'b> {
+impl ResolveGeneratedContentFragmentMutator<'_, '_> {
     fn mutate_fragment(&mut self, fragment: &mut Fragment) {
         // We only reset and/or increment counters once per flow. This avoids double-incrementing
         // counters on list items (once for the main fragment and once for the marker).
@@ -195,7 +195,7 @@ impl<'a, 'b> ResolveGeneratedContentFragmentMutator<'a, 'b> {
                     new_info = self.traversal.list_item.render(
                         self.traversal.layout_context,
                         fragment.node,
-                        fragment.pseudo.clone(),
+                        fragment.pseudo,
                         fragment.style.clone(),
                         list_style_type,
                         RenderingMode::Suffix(".\u{00a0}"),
@@ -214,7 +214,7 @@ impl<'a, 'b> ResolveGeneratedContentFragmentMutator<'a, 'b> {
                     new_info = counter.render(
                         self.traversal.layout_context,
                         fragment.node,
-                        fragment.pseudo.clone(),
+                        fragment.pseudo,
                         fragment.style.clone(),
                         counter_style,
                         RenderingMode::Plain,
@@ -237,7 +237,7 @@ impl<'a, 'b> ResolveGeneratedContentFragmentMutator<'a, 'b> {
                         fragment.pseudo,
                         fragment.style.clone(),
                         counter_style,
-                        RenderingMode::All(&separator),
+                        RenderingMode::All(separator),
                     );
                 },
                 GeneratedContentInfo::ContentItem(ContentItem::OpenQuote) => {
@@ -246,7 +246,7 @@ impl<'a, 'b> ResolveGeneratedContentFragmentMutator<'a, 'b> {
                         fragment.node,
                         fragment.pseudo,
                         fragment.style.clone(),
-                        self.quote(&*fragment.style, false),
+                        self.quote(&fragment.style, false),
                     );
                     self.traversal.quote += 1
                 },
@@ -260,7 +260,7 @@ impl<'a, 'b> ResolveGeneratedContentFragmentMutator<'a, 'b> {
                         fragment.node,
                         fragment.pseudo,
                         fragment.style.clone(),
-                        self.quote(&*fragment.style, true),
+                        self.quote(&fragment.style, true),
                     );
                 },
                 GeneratedContentInfo::ContentItem(ContentItem::NoOpenQuote) => {
@@ -307,7 +307,7 @@ impl<'a, 'b> ResolveGeneratedContentFragmentMutator<'a, 'b> {
         }
 
         // Truncate down counters.
-        for (_, counter) in &mut self.traversal.counters {
+        for counter in self.traversal.counters.values_mut() {
             counter.truncate_to_level(self.level);
         }
         self.traversal.list_item.truncate_to_level(self.level);
@@ -385,10 +385,7 @@ impl Counter {
         }
 
         // Otherwise, push a new instance of the counter.
-        self.values.push(CounterValue {
-            level: level,
-            value: value,
-        })
+        self.values.push(CounterValue { level, value })
     }
 
     fn truncate_to_level(&mut self, level: u32) {
@@ -404,7 +401,7 @@ impl Counter {
         }
 
         self.values.push(CounterValue {
-            level: level,
+            level,
             value: amount,
         })
     }
@@ -422,14 +419,14 @@ impl Counter {
         match mode {
             RenderingMode::Plain => {
                 let value = match self.values.last() {
-                    Some(ref value) => value.value,
+                    Some(value) => value.value,
                     None => 0,
                 };
                 push_representation(value, list_style_type, &mut string)
             },
             RenderingMode::Suffix(suffix) => {
                 let value = match self.values.last() {
-                    Some(ref value) => value.value,
+                    Some(value) => value.value,
                     None => 0,
                 };
                 push_representation(value, list_style_type, &mut string);
@@ -496,9 +493,7 @@ fn render_text(
     ));
     // FIXME(pcwalton): This should properly handle multiple marker fragments. This could happen
     // due to text run splitting.
-    let fragments = with_thread_local_font_context(layout_context, |font_context| {
-        TextRunScanner::new().scan_for_runs(font_context, fragments)
-    });
+    let fragments = TextRunScanner::new().scan_for_runs(&layout_context.font_context, fragments);
     if fragments.is_empty() {
         None
     } else {
@@ -585,11 +580,11 @@ fn push_alphabetic_representation(value: i32, system: &[char], accumulator: &mut
     let mut string: SmallVec<[char; 8]> = SmallVec::new();
     while abs_value != 0 {
         // Step 1.
-        abs_value = abs_value - 1;
+        abs_value -= 1;
         // Step 2.
         string.push(system[abs_value % system.len()]);
         // Step 3.
-        abs_value = abs_value / system.len();
+        abs_value /= system.len();
     }
 
     accumulator.extend(string.iter().cloned().rev())
@@ -612,7 +607,7 @@ fn push_numeric_representation(value: i32, system: &[char], accumulator: &mut St
         // Step 2.1.
         string.push(system[abs_value % system.len()]);
         // Step 2.2.
-        abs_value = abs_value / system.len();
+        abs_value /= system.len();
     }
 
     // Step 3.
@@ -629,7 +624,7 @@ fn handle_negative_value(value: i32, accumulator: &mut String) -> usize {
         // TODO: Support different negative signs using the 'negative' descriptor.
         // https://drafts.csswg.org/date/2015-07-16/css-counter-styles/#counter-style-negative
         accumulator.push('-');
-        value.abs() as usize
+        value.unsigned_abs() as usize
     } else {
         value as usize
     }

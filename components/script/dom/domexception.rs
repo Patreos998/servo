@@ -15,10 +15,12 @@ use crate::dom::bindings::reflector::{
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[repr(u16)]
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
-pub enum DOMErrorName {
+pub(crate) enum DOMErrorName {
     IndexSizeError = DOMExceptionConstants::INDEX_SIZE_ERR,
     HierarchyRequestError = DOMExceptionConstants::HIERARCHY_REQUEST_ERR,
     WrongDocumentError = DOMExceptionConstants::WRONG_DOCUMENT_ERR,
@@ -41,12 +43,14 @@ pub enum DOMErrorName {
     TimeoutError = DOMExceptionConstants::TIMEOUT_ERR,
     InvalidNodeTypeError = DOMExceptionConstants::INVALID_NODE_TYPE_ERR,
     DataCloneError = DOMExceptionConstants::DATA_CLONE_ERR,
+    EncodingError,
     NotReadableError,
+    DataError,
     OperationError,
 }
 
 impl DOMErrorName {
-    pub fn from(s: &DOMString) -> Option<DOMErrorName> {
+    pub(crate) fn from(s: &DOMString) -> Option<DOMErrorName> {
         match s.as_ref() {
             "IndexSizeError" => Some(DOMErrorName::IndexSizeError),
             "HierarchyRequestError" => Some(DOMErrorName::HierarchyRequestError),
@@ -70,7 +74,9 @@ impl DOMErrorName {
             "TimeoutError" => Some(DOMErrorName::TimeoutError),
             "InvalidNodeTypeError" => Some(DOMErrorName::InvalidNodeTypeError),
             "DataCloneError" => Some(DOMErrorName::DataCloneError),
+            "EncodingError" => Some(DOMErrorName::EncodingError),
             "NotReadableError" => Some(DOMErrorName::NotReadableError),
+            "DataError" => Some(DOMErrorName::DataError),
             "OperationError" => Some(DOMErrorName::OperationError),
             _ => None,
         }
@@ -78,7 +84,7 @@ impl DOMErrorName {
 }
 
 #[dom_struct]
-pub struct DOMException {
+pub(crate) struct DOMException {
     reflector_: Reflector,
     message: DOMString,
     name: DOMString,
@@ -115,7 +121,11 @@ impl DOMException {
                 "The supplied node is incorrect or has an incorrect ancestor for this operation."
             },
             DOMErrorName::DataCloneError => "The object can not be cloned.",
+            DOMErrorName::EncodingError => {
+                "The encoding operation (either encoded or decoding) failed."
+            },
             DOMErrorName::NotReadableError => "The I/O read operation failed.",
+            DOMErrorName::DataError => "Provided data is inadequate.",
             DOMErrorName::OperationError => {
                 "The operation failed for an operation-specific reason."
             },
@@ -127,24 +137,36 @@ impl DOMException {
         )
     }
 
-    fn new_inherited(message_: DOMString, name_: DOMString) -> DOMException {
+    pub(crate) fn new_inherited(message: DOMString, name: DOMString) -> DOMException {
         DOMException {
             reflector_: Reflector::new(),
-            message: message_,
-            name: name_,
+            message,
+            name,
         }
     }
 
-    pub fn new(global: &GlobalScope, code: DOMErrorName) -> DomRoot<DOMException> {
+    pub(crate) fn new(global: &GlobalScope, code: DOMErrorName) -> DomRoot<DOMException> {
         let (message, name) = DOMException::get_error_data_by_code(code);
 
-        reflect_dom_object(Box::new(DOMException::new_inherited(message, name)), global)
+        reflect_dom_object(
+            Box::new(DOMException::new_inherited(message, name)),
+            global,
+            CanGc::note(),
+        )
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    // not an IDL stringifier, used internally
+    pub(crate) fn stringifier(&self) -> DOMString {
+        DOMString::from(format!("{}: {}", self.name, self.message))
+    }
+}
+
+impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
+    // https://webidl.spec.whatwg.org/#dom-domexception-domexception
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         message: DOMString,
         name: DOMString,
     ) -> Result<DomRoot<DOMException>, Error> {
@@ -152,17 +174,11 @@ impl DOMException {
             Box::new(DOMException::new_inherited(message, name)),
             global,
             proto,
+            can_gc,
         ))
     }
 
-    // not an IDL stringifier, used internally
-    pub fn stringifier(&self) -> DOMString {
-        DOMString::from(format!("{}: {}", self.name, self.message))
-    }
-}
-
-impl DOMExceptionMethods for DOMException {
-    // https://heycam.github.io/webidl/#dom-domexception-code
+    // https://webidl.spec.whatwg.org/#dom-domexception-code
     fn Code(&self) -> u16 {
         match DOMErrorName::from(&self.name) {
             Some(code) if code <= DOMErrorName::DataCloneError => code as u16,
@@ -170,12 +186,12 @@ impl DOMExceptionMethods for DOMException {
         }
     }
 
-    // https://heycam.github.io/webidl/#idl-DOMException-error-names
+    // https://webidl.spec.whatwg.org/#dom-domexception-name
     fn Name(&self) -> DOMString {
         self.name.clone()
     }
 
-    // https://heycam.github.io/webidl/#error-names
+    // https://webidl.spec.whatwg.org/#dom-domexception-message
     fn Message(&self) -> DOMString {
         self.message.clone()
     }

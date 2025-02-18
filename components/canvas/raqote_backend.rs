@@ -2,22 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use canvas_traits::canvas::*;
-use cssparser::RGBA;
+use cssparser::color::clamp_unit_f32;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D, Vector2D};
 use euclid::Angle;
 use font_kit::font::Font;
+use fonts::{ByteIndex, FontIdentifier, FontTemplateRefMethods};
 use log::warn;
 use lyon_geom::Arc;
+use range::Range;
 use raqote::PathOp;
+use style::color::AbsoluteColor;
 
-use crate::canvas_data;
 use crate::canvas_data::{
-    Backend, CanvasPaintState, Color, CompositionOp, DrawOptions, Filter, GenericDrawTarget,
-    GenericPathBuilder, GradientStop, GradientStops, Path, SourceSurface, StrokeOptions,
+    self, Backend, CanvasPaintState, Color, CompositionOp, DrawOptions, Filter, GenericDrawTarget,
+    GenericPathBuilder, GradientStop, GradientStops, Path, SourceSurface, StrokeOptions, TextRun,
 };
-use crate::canvas_paint_thread::AntialiasMode;
 
+thread_local! {
+    /// The shared font cache used by all canvases that render on a thread. It would be nicer
+    /// to have a global cache, but it looks like font-kit uses a per-thread FreeType, so
+    /// in order to ensure that fonts are particular to a thread we have to make our own
+    /// cache thread local as well.
+    static SHARED_FONT_CACHE: RefCell<HashMap<FontIdentifier, Font>> = RefCell::default();
+}
+
+#[derive(Default)]
 pub struct RaqoteBackend;
 
 impl Backend for RaqoteBackend {
@@ -29,14 +42,14 @@ impl Backend for RaqoteBackend {
         color.as_raqote().a != 0
     }
 
-    fn set_shadow_color<'a>(&mut self, color: RGBA, state: &mut CanvasPaintState<'a>) {
+    fn set_shadow_color(&mut self, color: AbsoluteColor, state: &mut CanvasPaintState<'_>) {
         state.shadow_color = Color::Raqote(color.to_raqote_style());
     }
 
-    fn set_fill_style<'a>(
+    fn set_fill_style(
         &mut self,
         style: FillOrStrokeStyle,
-        state: &mut CanvasPaintState<'a>,
+        state: &mut CanvasPaintState<'_>,
         _drawtarget: &dyn GenericDrawTarget,
     ) {
         if let Some(pattern) = style.to_raqote_pattern() {
@@ -44,10 +57,10 @@ impl Backend for RaqoteBackend {
         }
     }
 
-    fn set_stroke_style<'a>(
+    fn set_stroke_style(
         &mut self,
         style: FillOrStrokeStyle,
-        state: &mut CanvasPaintState<'a>,
+        state: &mut CanvasPaintState<'_>,
         _drawtarget: &dyn GenericDrawTarget,
     ) {
         if let Some(pattern) = style.to_raqote_pattern() {
@@ -55,10 +68,10 @@ impl Backend for RaqoteBackend {
         }
     }
 
-    fn set_global_composition<'a>(
+    fn set_global_composition(
         &mut self,
         op: CompositionOrBlending,
-        state: &mut CanvasPaintState<'a>,
+        state: &mut CanvasPaintState<'_>,
     ) {
         state.draw_options.as_raqote_mut().blend_mode = op.to_raqote_style();
     }
@@ -71,12 +84,12 @@ impl Backend for RaqoteBackend {
     }
 
     fn recreate_paint_state<'a>(&self, _state: &CanvasPaintState<'a>) -> CanvasPaintState<'a> {
-        CanvasPaintState::new(AntialiasMode::Default)
+        CanvasPaintState::default()
     }
 }
 
-impl<'a> CanvasPaintState<'a> {
-    pub fn new(_antialias: AntialiasMode) -> CanvasPaintState<'a> {
+impl Default for CanvasPaintState<'_> {
+    fn default() -> Self {
         let pattern = Pattern::Color(255, 0, 0, 0);
         CanvasPaintState {
             draw_options: DrawOptions::Raqote(raqote::DrawOptions::new()),
@@ -104,7 +117,7 @@ pub enum Pattern<'a> {
     Surface(SurfacePattern<'a>),
 }
 
-impl<'a> Pattern<'a> {
+impl Pattern<'_> {
     fn set_transform(&mut self, transform: Transform2D<f32>) {
         match self {
             Pattern::Surface(pattern) => pattern.set_transform(transform),
@@ -125,9 +138,9 @@ pub struct LinearGradientPattern {
 impl LinearGradientPattern {
     fn new(start: Point2D<f32>, end: Point2D<f32>, stops: Vec<raqote::GradientStop>) -> Self {
         LinearGradientPattern {
-            gradient: raqote::Gradient { stops: stops },
-            start: start,
-            end: end,
+            gradient: raqote::Gradient { stops },
+            start,
+            end,
         }
     }
 }
@@ -150,11 +163,11 @@ impl RadialGradientPattern {
         stops: Vec<raqote::GradientStop>,
     ) -> Self {
         RadialGradientPattern {
-            gradient: raqote::Gradient { stops: stops },
-            center1: center1,
-            radius1: radius1,
-            center2: center2,
-            radius2: radius2,
+            gradient: raqote::Gradient { stops },
+            center1,
+            radius1,
+            center2,
+            radius2,
         }
     }
 }
@@ -177,10 +190,10 @@ impl<'a> SurfacePattern<'a> {
             },
         };
         SurfacePattern {
-            image: image,
-            filter: filter,
-            extend: extend,
-            repeat: repeat,
+            image,
+            filter,
+            extend,
+            repeat,
             transform: Transform2D::identity(),
         }
     }
@@ -389,7 +402,7 @@ impl GenericDrawTarget for raqote::DrawTarget {
     fn create_gradient_stops(&self, gradient_stops: Vec<GradientStop>) -> GradientStops {
         let mut stops = gradient_stops
             .into_iter()
-            .map(|item| item.as_raqote().clone())
+            .map(|item| *item.as_raqote())
             .collect::<Vec<raqote::GradientStop>>();
         // https://www.w3.org/html/test/results/2dcontext/annotated-spec/canvas.html#testrefs.2d.gradient.interpolate.overlap
         stops.sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap());
@@ -492,7 +505,7 @@ impl GenericDrawTarget for raqote::DrawTarget {
             raqote::BlendMode::SrcOut |
             raqote::BlendMode::DstIn |
             raqote::BlendMode::DstAtop => {
-                let mut options = draw_options.as_raqote().clone();
+                let mut options = *draw_options.as_raqote();
                 self.push_layer_with_blend(1., options.blend_mode);
                 options.blend_mode = raqote::BlendMode::SrcOver;
                 self.fill(path.as_raqote(), &pattern.source(), &options);
@@ -507,43 +520,62 @@ impl GenericDrawTarget for raqote::DrawTarget {
 
     fn fill_text(
         &mut self,
-        font: &Font,
-        point_size: f32,
-        text: &str,
+        text_runs: Vec<TextRun>,
         start: Point2D<f32>,
         pattern: &canvas_data::Pattern,
-        options: &DrawOptions,
+        draw_options: &DrawOptions,
     ) {
-        let mut start = pathfinder_geometry::vector::vec2f(start.x, start.y);
-        let mut ids = Vec::new();
-        let mut positions = Vec::new();
-        for c in text.chars() {
-            let id = match font.glyph_for_char(c) {
-                Some(id) => id,
-                None => {
-                    warn!("Skipping non-existent glyph {}", c);
-                    continue;
-                },
-            };
-            ids.push(id);
-            positions.push(Point2D::new(start.x(), start.y()));
-            let advance = match font.advance(id) {
-                Ok(advance) => advance,
-                Err(e) => {
-                    warn!("Skipping glyph {} with missing advance: {:?}", c, e);
-                    continue;
-                },
-            };
-            start += advance * point_size / 24. / 96.;
+        let mut advance = 0.;
+        for run in text_runs.iter() {
+            let mut positions = Vec::new();
+            let glyphs = &run.glyphs;
+            let ids: Vec<_> = glyphs
+                .iter_glyphs_for_byte_range(&Range::new(ByteIndex(0), glyphs.len()))
+                .map(|glyph| {
+                    let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
+                    positions.push(Point2D::new(
+                        advance + start.x + glyph_offset.x.to_f32_px(),
+                        start.y + glyph_offset.y.to_f32_px(),
+                    ));
+                    advance += glyph.advance().to_f32_px();
+                    glyph.id()
+                })
+                .collect();
+
+            // TODO: raqote uses font-kit to rasterize glyphs, but font-kit fails an assertion when
+            // using color bitmap fonts in the FreeType backend. For now, simply do not render these
+            // type of fonts.
+            if run.font.has_color_bitmap_or_colr_table() {
+                continue;
+            }
+
+            let template = &run.font.template;
+
+            SHARED_FONT_CACHE.with(|font_cache| {
+                let identifier = template.identifier();
+                if !font_cache.borrow().contains_key(&identifier) {
+                    let data = std::sync::Arc::new(run.font.data().as_ref().to_vec());
+                    let Ok(font) = Font::from_bytes(data, identifier.index()) else {
+                        return;
+                    };
+                    font_cache.borrow_mut().insert(identifier.clone(), font);
+                }
+
+                let font_cache = font_cache.borrow();
+                let Some(font) = font_cache.get(&identifier) else {
+                    return;
+                };
+
+                self.draw_glyphs(
+                    font,
+                    run.font.descriptor.pt_size.to_f32_px(),
+                    &ids,
+                    &positions,
+                    &pattern.source(),
+                    draw_options.as_raqote(),
+                );
+            })
         }
-        self.draw_glyphs(
-            font,
-            point_size,
-            &ids,
-            &positions,
-            &pattern.source(),
-            options.as_raqote(),
-        );
     }
 
     fn fill_rect(
@@ -654,28 +686,23 @@ impl GenericDrawTarget for raqote::DrawTarget {
     #[allow(unsafe_code)]
     fn snapshot_data(&self, f: &dyn Fn(&[u8]) -> Vec<u8>) -> Vec<u8> {
         let v = self.get_data();
-        f(unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                v.len() * std::mem::size_of::<u32>(),
-            )
-        })
+        f(
+            unsafe {
+                std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v))
+            },
+        )
     }
     #[allow(unsafe_code)]
     fn snapshot_data_owned(&self) -> Vec<u8> {
         let v = self.get_data();
         unsafe {
-            std::slice::from_raw_parts(
-                v.as_ptr() as *const u8,
-                v.len() * std::mem::size_of::<u32>(),
-            )
-            .into()
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)).into()
         }
     }
 }
 
 impl Filter {
-    fn to_raqote(&self) -> raqote::FilterMode {
+    fn to_raqote(self) -> raqote::FilterMode {
         match self {
             Filter::Bilinear => raqote::FilterMode::Bilinear,
             Filter::Nearest => raqote::FilterMode::Nearest,
@@ -852,61 +879,38 @@ pub trait ToRaqotePattern<'a> {
 }
 
 pub trait ToRaqoteGradientStop {
-    fn to_raqote(&self) -> raqote::GradientStop;
-}
-
-/// Clamp a 0..1 number to a 0..255 range to u8.
-///
-/// Whilst scaling by 256 and flooring would provide
-/// an equal distribution of integers to percentage inputs,
-/// this is not what Gecko does so we instead multiply by 255
-/// and round (adding 0.5 and flooring is equivalent to rounding)
-///
-/// Chrome does something similar for the alpha value, but not
-/// the rgb values.
-///
-/// See <https://bugzilla.mozilla.org/show_bug.cgi?id=1340484>
-///
-/// Clamping to 256 and rounding after would let 1.0 map to 256, and
-/// `256.0_f32 as u8` is undefined behavior:
-///
-/// <https://github.com/rust-lang/rust/issues/10184>
-#[inline]
-pub fn clamp_unit_f32(val: f32) -> u8 {
-    clamp_floor_256_f32(val * 255.)
-}
-
-/// Round and clamp a single number to a u8.
-#[inline]
-pub fn clamp_floor_256_f32(val: f32) -> u8 {
-    val.round().clamp(0., 255.) as u8
+    fn to_raqote(self) -> raqote::GradientStop;
 }
 
 impl ToRaqoteGradientStop for CanvasGradientStop {
-    fn to_raqote(&self) -> raqote::GradientStop {
+    fn to_raqote(self) -> raqote::GradientStop {
+        let srgb = self.color.into_srgb_legacy();
         let color = raqote::Color::new(
-            self.color.alpha.map(clamp_unit_f32).unwrap_or(0),
-            self.color.red.unwrap_or(0),
-            self.color.green.unwrap_or(0),
-            self.color.blue.unwrap_or(0),
+            clamp_unit_f32(srgb.alpha),
+            clamp_unit_f32(srgb.components.0),
+            clamp_unit_f32(srgb.components.1),
+            clamp_unit_f32(srgb.components.2),
         );
         let position = self.offset as f32;
         raqote::GradientStop { position, color }
     }
 }
 
-impl<'a> ToRaqotePattern<'_> for FillOrStrokeStyle {
+impl ToRaqotePattern<'_> for FillOrStrokeStyle {
     #[allow(unsafe_code)]
     fn to_raqote_pattern(self) -> Option<Pattern<'static>> {
         use canvas_traits::canvas::FillOrStrokeStyle::*;
 
         match self {
-            Color(color) => Some(Pattern::Color(
-                color.alpha.map(clamp_unit_f32).unwrap_or(0),
-                color.red.unwrap_or(0),
-                color.green.unwrap_or(0),
-                color.blue.unwrap_or(0),
-            )),
+            Color(color) => {
+                let srgb = color.into_srgb_legacy();
+                Some(Pattern::Color(
+                    clamp_unit_f32(srgb.alpha),
+                    clamp_unit_f32(srgb.components.0),
+                    clamp_unit_f32(srgb.components.1),
+                    clamp_unit_f32(srgb.components.2),
+                ))
+            },
             LinearGradient(style) => {
                 let start = Point2D::new(style.x0 as f32, style.y0 as f32);
                 let end = Point2D::new(style.x1 as f32, style.y1 as f32);
@@ -956,15 +960,16 @@ impl Color {
     }
 }
 
-impl ToRaqoteStyle for RGBA {
+impl ToRaqoteStyle for AbsoluteColor {
     type Target = raqote::SolidSource;
 
     fn to_raqote_style(self) -> Self::Target {
+        let srgb = self.into_srgb_legacy();
         raqote::SolidSource::from_unpremultiplied_argb(
-            self.alpha.map(clamp_unit_f32).unwrap_or(0),
-            self.red.unwrap_or(0),
-            self.green.unwrap_or(0),
-            self.blue.unwrap_or(0),
+            clamp_unit_f32(srgb.alpha),
+            clamp_unit_f32(srgb.components.0),
+            clamp_unit_f32(srgb.components.1),
+            clamp_unit_f32(srgb.components.2),
         )
     }
 }

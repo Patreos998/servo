@@ -18,9 +18,10 @@ use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::storage::Storage;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct StorageEvent {
+pub(crate) struct StorageEvent {
     event: Event,
     key: DomRefCell<Option<DOMString>>,
     old_value: DomRefCell<Option<DOMString>>,
@@ -31,7 +32,7 @@ pub struct StorageEvent {
 
 #[allow(non_snake_case)]
 impl StorageEvent {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         key: Option<DOMString>,
         old_value: Option<DOMString>,
         new_value: Option<DOMString>,
@@ -48,23 +49,30 @@ impl StorageEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window, url: DOMString) -> DomRoot<StorageEvent> {
-        Self::new_uninitialized_with_proto(window, None, url)
+    pub(crate) fn new_uninitialized(
+        window: &Window,
+        url: DOMString,
+        can_gc: CanGc,
+    ) -> DomRoot<StorageEvent> {
+        Self::new_uninitialized_with_proto(window, None, url, can_gc)
     }
 
     fn new_uninitialized_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
         url: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<StorageEvent> {
         reflect_dom_object_with_proto(
             Box::new(StorageEvent::new_inherited(None, None, None, url, None)),
             window,
             proto,
+            can_gc,
         )
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         global: &Window,
         type_: Atom,
         bubbles: EventBubbles,
@@ -74,6 +82,7 @@ impl StorageEvent {
         newValue: Option<DOMString>,
         url: DOMString,
         storageArea: Option<&Storage>,
+        can_gc: CanGc,
     ) -> DomRoot<StorageEvent> {
         Self::new_with_proto(
             global,
@@ -86,9 +95,11 @@ impl StorageEvent {
             newValue,
             url,
             storageArea,
+            can_gc,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &Window,
         proto: Option<HandleObject>,
@@ -100,6 +111,7 @@ impl StorageEvent {
         newValue: Option<DOMString>,
         url: DOMString,
         storageArea: Option<&Storage>,
+        can_gc: CanGc,
     ) -> DomRoot<StorageEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(StorageEvent::new_inherited(
@@ -111,6 +123,7 @@ impl StorageEvent {
             )),
             global,
             proto,
+            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -118,10 +131,15 @@ impl StorageEvent {
         }
         ev
     }
+}
 
-    pub fn Constructor(
+#[allow(non_snake_case)]
+impl StorageEventMethods<crate::DomTypeHolder> for StorageEvent {
+    // https://html.spec.whatwg.org/multipage/#storageevent
+    fn Constructor(
         global: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &StorageEventBinding::StorageEventInit,
     ) -> Fallible<DomRoot<StorageEvent>> {
@@ -143,13 +161,11 @@ impl StorageEvent {
             newValue,
             url,
             storageArea,
+            can_gc,
         );
         Ok(event)
     }
-}
 
-#[allow(non_snake_case)]
-impl StorageEventMethods for StorageEvent {
     // https://html.spec.whatwg.org/multipage/#dom-storageevent-key
     fn GetKey(&self) -> Option<DOMString> {
         self.key.borrow().clone()
@@ -192,11 +208,8 @@ impl StorageEventMethods for StorageEvent {
         url: USVString,
         storageArea: Option<&Storage>,
     ) {
-        self.event.init_event(
-            Atom::from(type_),
-            bool::from(bubbles),
-            bool::from(cancelable),
-        );
+        self.event
+            .init_event(Atom::from(type_), bubbles, cancelable);
         *self.key.borrow_mut() = key;
         *self.old_value.borrow_mut() = oldValue;
         *self.new_value.borrow_mut() = newValue;

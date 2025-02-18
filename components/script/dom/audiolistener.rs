@@ -5,6 +5,7 @@
 use std::f32;
 
 use dom_struct::dom_struct;
+use servo_media::audio::node::AudioNodeType;
 use servo_media::audio::param::{ParamDir, ParamType};
 
 use crate::dom::audioparam::AudioParam;
@@ -18,9 +19,10 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct AudioListener {
+pub(crate) struct AudioListener {
     reflector_: Reflector,
     position_x: Dom<AudioParam>,
     position_y: Dom<AudioParam>,
@@ -41,6 +43,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Position(ParamDir::X),
             AutomationRate::A_rate,
             0.,       // default value
@@ -51,6 +54,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Position(ParamDir::Y),
             AutomationRate::A_rate,
             0.,       // default value
@@ -61,6 +65,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Position(ParamDir::Z),
             AutomationRate::A_rate,
             0.,       // default value
@@ -71,6 +76,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Forward(ParamDir::X),
             AutomationRate::A_rate,
             0.,       // default value
@@ -81,6 +87,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Forward(ParamDir::Y),
             AutomationRate::A_rate,
             0.,       // default value
@@ -91,6 +98,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Forward(ParamDir::Z),
             AutomationRate::A_rate,
             -1.,      // default value
@@ -101,6 +109,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Up(ParamDir::X),
             AutomationRate::A_rate,
             0.,       // default value
@@ -111,6 +120,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Up(ParamDir::Y),
             AutomationRate::A_rate,
             1.,       // default value
@@ -121,6 +131,7 @@ impl AudioListener {
             window,
             context,
             node,
+            AudioNodeType::AudioListenerNode,
             ParamType::Up(ParamDir::Z),
             AutomationRate::A_rate,
             0.,       // default value
@@ -142,15 +153,19 @@ impl AudioListener {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(window: &Window, context: &BaseAudioContext) -> DomRoot<AudioListener> {
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
+        window: &Window,
+        context: &BaseAudioContext,
+        can_gc: CanGc,
+    ) -> DomRoot<AudioListener> {
         let node = AudioListener::new_inherited(window, context);
-        reflect_dom_object(Box::new(node), window)
+        reflect_dom_object(Box::new(node), window, can_gc)
     }
 }
 
 #[allow(non_snake_case)]
-impl AudioListenerMethods for AudioListener {
+impl AudioListenerMethods<crate::DomTypeHolder> for AudioListener {
     // https://webaudio.github.io/web-audio-api/#dom-audiolistener-positionx
     fn PositionX(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.position_x)

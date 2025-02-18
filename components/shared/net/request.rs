@@ -4,18 +4,30 @@
 
 use std::sync::{Arc, Mutex};
 
-use content_security_policy::{self as csp, CspList};
+use base::id::{PipelineId, WebViewId};
+use content_security_policy::{self as csp};
 use http::header::{HeaderName, AUTHORIZATION};
 use http::{HeaderMap, Method};
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
-use msg::constellation_msg::PipelineId;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
+use uuid::Uuid;
 
+use crate::policy_container::{PolicyContainer, RequestPolicyContainer};
 use crate::response::HttpsState;
 use crate::{ReferrerPolicy, ResourceTimingType};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
+/// An id to differeniate one network request from another.
+pub struct RequestId(Uuid);
+
+impl Default for RequestId {
+    fn default() -> Self {
+        Self(servo_rand::random_uuid())
+    }
+}
 
 /// An [initiator](https://fetch.spec.whatwg.org/#concept-request-initiator)
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
@@ -25,6 +37,8 @@ pub enum Initiator {
     ImageSet,
     Manifest,
     XSLT,
+    Prefetch,
+    Link,
 }
 
 /// A request [destination](https://fetch.spec.whatwg.org/#concept-request-destination)
@@ -35,6 +49,12 @@ pub use csp::Destination;
 pub enum Origin {
     Client,
     Origin(ImmutableOrigin),
+}
+
+impl Origin {
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Origin::Origin(ImmutableOrigin::Opaque(_)))
+    }
 }
 
 /// A [referer](https://fetch.spec.whatwg.org/#concept-request-referrer)
@@ -186,7 +206,7 @@ impl RequestBody {
         }
     }
 
-    /// Step 12 of https://fetch.spec.whatwg.org/#concept-http-redirect-fetch
+    /// Step 12 of <https://fetch.spec.whatwg.org/#concept-http-redirect-fetch>
     pub fn extract_source(&mut self) {
         match self.source {
             BodySource::Null => panic!("Null sources should never be re-directed."),
@@ -207,13 +227,21 @@ impl RequestBody {
         self.source == BodySource::Null
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> Option<usize> {
-        self.total_bytes.clone()
+        self.total_bytes
     }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub enum InsecureRequestsPolicy {
+    DoNotUpgrade,
+    Upgrade,
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct RequestBuilder {
+    pub id: RequestId,
     #[serde(
         deserialize_with = "::hyper_serde::deserialize",
         serialize_with = "::hyper_serde::serialize"
@@ -239,17 +267,15 @@ pub struct RequestBuilder {
     pub credentials_mode: CredentialsMode,
     pub use_url_credentials: bool,
     pub origin: ImmutableOrigin,
+    pub policy_container: RequestPolicyContainer,
+    pub insecure_requests_policy: InsecureRequestsPolicy,
     // XXXManishearth these should be part of the client object
     pub referrer: Referrer,
-    pub referrer_policy: Option<ReferrerPolicy>,
+    pub referrer_policy: ReferrerPolicy,
     pub pipeline_id: Option<PipelineId>,
+    pub target_webview_id: Option<WebViewId>,
     pub redirect_mode: RedirectMode,
     pub integrity_metadata: String,
-    // This is nominally a part of the client's global object.
-    // It is copied here to avoid having to reach across the thread
-    // boundary every time a redirect occurs.
-    #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
-    pub csp_list: Option<CspList>,
     // to keep track of redirects
     pub url_list: Vec<ServoUrl>,
     pub parser_metadata: ParserMetadata,
@@ -261,10 +287,11 @@ pub struct RequestBuilder {
 }
 
 impl RequestBuilder {
-    pub fn new(url: ServoUrl, referrer: Referrer) -> RequestBuilder {
+    pub fn new(webview_id: Option<WebViewId>, url: ServoUrl, referrer: Referrer) -> RequestBuilder {
         RequestBuilder {
+            id: RequestId::default(),
             method: Method::GET,
-            url: url,
+            url,
             headers: HeaderMap::new(),
             unsafe_request: false,
             body: None,
@@ -277,15 +304,17 @@ impl RequestBuilder {
             credentials_mode: CredentialsMode::CredentialsSameOrigin,
             use_url_credentials: false,
             origin: ImmutableOrigin::new_opaque(),
-            referrer: referrer,
-            referrer_policy: None,
+            policy_container: RequestPolicyContainer::default(),
+            insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
+            referrer,
+            referrer_policy: ReferrerPolicy::EmptyString,
             pipeline_id: None,
+            target_webview_id: webview_id,
             redirect_mode: RedirectMode::Follow,
             integrity_metadata: "".to_owned(),
             url_list: vec![],
             parser_metadata: ParserMetadata::Default,
             initiator: Initiator::None,
-            csp_list: None,
             https_state: HttpsState::None,
             response_tainting: ResponseTainting::Basic,
             crash: None,
@@ -352,7 +381,7 @@ impl RequestBuilder {
         self
     }
 
-    pub fn referrer_policy(mut self, referrer_policy: Option<ReferrerPolicy>) -> RequestBuilder {
+    pub fn referrer_policy(mut self, referrer_policy: ReferrerPolicy) -> RequestBuilder {
         self.referrer_policy = referrer_policy;
         self
     }
@@ -392,12 +421,40 @@ impl RequestBuilder {
         self
     }
 
+    pub fn policy_container(mut self, policy_container: PolicyContainer) -> RequestBuilder {
+        self.policy_container = RequestPolicyContainer::PolicyContainer(policy_container);
+        self
+    }
+
+    pub fn insecure_requests_policy(
+        mut self,
+        insecure_requests_policy: InsecureRequestsPolicy,
+    ) -> RequestBuilder {
+        self.insecure_requests_policy = insecure_requests_policy;
+        self
+    }
+
+    pub fn service_workers_mode(
+        mut self,
+        service_workers_mode: ServiceWorkersMode,
+    ) -> RequestBuilder {
+        self.service_workers_mode = service_workers_mode;
+        self
+    }
+
+    pub fn cache_mode(mut self, cache_mode: CacheMode) -> RequestBuilder {
+        self.cache_mode = cache_mode;
+        self
+    }
+
     pub fn build(self) -> Request {
         let mut request = Request::new(
+            self.id,
             self.url.clone(),
             Some(Origin::Origin(self.origin)),
             self.referrer,
             self.pipeline_id,
+            self.target_webview_id,
             self.https_state,
         );
         request.initiator = self.initiator;
@@ -423,9 +480,10 @@ impl RequestBuilder {
         request.url_list = url_list;
         request.integrity_metadata = self.integrity_metadata;
         request.parser_metadata = self.parser_metadata;
-        request.csp_list = self.csp_list;
         request.response_tainting = self.response_tainting;
         request.crash = self.crash;
+        request.policy_container = self.policy_container;
+        request.insecure_requests_policy = self.insecure_requests_policy;
         request
     }
 }
@@ -434,13 +492,15 @@ impl RequestBuilder {
 /// the Fetch spec.
 #[derive(Clone, MallocSizeOf)]
 pub struct Request {
+    /// The unique id of this request so that the task that triggered it can route
+    /// messages to the correct listeners. This is a UUID that is generated when a request
+    /// is being built.
+    pub id: RequestId,
     /// <https://fetch.spec.whatwg.org/#concept-request-method>
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub method: Method,
     /// <https://fetch.spec.whatwg.org/#local-urls-only-flag>
     pub local_urls_only: bool,
-    /// <https://fetch.spec.whatwg.org/#sandboxed-storage-area-urls-flag>
-    pub sandboxed_storage_area_urls: bool,
     /// <https://fetch.spec.whatwg.org/#concept-request-header-list>
     #[ignore_malloc_size_of = "Defined in hyper"]
     pub headers: HeaderMap,
@@ -450,7 +510,7 @@ pub struct Request {
     pub body: Option<RequestBody>,
     // TODO: client object
     pub window: Window,
-    // TODO: target browsing context
+    pub target_webview_id: Option<WebViewId>,
     /// <https://fetch.spec.whatwg.org/#request-keepalive-flag>
     pub keep_alive: bool,
     /// <https://fetch.spec.whatwg.org/#request-service-workers-mode>
@@ -465,7 +525,7 @@ pub struct Request {
     /// <https://fetch.spec.whatwg.org/#concept-request-referrer>
     pub referrer: Referrer,
     /// <https://fetch.spec.whatwg.org/#concept-request-referrer-policy>
-    pub referrer_policy: Option<ReferrerPolicy>,
+    pub referrer_policy: ReferrerPolicy,
     pub pipeline_id: Option<PipelineId>,
     /// <https://fetch.spec.whatwg.org/#synchronous-flag>
     pub synchronous: bool,
@@ -493,11 +553,10 @@ pub struct Request {
     pub response_tainting: ResponseTainting,
     /// <https://fetch.spec.whatwg.org/#concept-request-parser-metadata>
     pub parser_metadata: ParserMetadata,
-    // This is nominally a part of the client's global object.
-    // It is copied here to avoid having to reach across the thread
-    // boundary every time a redirect occurs.
-    #[ignore_malloc_size_of = "Defined in rust-content-security-policy"]
-    pub csp_list: Option<CspList>,
+    /// <https://fetch.spec.whatwg.org/#concept-request-policy-container>
+    pub policy_container: RequestPolicyContainer,
+    /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy>
+    pub insecure_requests_policy: InsecureRequestsPolicy,
     pub https_state: HttpsState,
     /// Servo internal: if crash details are present, trigger a crash error page with these details.
     pub crash: Option<String>,
@@ -505,16 +564,18 @@ pub struct Request {
 
 impl Request {
     pub fn new(
+        id: RequestId,
         url: ServoUrl,
         origin: Option<Origin>,
         referrer: Referrer,
         pipeline_id: Option<PipelineId>,
+        webview_id: Option<WebViewId>,
         https_state: HttpsState,
     ) -> Request {
         Request {
+            id,
             method: Method::GET,
             local_urls_only: false,
-            sandboxed_storage_area_urls: false,
             headers: HeaderMap::new(),
             unsafe_request: false,
             body: None,
@@ -524,9 +585,10 @@ impl Request {
             initiator: Initiator::None,
             destination: Destination::None,
             origin: origin.unwrap_or(Origin::Client),
-            referrer: referrer,
-            referrer_policy: None,
-            pipeline_id: pipeline_id,
+            referrer,
+            referrer_policy: ReferrerPolicy::EmptyString,
+            pipeline_id,
+            target_webview_id: webview_id,
             synchronous: false,
             mode: RequestMode::NoCors,
             use_cors_preflight: false,
@@ -539,8 +601,9 @@ impl Request {
             parser_metadata: ParserMetadata::Default,
             redirect_count: 0,
             response_tainting: ResponseTainting::Basic,
-            csp_list: None,
-            https_state: https_state,
+            policy_container: RequestPolicyContainer::Client,
+            insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
+            https_state,
             crash: None,
         }
     }
@@ -562,24 +625,31 @@ impl Request {
 
     /// <https://fetch.spec.whatwg.org/#navigation-request>
     pub fn is_navigation_request(&self) -> bool {
-        self.destination == Destination::Document
+        matches!(
+            self.destination,
+            Destination::Document |
+                Destination::Embed |
+                Destination::Frame |
+                Destination::IFrame |
+                Destination::Object
+        )
     }
 
     /// <https://fetch.spec.whatwg.org/#subresource-request>
     pub fn is_subresource_request(&self) -> bool {
-        match self.destination {
+        matches!(
+            self.destination,
             Destination::Audio |
-            Destination::Font |
-            Destination::Image |
-            Destination::Manifest |
-            Destination::Script |
-            Destination::Style |
-            Destination::Track |
-            Destination::Video |
-            Destination::Xslt |
-            Destination::None => true,
-            _ => false,
-        }
+                Destination::Font |
+                Destination::Image |
+                Destination::Manifest |
+                Destination::Script |
+                Destination::Style |
+                Destination::Track |
+                Destination::Video |
+                Destination::Xslt |
+                Destination::None
+        )
     }
 
     pub fn timing_type(&self) -> ResourceTimingType {
@@ -605,7 +675,7 @@ impl Referrer {
 // TODO: values in the control-code range are being quietly stripped out by
 // HeaderMap and never reach this function to be loudly rejected!
 fn is_cors_unsafe_request_header_byte(value: &u8) -> bool {
-    match value {
+    matches!(value,
         0x00..=0x08 |
         0x10..=0x19 |
         0x22 |
@@ -621,9 +691,8 @@ fn is_cors_unsafe_request_header_byte(value: &u8) -> bool {
         0x5D |
         0x7B |
         0x7D |
-        0x7F => true,
-        _ => false,
-    }
+        0x7F
+    )
 }
 
 // https://fetch.spec.whatwg.org/#cors-safelisted-request-header
@@ -635,18 +704,19 @@ fn is_cors_safelisted_request_accept(value: &[u8]) -> bool {
 // https://fetch.spec.whatwg.org/#cors-safelisted-request-header
 // subclauses `accept-language`, `content-language`
 fn is_cors_safelisted_language(value: &[u8]) -> bool {
-    value.iter().all(|&x| match x {
-        0x30..=0x39 |
-        0x41..=0x5A |
-        0x61..=0x7A |
-        0x20 |
-        0x2A |
-        0x2C |
-        0x2D |
-        0x2E |
-        0x3B |
-        0x3D => true,
-        _ => false,
+    value.iter().all(|&x| {
+        matches!(x,
+            0x30..=0x39 |
+            0x41..=0x5A |
+            0x61..=0x7A |
+            0x20 |
+            0x2A |
+            0x2C |
+            0x2D |
+            0x2E |
+            0x3B |
+            0x3D
+        )
     })
 }
 
@@ -691,16 +761,46 @@ pub fn is_cors_safelisted_request_header<N: AsRef<str>, V: AsRef<[u8]>>(
         "accept" => is_cors_safelisted_request_accept(value),
         "accept-language" | "content-language" => is_cors_safelisted_language(value),
         "content-type" => is_cors_safelisted_request_content_type(value),
+        "range" => is_cors_safelisted_request_range(value),
         _ => false,
     }
 }
 
+pub fn is_cors_safelisted_request_range(value: &[u8]) -> bool {
+    if let Ok(value_str) = std::str::from_utf8(value) {
+        return validate_range_header(value_str);
+    }
+    false
+}
+
+fn validate_range_header(value: &str) -> bool {
+    let trimmed = value.trim();
+    if !trimmed.starts_with("bytes=") {
+        return false;
+    }
+
+    if let Some(range) = trimmed.strip_prefix("bytes=") {
+        let mut parts = range.split('-');
+        let start = parts.next();
+        let end = parts.next();
+
+        if let Some(start) = start {
+            if let Ok(start_num) = start.parse::<u64>() {
+                return match end {
+                    Some(e) if !e.is_empty() => e
+                        .parse::<u64>()
+                        .map_or(false, |end_num| start_num <= end_num),
+                    _ => true,
+                };
+            }
+        }
+    }
+    false
+}
+
 /// <https://fetch.spec.whatwg.org/#cors-safelisted-method>
 pub fn is_cors_safelisted_method(m: &Method) -> bool {
-    match *m {
-        Method::GET | Method::HEAD | Method::POST => true,
-        _ => false,
-    }
+    matches!(*m, Method::GET | Method::HEAD | Method::POST)
 }
 
 /// <https://fetch.spec.whatwg.org/#cors-non-wildcard-request-header-name>
@@ -733,7 +833,7 @@ pub fn get_cors_unsafe_header_names(headers: &HeaderMap) -> Vec<HeaderName> {
     }
 
     // Step 6
-    return convert_header_names_to_sorted_lowercase_set(unsafe_names);
+    convert_header_names_to_sorted_lowercase_set(unsafe_names)
 }
 
 /// <https://fetch.spec.whatwg.org/#ref-for-convert-header-names-to-a-sorted-lowercase-set>
@@ -745,5 +845,5 @@ pub fn convert_header_names_to_sorted_lowercase_set(
     let mut ordered_set = header_names.to_vec();
     ordered_set.sort_by(|a, b| a.as_str().partial_cmp(b.as_str()).unwrap());
     ordered_set.dedup();
-    return ordered_set.into_iter().cloned().collect();
+    ordered_set.into_iter().cloned().collect()
 }

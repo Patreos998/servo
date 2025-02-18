@@ -10,9 +10,10 @@ use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MessageChannel {
+pub(crate) struct MessageChannel {
     reflector_: Reflector,
     port1: Dom<MessagePort>,
     port2: Dom<MessagePort>,
@@ -20,40 +21,33 @@ pub struct MessageChannel {
 
 impl MessageChannel {
     /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel>
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        global: &GlobalScope,
+    fn new(
+        incumbent: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<MessageChannel> {
-        MessageChannel::new(global, proto)
-    }
-
-    /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel>
-    fn new(incumbent: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<MessageChannel> {
         // Step 1
-        let port1 = MessagePort::new(&incumbent);
+        let port1 = MessagePort::new(incumbent);
 
         // Step 2
-        let port2 = MessagePort::new(&incumbent);
+        let port2 = MessagePort::new(incumbent);
 
-        incumbent.track_message_port(&*port1, None);
-        incumbent.track_message_port(&*port2, None);
+        incumbent.track_message_port(&port1, None);
+        incumbent.track_message_port(&port2, None);
 
         // Step 3
-        incumbent.entangle_ports(
-            port1.message_port_id().clone(),
-            port2.message_port_id().clone(),
-        );
+        incumbent.entangle_ports(*port1.message_port_id(), *port2.message_port_id());
 
         // Steps 4-6
         reflect_dom_object_with_proto(
-            Box::new(MessageChannel::new_inherited(&*port1, &*port2)),
+            Box::new(MessageChannel::new_inherited(&port1, &port2)),
             incumbent,
             proto,
+            can_gc,
         )
     }
 
-    pub fn new_inherited(port1: &MessagePort, port2: &MessagePort) -> MessageChannel {
+    pub(crate) fn new_inherited(port1: &MessagePort, port2: &MessagePort) -> MessageChannel {
         MessageChannel {
             reflector_: Reflector::new(),
             port1: Dom::from_ref(port1),
@@ -62,7 +56,16 @@ impl MessageChannel {
     }
 }
 
-impl MessageChannelMethods for MessageChannel {
+impl MessageChannelMethods<crate::DomTypeHolder> for MessageChannel {
+    /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel>
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<MessageChannel> {
+        MessageChannel::new(global, proto, can_gc)
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#dom-messagechannel-port1>
     fn Port1(&self) -> DomRoot<MessagePort> {
         DomRoot::from_ref(&*self.port1)

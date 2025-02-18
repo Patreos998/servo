@@ -11,7 +11,7 @@ use crate::StreamId;
 
 pub struct ObjectActor {
     pub name: String,
-    pub uuid: String,
+    pub _uuid: String,
 }
 
 impl Actor for ObjectActor {
@@ -26,17 +26,18 @@ impl Actor for ObjectActor {
         _: &mut TcpStream,
         _: StreamId,
     ) -> Result<ActorMessageStatus, ()> {
+        // TODO: Handle enumSymbols for console object inspection
         Ok(ActorMessageStatus::Ignored)
     }
 }
 
 impl ObjectActor {
-    pub fn new(registry: &ActorRegistry, uuid: String) -> String {
+    pub fn register(registry: &ActorRegistry, uuid: String) -> String {
         if !registry.script_actor_registered(uuid.clone()) {
             let name = registry.new_name("object");
             let actor = ObjectActor {
                 name: name.clone(),
-                uuid: uuid.clone(),
+                _uuid: uuid.clone(),
             };
 
             registry.register_script_actor(uuid, name.clone());

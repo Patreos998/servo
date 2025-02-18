@@ -2,19 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-//! Data needed by the layout thread.
+//! Data needed by layout.
 
-use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base::id::PipelineId;
 use fnv::FnvHasher;
-use gfx::font_cache_thread::FontCacheThread;
-use gfx::font_context::FontContext;
-use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
-use msg::constellation_msg::PipelineId;
+use fonts::FontContext;
 use net_traits::image_cache::{
     ImageCache, ImageCacheResult, ImageOrMetadataAvailable, UsePlaceholder,
 };
@@ -27,33 +24,8 @@ use style::context::{RegisteredSpeculativePainter, SharedStyleContext};
 
 use crate::display_list::items::{OpaqueNode, WebRenderImageInfo};
 
-pub type LayoutFontContext = FontContext<FontCacheThread>;
-
-thread_local!(static FONT_CONTEXT_KEY: RefCell<Option<LayoutFontContext>> = RefCell::new(None));
-
-pub fn with_thread_local_font_context<F, R>(layout_context: &LayoutContext, f: F) -> R
-where
-    F: FnOnce(&mut LayoutFontContext) -> R,
-{
-    FONT_CONTEXT_KEY.with(|k| {
-        let mut font_context = k.borrow_mut();
-        if font_context.is_none() {
-            let font_cache_thread = layout_context.font_cache_thread.lock().unwrap().clone();
-            *font_context = Some(FontContext::new(font_cache_thread));
-        }
-        f(&mut RefMut::map(font_context, |x| x.as_mut().unwrap()))
-    })
-}
-
-pub fn malloc_size_of_persistent_local_context(ops: &mut MallocSizeOfOps) -> usize {
-    FONT_CONTEXT_KEY.with(|r| {
-        if let Some(ref context) = *r.borrow() {
-            context.size_of(ops)
-        } else {
-            0
-        }
-    })
-}
+type WebrenderImageCache =
+    HashMap<(ServoUrl, UsePlaceholder), WebRenderImageInfo, BuildHasherDefault<FnvHasher>>;
 
 /// Layout information shared among all workers. This must be thread-safe.
 pub struct LayoutContext<'a> {
@@ -69,15 +41,11 @@ pub struct LayoutContext<'a> {
     /// Reference to the script thread image cache.
     pub image_cache: Arc<dyn ImageCache>,
 
-    /// Interface to the font cache thread.
-    pub font_cache_thread: Mutex<FontCacheThread>,
+    /// A FontContext to be used during layout.
+    pub font_context: Arc<FontContext>,
 
     /// A cache of WebRender image info.
-    pub webrender_image_cache: Arc<
-        RwLock<
-            HashMap<(ServoUrl, UsePlaceholder), WebRenderImageInfo, BuildHasherDefault<FnvHasher>>,
-        >,
-    >,
+    pub webrender_image_cache: Arc<RwLock<WebrenderImageCache>>,
 
     /// Paint worklets
     pub registered_painters: &'a dyn RegisteredPainters,
@@ -86,7 +54,7 @@ pub struct LayoutContext<'a> {
     pub pending_images: Mutex<Vec<PendingImage>>,
 }
 
-impl<'a> Drop for LayoutContext<'a> {
+impl Drop for LayoutContext<'_> {
     fn drop(&mut self) {
         if !thread::panicking() {
             assert!(self.pending_images.lock().unwrap().is_empty());
@@ -94,7 +62,7 @@ impl<'a> Drop for LayoutContext<'a> {
     }
 }
 
-impl<'a> LayoutContext<'a> {
+impl LayoutContext<'_> {
     #[inline(always)]
     pub fn shared_context(&self) -> &SharedStyleContext {
         &self.style_context
@@ -155,12 +123,12 @@ impl<'a> LayoutContext<'a> {
             .read()
             .get(&(url.clone(), use_placeholder))
         {
-            return Some((*existing_webrender_image).clone());
+            return Some(*existing_webrender_image);
         }
 
         match self.get_or_request_image_or_meta(node, url.clone(), use_placeholder) {
             Some(ImageOrMetadataAvailable::ImageAvailable { image, .. }) => {
-                let image_info = WebRenderImageInfo::from_image(&*image);
+                let image_info = WebRenderImageInfo::from_image(&image);
                 if image_info.key.is_none() {
                     Some(image_info)
                 } else {
@@ -169,7 +137,7 @@ impl<'a> LayoutContext<'a> {
                     Some(image_info)
                 }
             },
-            None | Some(ImageOrMetadataAvailable::MetadataAvailable(_)) => None,
+            None | Some(ImageOrMetadataAvailable::MetadataAvailable(..)) => None,
         }
     }
 }

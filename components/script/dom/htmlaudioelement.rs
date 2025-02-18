@@ -7,6 +7,7 @@ use html5ever::{local_name, namespace_url, ns, LocalName, Prefix, QualName};
 use js::rust::HandleObject;
 
 use crate::dom::bindings::codegen::Bindings::ElementBinding::Element_Binding::ElementMethods;
+use crate::dom::bindings::codegen::Bindings::HTMLAudioElementBinding::HTMLAudioElementMethods;
 use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
@@ -17,9 +18,10 @@ use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::htmlmediaelement::HTMLMediaElement;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLAudioElement {
+pub(crate) struct HTMLAudioElement {
     htmlmediaelement: HTMLMediaElement,
 }
 
@@ -34,12 +36,13 @@ impl HTMLAudioElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLAudioElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLAudioElement::new_inherited(
@@ -47,14 +50,17 @@ impl HTMLAudioElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
+}
 
+impl HTMLAudioElementMethods<crate::DomTypeHolder> for HTMLAudioElement {
     // https://html.spec.whatwg.org/multipage/#dom-audio
-    #[allow(non_snake_case)]
-    pub fn Audio(
+    fn Audio(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         src: Option<DOMString>,
     ) -> Fallible<DomRoot<HTMLAudioElement>> {
         let element = Element::create(
@@ -64,18 +70,19 @@ impl HTMLAudioElement {
             ElementCreator::ScriptCreated,
             CustomElementCreationMode::Synchronous,
             proto,
+            can_gc,
         );
 
         let audio = DomRoot::downcast::<HTMLAudioElement>(element).unwrap();
 
         audio
             .upcast::<Element>()
-            .SetAttribute(DOMString::from("preload"), DOMString::from("auto"))
+            .SetAttribute(DOMString::from("preload"), DOMString::from("auto"), can_gc)
             .expect("should be infallible");
         if let Some(s) = src {
             audio
                 .upcast::<Element>()
-                .SetAttribute(DOMString::from("src"), s)
+                .SetAttribute(DOMString::from("src"), s, can_gc)
                 .expect("should be infallible");
         }
 

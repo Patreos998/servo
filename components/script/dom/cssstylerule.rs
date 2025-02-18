@@ -6,25 +6,26 @@ use std::mem;
 
 use cssparser::{Parser as CssParser, ParserInput as CssParserInput, ToCss};
 use dom_struct::dom_struct;
-use selectors::parser::SelectorList;
+use selectors::parser::{ParseRelative, SelectorList};
 use servo_arc::Arc;
 use style::selector_parser::SelectorParser;
 use style::shared_lock::{Locked, ToCssWithGuard};
-use style::stylesheets::{Origin, StyleRule};
+use style::stylesheets::{CssRuleType, Origin, StyleRule};
 
 use crate::dom::bindings::codegen::Bindings::CSSStyleRuleBinding::CSSStyleRuleMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner};
 use crate::dom::cssstylesheet::CSSStyleSheet;
-use crate::dom::node::{stylesheets_owner_from_node, Node};
+use crate::dom::node::NodeTraits;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CSSStyleRule {
+pub(crate) struct CSSStyleRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -39,13 +40,13 @@ impl CSSStyleRule {
     ) -> CSSStyleRule {
         CSSStyleRule {
             cssrule: CSSRule::new_inherited(parent_stylesheet),
-            stylerule: stylerule,
+            stylerule,
             style_decl: Default::default(),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         stylerule: Arc<Locked<StyleRule>>,
@@ -53,14 +54,14 @@ impl CSSStyleRule {
         reflect_dom_object(
             Box::new(CSSStyleRule::new_inherited(parent_stylesheet, stylerule)),
             window,
+            CanGc::note(),
         )
     }
 }
 
 impl SpecificCSSRule for CSSStyleRule {
-    fn ty(&self) -> u16 {
-        use crate::dom::bindings::codegen::Bindings::CSSRuleBinding::CSSRuleConstants;
-        CSSRuleConstants::STYLE_RULE
+    fn ty(&self) -> CssRuleType {
+        CssRuleType::Style
     }
 
     fn get_css(&self) -> DOMString {
@@ -72,7 +73,7 @@ impl SpecificCSSRule for CSSStyleRule {
     }
 }
 
-impl CSSStyleRuleMethods for CSSStyleRule {
+impl CSSStyleRuleMethods<crate::DomTypeHolder> for CSSStyleRule {
     // https://drafts.csswg.org/cssom/#dom-cssstylerule-style
     fn Style(&self) -> DomRoot<CSSStyleDeclaration> {
         self.style_decl.or_init(|| {
@@ -93,7 +94,7 @@ impl CSSStyleRuleMethods for CSSStyleRule {
     fn SelectorText(&self) -> DOMString {
         let guard = self.cssrule.shared_lock().read();
         let stylerule = self.stylerule.read_with(&guard);
-        return DOMString::from_string(stylerule.selectors.to_css_string());
+        DOMString::from_string(stylerule.selectors.to_css_string())
     }
 
     // https://drafts.csswg.org/cssom/#dom-cssstylerule-selectortext
@@ -109,15 +110,17 @@ impl CSSStyleRuleMethods for CSSStyleRule {
             url_data: &url_data,
             for_supports_rule: false,
         };
-        let mut css_parser = CssParserInput::new(&*value);
+        let mut css_parser = CssParserInput::new(&value);
         let mut css_parser = CssParser::new(&mut css_parser);
-        if let Ok(mut s) = SelectorList::parse(&parser, &mut css_parser) {
+        // TODO: Maybe allow setting relative selectors from the OM, if we're in a nested style
+        // rule?
+        if let Ok(mut s) = SelectorList::parse(&parser, &mut css_parser, ParseRelative::No) {
             // This mirrors what we do in CSSStyleOwner::mutate_associated_block.
             let mut guard = self.cssrule.shared_lock().write();
             let stylerule = self.stylerule.write_with(&mut guard);
             mem::swap(&mut stylerule.selectors, &mut s);
             if let Some(owner) = self.cssrule.parent_stylesheet().get_owner() {
-                stylesheets_owner_from_node(owner.upcast::<Node>()).invalidate_stylesheets();
+                owner.stylesheet_list_owner().invalidate_stylesheets();
             }
         }
     }

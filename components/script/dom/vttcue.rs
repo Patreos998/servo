@@ -14,7 +14,7 @@ use crate::dom::bindings::codegen::Bindings::VTTCueBinding::{
 };
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::num::Finite;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::documentfragment::DocumentFragment;
@@ -22,9 +22,10 @@ use crate::dom::globalscope::GlobalScope;
 use crate::dom::texttrackcue::TextTrackCue;
 use crate::dom::vttregion::VTTRegion;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct VTTCue {
+pub(crate) struct VTTCue {
     texttrackcue: TextTrackCue,
     region: DomRefCell<Option<Dom<VTTRegion>>>,
     vertical: Cell<DirectionSetting>,
@@ -39,7 +40,7 @@ pub struct VTTCue {
 }
 
 impl VTTCue {
-    pub fn new_inherited(start_time: f64, end_time: f64, text: DOMString) -> Self {
+    pub(crate) fn new_inherited(start_time: f64, end_time: f64, text: DOMString) -> Self {
         VTTCue {
             texttrackcue: TextTrackCue::new_inherited(
                 DOMString::default(),
@@ -66,27 +67,37 @@ impl VTTCue {
         start_time: f64,
         end_time: f64,
         text: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<Self> {
         reflect_dom_object_with_proto(
             Box::new(Self::new_inherited(start_time, end_time, text)),
             global,
             proto,
+            can_gc,
         )
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl VTTCueMethods<crate::DomTypeHolder> for VTTCue {
+    // https://w3c.github.io/webvtt/#dom-vttcue-vttcue
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         start_time: Finite<f64>,
         end_time: Finite<f64>,
         text: DOMString,
     ) -> DomRoot<Self> {
-        VTTCue::new(&window.global(), proto, *start_time, *end_time, text)
+        VTTCue::new(
+            &window.global(),
+            proto,
+            *start_time,
+            *end_time,
+            text,
+            can_gc,
+        )
     }
-}
 
-impl VTTCueMethods for VTTCue {
     // https://w3c.github.io/webvtt/#dom-vttcue-region
     fn GetRegion(&self) -> Option<DomRoot<VTTRegion>> {
         self.region
@@ -97,7 +108,7 @@ impl VTTCueMethods for VTTCue {
 
     // https://w3c.github.io/webvtt/#dom-vttcue-region
     fn SetRegion(&self, value: Option<&VTTRegion>) {
-        *self.region.borrow_mut() = value.map(|r| Dom::from_ref(r))
+        *self.region.borrow_mut() = value.map(Dom::from_ref)
     }
 
     // https://w3c.github.io/webvtt/#dom-vttcue-vertical

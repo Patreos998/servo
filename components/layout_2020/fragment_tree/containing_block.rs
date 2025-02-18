@@ -28,7 +28,8 @@ pub(crate) struct ContainingBlockManager<'a, T> {
     ///      element is split across multiple lines, the containing block is
     ///      undefined.
     ///   2. Otherwise, the containing block is formed by the padding edge of the
-    ///      ancestor."
+    ///      ancestor.
+    ///
     /// <https://www.w3.org/TR/CSS2/visudet.html#containing-block-details>
     /// If the ancestor forms a containing block for all descendants (see below),
     /// this value will be None and absolute descendants will use the containing
@@ -51,7 +52,7 @@ pub(crate) struct ContainingBlockManager<'a, T> {
 impl<'a, T> ContainingBlockManager<'a, T> {
     pub(crate) fn get_containing_block_for_fragment(&self, fragment: &Fragment) -> &T {
         if let Fragment::Box(box_fragment) = fragment {
-            match box_fragment.style.clone_position() {
+            match box_fragment.borrow().style.clone_position() {
                 ComputedPosition::Fixed => self.for_absolute_and_fixed_descendants,
                 ComputedPosition::Absolute => self
                     .for_absolute_descendants
@@ -67,11 +68,11 @@ impl<'a, T> ContainingBlockManager<'a, T> {
         &self,
         for_non_absolute_descendants: &'a T,
     ) -> Self {
-        return ContainingBlockManager {
+        ContainingBlockManager {
             for_non_absolute_descendants,
             for_absolute_descendants: self.for_absolute_descendants,
             for_absolute_and_fixed_descendants: self.for_absolute_and_fixed_descendants,
-        };
+        }
     }
 
     pub(crate) fn new_for_absolute_descendants(
@@ -79,11 +80,11 @@ impl<'a, T> ContainingBlockManager<'a, T> {
         for_non_absolute_descendants: &'a T,
         for_absolute_descendants: &'a T,
     ) -> Self {
-        return ContainingBlockManager {
+        ContainingBlockManager {
             for_non_absolute_descendants,
             for_absolute_descendants: Some(for_absolute_descendants),
             for_absolute_and_fixed_descendants: self.for_absolute_and_fixed_descendants,
-        };
+        }
     }
 
     pub(crate) fn new_for_absolute_and_fixed_descendants(
@@ -91,10 +92,10 @@ impl<'a, T> ContainingBlockManager<'a, T> {
         for_non_absolute_descendants: &'a T,
         for_absolute_and_fixed_descendants: &'a T,
     ) -> Self {
-        return ContainingBlockManager {
+        ContainingBlockManager {
             for_non_absolute_descendants,
             for_absolute_descendants: None,
             for_absolute_and_fixed_descendants,
-        };
+        }
     }
 }

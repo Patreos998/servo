@@ -8,8 +8,9 @@ use std::fmt;
 use bitflags::bitflags;
 use dom_struct::dom_struct;
 use itertools::Itertools;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
+use super::bindings::codegen::Bindings::ElementInternalsBinding::ValidityStateFlags;
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::ValidityStateBinding::ValidityStateMethods;
 use crate::dom::bindings::inheritance::Castable;
@@ -21,10 +22,11 @@ use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
 use crate::dom::htmlformelement::FormControlElementHelpers;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#validity-states
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
-pub struct ValidationFlags(u32);
+pub(crate) struct ValidationFlags(u32);
 
 bitflags! {
     impl ValidationFlags: u32 {
@@ -72,7 +74,7 @@ impl fmt::Display for ValidationFlags {
 
 // https://html.spec.whatwg.org/multipage/#validitystate
 #[dom_struct]
-pub struct ValidityState {
+pub(crate) struct ValidityState {
     reflector_: Reflector,
     element: Dom<Element>,
     custom_error_message: DomRefCell<DOMString>,
@@ -89,17 +91,21 @@ impl ValidityState {
         }
     }
 
-    pub fn new(window: &Window, element: &Element) -> DomRoot<ValidityState> {
-        reflect_dom_object(Box::new(ValidityState::new_inherited(element)), window)
+    pub(crate) fn new(window: &Window, element: &Element) -> DomRoot<ValidityState> {
+        reflect_dom_object(
+            Box::new(ValidityState::new_inherited(element)),
+            window,
+            CanGc::note(),
+        )
     }
 
     // https://html.spec.whatwg.org/multipage/#custom-validity-error-message
-    pub fn custom_error_message(&self) -> Ref<DOMString> {
+    pub(crate) fn custom_error_message(&self) -> Ref<DOMString> {
         self.custom_error_message.borrow()
     }
 
     // https://html.spec.whatwg.org/multipage/#custom-validity-error-message
-    pub fn set_custom_error_message(&self, error: DOMString) {
+    pub(crate) fn set_custom_error_message(&self, error: DOMString) {
         *self.custom_error_message.borrow_mut() = error;
         self.perform_validation_and_update(ValidationFlags::CUSTOM_ERROR);
     }
@@ -109,7 +115,7 @@ impl ValidityState {
     /// if [ValidationFlags::CUSTOM_ERROR] is in `update_flags` and a custom
     /// error has been set on this [ValidityState], the state will be updated
     /// to reflect the existance of a custom error.
-    pub fn perform_validation_and_update(&self, update_flags: ValidationFlags) {
+    pub(crate) fn perform_validation_and_update(&self, update_flags: ValidationFlags) {
         let mut invalid_flags = self.invalid_flags.get();
         invalid_flags.remove(update_flags);
 
@@ -129,20 +135,22 @@ impl ValidityState {
         self.update_pseudo_classes();
     }
 
-    pub fn invalid_flags(&self) -> ValidationFlags {
+    pub(crate) fn update_invalid_flags(&self, update_flags: ValidationFlags) {
+        self.invalid_flags.set(update_flags);
+    }
+
+    pub(crate) fn invalid_flags(&self) -> ValidationFlags {
         self.invalid_flags.get()
     }
 
-    fn update_pseudo_classes(&self) {
-        if let Some(validatable) = self.element.as_maybe_validatable() {
-            if validatable.is_instance_validatable() {
-                let is_valid = self.invalid_flags.get().is_empty();
-                self.element.set_state(ElementState::VALID, is_valid);
-                self.element.set_state(ElementState::INVALID, !is_valid);
-            } else {
-                self.element.set_state(ElementState::VALID, false);
-                self.element.set_state(ElementState::INVALID, false);
-            }
+    pub(crate) fn update_pseudo_classes(&self) {
+        if self.element.is_instance_validatable() {
+            let is_valid = self.invalid_flags.get().is_empty();
+            self.element.set_state(ElementState::VALID, is_valid);
+            self.element.set_state(ElementState::INVALID, !is_valid);
+        } else {
+            self.element.set_state(ElementState::VALID, false);
+            self.element.set_state(ElementState::INVALID, false);
         }
 
         if let Some(form_control) = self.element.as_maybe_form_control() {
@@ -163,7 +171,7 @@ impl ValidityState {
     }
 }
 
-impl ValidityStateMethods for ValidityState {
+impl ValidityStateMethods<crate::DomTypeHolder> for ValidityState {
     // https://html.spec.whatwg.org/multipage/#dom-validitystate-valuemissing
     fn ValueMissing(&self) -> bool {
         self.invalid_flags()
@@ -223,5 +231,42 @@ impl ValidityStateMethods for ValidityState {
     // https://html.spec.whatwg.org/multipage/#dom-validitystate-valid
     fn Valid(&self) -> bool {
         self.invalid_flags().is_empty()
+    }
+}
+
+impl From<&ValidityStateFlags> for ValidationFlags {
+    fn from(flags: &ValidityStateFlags) -> Self {
+        let mut bits = ValidationFlags::empty();
+        if flags.valueMissing {
+            bits |= ValidationFlags::VALUE_MISSING;
+        }
+        if flags.typeMismatch {
+            bits |= ValidationFlags::TYPE_MISMATCH;
+        }
+        if flags.patternMismatch {
+            bits |= ValidationFlags::PATTERN_MISMATCH;
+        }
+        if flags.tooLong {
+            bits |= ValidationFlags::TOO_LONG;
+        }
+        if flags.tooShort {
+            bits |= ValidationFlags::TOO_SHORT;
+        }
+        if flags.rangeUnderflow {
+            bits |= ValidationFlags::RANGE_UNDERFLOW;
+        }
+        if flags.rangeOverflow {
+            bits |= ValidationFlags::RANGE_OVERFLOW;
+        }
+        if flags.stepMismatch {
+            bits |= ValidationFlags::STEP_MISMATCH;
+        }
+        if flags.badInput {
+            bits |= ValidationFlags::BAD_INPUT;
+        }
+        if flags.customError {
+            bits |= ValidationFlags::CUSTOM_ERROR;
+        }
+        bits
     }
 }

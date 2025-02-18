@@ -15,26 +15,32 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::uievent::UIEvent;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CompositionEvent {
+pub(crate) struct CompositionEvent {
     uievent: UIEvent,
     data: DOMString,
 }
 
 impl CompositionEvent {
-    pub fn new_inherited() -> CompositionEvent {
+    pub(crate) fn new_inherited() -> CompositionEvent {
         CompositionEvent {
             uievent: UIEvent::new_inherited(),
             data: DOMString::new(),
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<CompositionEvent> {
-        reflect_dom_object(Box::new(CompositionEvent::new_inherited()), window)
+    pub(crate) fn new_uninitialized(window: &Window) -> DomRoot<CompositionEvent> {
+        reflect_dom_object(
+            Box::new(CompositionEvent::new_inherited()),
+            window,
+            CanGc::note(),
+        )
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         window: &Window,
         type_: DOMString,
         can_bubble: bool,
@@ -42,12 +48,14 @@ impl CompositionEvent {
         view: Option<&Window>,
         detail: i32,
         data: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<CompositionEvent> {
         Self::new_with_proto(
-            window, None, type_, can_bubble, cancelable, view, detail, data,
+            window, None, type_, can_bubble, cancelable, view, detail, data, can_gc,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -57,24 +65,33 @@ impl CompositionEvent {
         view: Option<&Window>,
         detail: i32,
         data: DOMString,
+        can_gc: CanGc,
     ) -> DomRoot<CompositionEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(CompositionEvent {
                 uievent: UIEvent::new_inherited(),
-                data: data,
+                data,
             }),
             window,
             proto,
+            can_gc,
         );
         ev.uievent
             .InitUIEvent(type_, can_bubble, cancelable, view, detail);
         ev
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    pub(crate) fn data(&self) -> &str {
+        &self.data
+    }
+}
+
+impl CompositionEventMethods<crate::DomTypeHolder> for CompositionEvent {
+    // https://w3c.github.io/uievents/#dom-compositionevent-compositionevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &CompositionEventBinding::CompositionEventInit,
     ) -> Fallible<DomRoot<CompositionEvent>> {
@@ -87,16 +104,11 @@ impl CompositionEvent {
             init.parent.view.as_deref(),
             init.parent.detail,
             init.data.clone(),
+            can_gc,
         );
         Ok(event)
     }
 
-    pub fn data(&self) -> &str {
-        &*self.data
-    }
-}
-
-impl CompositionEventMethods for CompositionEvent {
     // https://w3c.github.io/uievents/#dom-compositionevent-data
     fn Data(&self) -> DOMString {
         self.data.clone()

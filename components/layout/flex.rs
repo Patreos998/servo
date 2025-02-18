@@ -11,16 +11,14 @@ use app_units::{Au, MAX_AU};
 use euclid::default::Point2D;
 use log::debug;
 use serde::Serialize;
-use style::computed_values::align_content::T as AlignContent;
-use style::computed_values::align_self::T as AlignSelf;
 use style::computed_values::flex_direction::T as FlexDirection;
 use style::computed_values::flex_wrap::T as FlexWrap;
-use style::computed_values::justify_content::T as JustifyContent;
 use style::logical_geometry::{Direction, LogicalSize};
 use style::properties::ComputedValues;
 use style::servo::restyle_damage::ServoRestyleDamage;
 use style::values::computed::flex::FlexBasis;
 use style::values::computed::{MaxSize, Size};
+use style::values::specified::align::AlignFlags;
 
 use crate::block::{AbsoluteAssignBSizesTraversal, BlockFlow, MarginsMayCollapseFlag};
 use crate::context::LayoutContext;
@@ -34,7 +32,6 @@ use crate::model::{
     self, AdjoiningMargins, CollapsibleMargins, IntrinsicISizes, MaybeAuto, SizeConstraint,
 };
 use crate::traversal::PreorderFlowTraversal;
-use crate::{layout_debug, layout_debug_scope};
 
 /// The size of an axis. May be a specified size, a min/max
 /// constraint, or an unlimited size
@@ -50,11 +47,11 @@ impl AxisSize {
     /// containing block size, min constraint, and max constraint
     pub fn new(size: &Size, content_size: Option<Au>, min: &Size, max: &MaxSize) -> AxisSize {
         match size {
-            Size::Auto => AxisSize::MinMax(SizeConstraint::new(content_size, min, max, None)),
             Size::LengthPercentage(ref lp) => match lp.maybe_to_used_value(content_size) {
                 Some(length) => AxisSize::Definite(length),
                 None => AxisSize::Infinite,
             },
+            _ => AxisSize::MinMax(SizeConstraint::new(content_size, min, max, None)),
         }
     }
 }
@@ -74,10 +71,7 @@ fn from_flex_basis(flex_basis: &FlexBasis, main_length: &Size, containing_length
         _ => width,
     };
 
-    match width {
-        Size::Auto => MaybeAuto::Auto,
-        Size::LengthPercentage(ref lp) => MaybeAuto::Specified(lp.to_used_value(containing_length)),
-    }
+    MaybeAuto::from_option(width.to_used_value(containing_length))
 }
 
 /// Represents a child in a flex container. Most fields here are used in
@@ -120,10 +114,10 @@ impl FlexItem {
             base_size: Au(0),
             min_size: Au(0),
             max_size: MAX_AU,
-            index: index,
+            index,
             flex_grow: flex_grow.into(),
             flex_shrink: flex_shrink.into(),
-            order: order,
+            order,
             is_frozen: false,
             is_strut: false,
         }
@@ -202,7 +196,7 @@ impl FlexItem {
     /// Returns the outer main size of the item, including paddings and margins,
     /// clamped by max and min size.
     pub fn outer_main_size(&self, flow: &dyn Flow, direction: Direction) -> Au {
-        let ref fragment = flow.as_block().fragment;
+        let fragment = &flow.as_block().fragment;
         let outer_width = match direction {
             Direction::Inline => {
                 fragment.border_padding.inline_start_end() + fragment.margin.inline_start_end()
@@ -259,9 +253,9 @@ struct FlexLine {
 impl FlexLine {
     pub fn new(range: Range<usize>, free_space: Au, auto_margin_count: i32) -> FlexLine {
         FlexLine {
-            range: range,
-            auto_margin_count: auto_margin_count,
-            free_space: free_space,
+            range,
+            auto_margin_count,
+            free_space,
             cross_size: Au(0),
         }
     }
@@ -399,14 +393,14 @@ impl FlexFlow {
 
         FlexFlow {
             block_flow: BlockFlow::from_fragment_and_float_kind(fragment, flotation),
-            main_mode: main_mode,
+            main_mode,
             available_main_size: AxisSize::Infinite,
             available_cross_size: AxisSize::Infinite,
             lines: Vec::new(),
             items: Vec::new(),
-            main_reverse: main_reverse,
-            is_wrappable: is_wrappable,
-            cross_reverse: cross_reverse,
+            main_reverse,
+            is_wrappable,
+            cross_reverse,
         }
     }
 
@@ -518,7 +512,6 @@ impl FlexFlow {
         inline_end_content_edge: Au,
         content_inline_size: Au,
     ) {
-        let _scope = layout_debug_scope!("flex::block_mode_assign_inline_sizes");
         debug!("flex::block_mode_assign_inline_sizes");
 
         // FIXME (mbrubeck): Get correct mode for absolute containing block
@@ -565,7 +558,6 @@ impl FlexFlow {
         _inline_end_content_edge: Au,
         content_inline_size: Au,
     ) {
-        let _scope = layout_debug_scope!("flex::inline_mode_assign_inline_sizes");
         debug!("inline_mode_assign_inline_sizes");
 
         debug!("content_inline_size = {:?}", content_inline_size);
@@ -612,42 +604,47 @@ impl FlexFlow {
             // TODO(stshine): if this flex line contain children that have
             // property visibility:collapse, exclude them and resolve again.
 
-            let item_count = items.len() as i32;
-            let mut cur_i = inline_start_content_edge;
-            let item_interval = if line.free_space >= Au(0) && line.auto_margin_count == 0 {
-                match self
+            let justify_content = {
+                let justify_content = self
                     .block_flow
                     .fragment
                     .style()
                     .get_position()
                     .justify_content
-                {
-                    JustifyContent::SpaceBetween => {
+                    .0
+                    .primary()
+                    .value();
+
+                match justify_content {
+                    AlignFlags::AUTO | AlignFlags::NORMAL => AlignFlags::STRETCH,
+                    _ => justify_content,
+                }
+            };
+
+            let item_count = items.len() as i32;
+            let mut cur_i = inline_start_content_edge;
+            let item_interval = if line.free_space >= Au(0) && line.auto_margin_count == 0 {
+                match justify_content {
+                    AlignFlags::SPACE_BETWEEN => {
                         if item_count == 1 {
                             Au(0)
                         } else {
                             line.free_space / (item_count - 1)
                         }
                     },
-                    JustifyContent::SpaceAround => line.free_space / item_count,
+                    AlignFlags::SPACE_AROUND => line.free_space / item_count,
                     _ => Au(0),
                 }
             } else {
                 Au(0)
             };
 
-            match self
-                .block_flow
-                .fragment
-                .style()
-                .get_position()
-                .justify_content
-            {
+            match justify_content {
                 // Overflow equally in both ends of line.
-                JustifyContent::Center | JustifyContent::SpaceAround => {
+                AlignFlags::CENTER | AlignFlags::SPACE_AROUND => {
                     cur_i += (line.free_space - item_interval * (item_count - 1)) / 2;
                 },
-                JustifyContent::FlexEnd => {
+                AlignFlags::FLEX_END => {
                     cur_i += line.free_space;
                 },
                 _ => {},
@@ -671,9 +668,9 @@ impl FlexFlow {
                 } else {
                     line.free_space / line.auto_margin_count
                 };
-                let margin_inline_start = MaybeAuto::from_style(margin.inline_start, inline_size)
+                let margin_inline_start = MaybeAuto::from_margin(margin.inline_start, inline_size)
                     .specified_or_default(auto_len);
-                let margin_inline_end = MaybeAuto::from_style(margin.inline_end, inline_size)
+                let margin_inline_end = MaybeAuto::from_margin(margin.inline_end, inline_size)
                     .specified_or_default(auto_len);
                 let item_inline_size = item.main_size -
                     block.fragment.box_sizing_boundary(self.main_mode) +
@@ -709,24 +706,32 @@ impl FlexFlow {
             let base = children.get(item.index).mut_base();
             if !self.main_reverse {
                 base.position.start.b = cur_b;
-                cur_b = cur_b + base.position.size.block;
+                cur_b += base.position.size.block;
             } else {
-                cur_b = cur_b - base.position.size.block;
+                cur_b -= base.position.size.block;
                 base.position.start.b = cur_b;
             }
         }
     }
 
     fn inline_mode_assign_block_size(&mut self, layout_context: &LayoutContext) {
-        let _scope = layout_debug_scope!("flex::inline_mode_assign_block_size");
-
         let line_count = self.lines.len() as i32;
-        let line_align = self
-            .block_flow
-            .fragment
-            .style()
-            .get_position()
-            .align_content;
+        let line_align = {
+            let line_align = self
+                .block_flow
+                .fragment
+                .style()
+                .get_position()
+                .align_content
+                .0
+                .primary()
+                .value();
+
+            match line_align {
+                AlignFlags::AUTO | AlignFlags::NORMAL => AlignFlags::STRETCH,
+                _ => line_align,
+            }
+        };
         let mut cur_b = self.block_flow.fragment.border_padding.block_start;
         let mut total_cross_size = Au(0);
         let mut line_interval = Au(0);
@@ -762,21 +767,21 @@ impl FlexFlow {
             let free_space = container_block_size - total_cross_size;
             total_cross_size = container_block_size;
 
-            if line_align == AlignContent::Stretch && free_space > Au(0) {
+            if line_align == AlignFlags::STRETCH && free_space > Au(0) {
                 for line in self.lines.iter_mut() {
                     line.cross_size += free_space / line_count;
                 }
             }
 
             line_interval = match line_align {
-                AlignContent::SpaceBetween => {
+                AlignFlags::SPACE_BETWEEN => {
                     if line_count <= 1 {
                         Au(0)
                     } else {
                         free_space / (line_count - 1)
                     }
                 },
-                AlignContent::SpaceAround => {
+                AlignFlags::SPACE_AROUND => {
                     if line_count == 0 {
                         Au(0)
                     } else {
@@ -787,15 +792,30 @@ impl FlexFlow {
             };
 
             match line_align {
-                AlignContent::Center | AlignContent::SpaceAround => {
+                AlignFlags::CENTER | AlignFlags::SPACE_AROUND => {
                     cur_b += (free_space - line_interval * (line_count - 1)) / 2;
                 },
-                AlignContent::FlexEnd => {
+                AlignFlags::FLEX_END => {
                     cur_b += free_space;
                 },
                 _ => {},
             }
         }
+
+        let align_items = {
+            let align_items = self
+                .block_flow
+                .fragment
+                .style()
+                .clone_align_items()
+                .0
+                .value();
+
+            match align_items {
+                AlignFlags::AUTO | AlignFlags::NORMAL => AlignFlags::STRETCH,
+                _ => align_items,
+            }
+        };
 
         let mut children = self.block_flow.base.children.random_access_mut();
         for line in &self.lines {
@@ -826,8 +846,23 @@ impl FlexFlow {
                     free_space = Au(0);
                 }
 
-                let self_align = block.fragment.style().get_position().align_self;
-                if self_align == AlignSelf::Stretch &&
+                let self_align = {
+                    let self_align = block
+                        .fragment
+                        .style()
+                        .get_position()
+                        .align_self
+                        .0
+                         .0
+                        .value();
+
+                    match self_align {
+                        AlignFlags::AUTO | AlignFlags::NORMAL => align_items,
+                        _ => self_align,
+                    }
+                };
+
+                if self_align == AlignFlags::STRETCH &&
                     block.fragment.style().content_block_size().is_auto()
                 {
                     free_space = Au(0);
@@ -850,8 +885,8 @@ impl FlexFlow {
                 // TODO(stshine): support baseline alignment.
                 if free_space != Au(0) {
                     let flex_cross = match self_align {
-                        AlignSelf::FlexEnd => free_space,
-                        AlignSelf::Center => free_space / 2,
+                        AlignFlags::FLEX_END => free_space,
+                        AlignFlags::CENTER => free_space / 2,
                         _ => Au(0),
                     };
                     block.base.position.start.b += if !self.cross_reverse {
@@ -892,11 +927,6 @@ impl Flow for FlexFlow {
     }
 
     fn bubble_inline_sizes(&mut self) {
-        let _scope = layout_debug_scope!(
-            "flex::bubble_inline_sizes {:x}",
-            self.block_flow.base.debug_id()
-        );
-
         // Flexbox Section 9.0: Generate anonymous flex items:
         // This part was handled in the flow constructor.
 
@@ -928,10 +958,6 @@ impl Flow for FlexFlow {
     }
 
     fn assign_inline_sizes(&mut self, layout_context: &LayoutContext) {
-        let _scope = layout_debug_scope!(
-            "flex::assign_inline_sizes {:x}",
-            self.block_flow.base.debug_id()
-        );
         debug!("assign_inline_sizes");
 
         if !self

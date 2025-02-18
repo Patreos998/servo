@@ -9,13 +9,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use app_units::Au;
+use base::print_tree::PrintTree;
 use euclid::default::{Point2D, Vector2D};
-use gfx_traits::print_tree::PrintTree;
 use log::{debug, trace};
 use style::logical_geometry::LogicalSize;
 use style::properties::ComputedValues;
 use style::values::computed::length::{
-    MaxSize, NonNegativeLengthOrAuto, NonNegativeLengthPercentageOrNormal, Size,
+    NonNegativeLengthOrAuto, NonNegativeLengthPercentageOrNormal,
 };
 use style::values::generics::column::ColumnCount;
 
@@ -131,7 +131,7 @@ impl Flow for MulticolFlow {
                     (content_inline_size + column_gap).0 / (column_width + column_gap).0,
                 );
                 if let ColumnCount::Integer(specified_column_count) = column_style.column_count {
-                    column_count = min(column_count, specified_column_count.0 as i32);
+                    column_count = min(column_count, specified_column_count.0);
                 }
             } else {
                 column_count = match column_style.column_count {
@@ -167,14 +167,10 @@ impl Flow for MulticolFlow {
             this_fragment_is_empty: true,
             available_block_size: {
                 let style = &self.block_flow.fragment.style;
-                let size = match style.content_block_size() {
-                    Size::Auto => None,
-                    Size::LengthPercentage(ref lp) => lp.maybe_to_used_value(None),
-                };
-                let size = size.or_else(|| match style.max_block_size() {
-                    MaxSize::None => None,
-                    MaxSize::LengthPercentage(ref lp) => lp.maybe_to_used_value(None),
-                });
+                let size = style
+                    .content_block_size()
+                    .maybe_to_used_value(None)
+                    .or_else(|| style.max_block_size().maybe_to_used_value(None));
 
                 size.unwrap_or_else(|| {
                     // FIXME: do column balancing instead
@@ -216,7 +212,7 @@ impl Flow for MulticolFlow {
         let pitch = pitch.to_physical(self.block_flow.base.writing_mode);
         for (i, child) in self.block_flow.base.children.iter_mut().enumerate() {
             let point = &mut child.mut_base().stacking_relative_position;
-            *point = *point + Vector2D::new(pitch.width * i as i32, pitch.height * i as i32);
+            *point += Vector2D::new(pitch.width * i as i32, pitch.height * i as i32);
         }
     }
 

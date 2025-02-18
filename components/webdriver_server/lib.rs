@@ -14,21 +14,24 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::time::Duration;
-use std::{fmt, mem, thread};
+use std::{env, fmt, mem, process, thread};
 
+use base::id::{BrowsingContextId, TopLevelBrowsingContextId};
 use base64::Engine;
 use capabilities::ServoCapabilities;
 use compositing_traits::ConstellationMsg;
+use cookie::{CookieBuilder, Expiration};
 use crossbeam_channel::{after, select, unbounded, Receiver, Sender};
+use embedder_traits::TraversalDirection;
 use euclid::{Rect, Size2D};
 use http::method::Method;
-use image::{DynamicImage, ImageFormat, RgbImage};
+use image::{DynamicImage, ImageFormat, RgbaImage};
 use ipc_channel::ipc::{self, IpcSender};
 use ipc_channel::router::ROUTER;
 use keyboard_types::webdriver::send_keys;
 use log::{debug, info};
-use msg::constellation_msg::{BrowsingContextId, TopLevelBrowsingContextId, TraversalDirection};
 use net_traits::request::Referrer;
+use net_traits::ReferrerPolicy;
 use pixels::PixelFormat;
 use script_traits::webdriver_msg::{
     LoadStatus, WebDriverCookieError, WebDriverFrameId, WebDriverJSError, WebDriverJSResult,
@@ -39,8 +42,7 @@ use serde::de::{Deserializer, MapAccess, Visitor};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use servo_config::prefs;
-use servo_config::prefs::PrefValue;
+use servo_config::prefs::{self, PrefValue, Preferences};
 use servo_url::ServoUrl;
 use style_traits::CSSPixel;
 use uuid::Uuid;
@@ -48,26 +50,26 @@ use webdriver::actions::{
     ActionSequence, PointerDownAction, PointerMoveAction, PointerOrigin, PointerType,
     PointerUpAction,
 };
-use webdriver::capabilities::{Capabilities, CapabilitiesMatching};
+use webdriver::capabilities::CapabilitiesMatching;
 use webdriver::command::{
     ActionsParameters, AddCookieParameters, GetParameters, JavascriptCommandParameters,
-    LocatorParameters, NewSessionParameters, SendKeysParameters, SwitchToFrameParameters,
-    SwitchToWindowParameters, TimeoutsParameters, WebDriverCommand, WebDriverExtensionCommand,
-    WebDriverMessage, WindowRectParameters,
+    LocatorParameters, NewSessionParameters, NewWindowParameters, SendKeysParameters,
+    SwitchToFrameParameters, SwitchToWindowParameters, TimeoutsParameters, WebDriverCommand,
+    WebDriverExtensionCommand, WebDriverMessage, WindowRectParameters,
 };
 use webdriver::common::{Cookie, Date, LocatorStrategy, Parameters, WebElement};
 use webdriver::error::{ErrorStatus, WebDriverError, WebDriverResult};
 use webdriver::httpapi::WebDriverExtensionRoute;
 use webdriver::response::{
-    CookieResponse, CookiesResponse, ElementRectResponse, NewSessionResponse, TimeoutsResponse,
-    ValueResponse, WebDriverResponse, WindowRectResponse,
+    CloseWindowResponse, CookieResponse, CookiesResponse, ElementRectResponse, NewSessionResponse,
+    NewWindowResponse, TimeoutsResponse, ValueResponse, WebDriverResponse, WindowRectResponse,
 };
 use webdriver::server::{self, Session, SessionTeardownKind, WebDriverHandler};
 
 use crate::actions::{InputSourceState, PointerInputState};
 
 fn extension_routes() -> Vec<(Method, &'static str, ServoExtensionRoute)> {
-    return vec![
+    vec![
         (
             Method::POST,
             "/session/{sessionId}/servo/prefs/get",
@@ -83,7 +85,7 @@ fn extension_routes() -> Vec<(Method, &'static str, ServoExtensionRoute)> {
             "/session/{sessionId}/servo/prefs/reset",
             ServoExtensionRoute::ResetPrefs,
         ),
-    ];
+    ]
 }
 
 fn cookie_msg_to_cookie(cookie: cookie::Cookie) -> Cookie {
@@ -92,9 +94,10 @@ fn cookie_msg_to_cookie(cookie: cookie::Cookie) -> Cookie {
         value: cookie.value().to_owned(),
         path: cookie.path().map(|s| s.to_owned()),
         domain: cookie.domain().map(|s| s.to_owned()),
-        expiry: cookie
-            .expires()
-            .map(|time| Date(time.to_timespec().sec as u64)),
+        expiry: cookie.expires().and_then(|expiration| match expiration {
+            Expiration::DateTime(date_time) => Some(Date(date_time.unix_timestamp() as u64)),
+            Expiration::Session => None,
+        }),
         secure: cookie.secure().unwrap_or(false),
         http_only: cookie.http_only().unwrap_or(false),
         same_site: cookie.same_site().map(|s| s.to_string()),
@@ -127,6 +130,8 @@ pub struct WebDriverSession {
     browsing_context_id: BrowsingContextId,
     top_level_browsing_context_id: TopLevelBrowsingContextId,
 
+    window_handles: HashMap<TopLevelBrowsingContextId, String>,
+
     /// Time to wait for injected scripts to run before interrupting them.  A [`None`] value
     /// specifies that the script should run indefinitely.
     script_timeout: Option<u64>,
@@ -155,10 +160,16 @@ impl WebDriverSession {
         browsing_context_id: BrowsingContextId,
         top_level_browsing_context_id: TopLevelBrowsingContextId,
     ) -> WebDriverSession {
+        let mut window_handles = HashMap::new();
+        let handle = Uuid::new_v4().to_string();
+        window_handles.insert(top_level_browsing_context_id, handle);
+
         WebDriverSession {
             id: Uuid::new_v4(),
-            browsing_context_id: browsing_context_id,
-            top_level_browsing_context_id: top_level_browsing_context_id,
+            browsing_context_id,
+            top_level_browsing_context_id,
+
+            window_handles,
 
             script_timeout: Some(30_000),
             load_timeout: 300_000,
@@ -189,6 +200,7 @@ struct Handler {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum ServoExtensionRoute {
     GetPrefs,
     SetPrefs,
@@ -222,6 +234,7 @@ impl WebDriverExtensionRoute for ServoExtensionRoute {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 enum ServoExtensionCommand {
     GetPrefs(GetPrefsParameters),
     SetPrefs(SetPrefsParameters),
@@ -250,8 +263,9 @@ impl Serialize for SendableWebDriverJSValue {
             WebDriverJSValue::Undefined => serializer.serialize_unit(),
             WebDriverJSValue::Null => serializer.serialize_unit(),
             WebDriverJSValue::Boolean(x) => serializer.serialize_bool(x),
+            WebDriverJSValue::Int(x) => serializer.serialize_i32(x),
             WebDriverJSValue::Number(x) => serializer.serialize_f64(x),
-            WebDriverJSValue::String(ref x) => serializer.serialize_str(&x),
+            WebDriverJSValue::String(ref x) => serializer.serialize_str(x),
             WebDriverJSValue::Element(ref x) => x.serialize(serializer),
             WebDriverJSValue::Frame(ref x) => x.serialize(serializer),
             WebDriverJSValue::Window(ref x) => x.serialize(serializer),
@@ -279,10 +293,9 @@ impl Serialize for WebDriverPrefValue {
     {
         match self.0 {
             PrefValue::Bool(b) => serializer.serialize_bool(b),
-            PrefValue::Str(ref s) => serializer.serialize_str(&s),
+            PrefValue::Str(ref s) => serializer.serialize_str(s),
             PrefValue::Float(f) => serializer.serialize_f64(f),
             PrefValue::Int(i) => serializer.serialize_i64(i),
-            PrefValue::Missing => serializer.serialize_unit(),
             PrefValue::Array(ref v) => v
                 .iter()
                 .map(|value| WebDriverPrefValue(value.clone()))
@@ -299,7 +312,7 @@ impl<'de> Deserialize<'de> for WebDriverPrefValue {
     {
         struct Visitor;
 
-        impl<'de> ::serde::de::Visitor<'de> for Visitor {
+        impl ::serde::de::Visitor<'_> for Visitor {
             type Value = WebDriverPrefValue;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -407,7 +420,7 @@ impl Handler {
             load_status_sender,
             load_status_receiver,
             session: None,
-            constellation_chan: constellation_chan,
+            constellation_chan,
             resize_timeout: 500,
         }
     }
@@ -460,13 +473,15 @@ impl Handler {
         &mut self,
         parameters: &NewSessionParameters,
     ) -> WebDriverResult<WebDriverResponse> {
+        if let Ok(value) = env::var("DELAY_AFTER_ACCEPT") {
+            let seconds = value.parse::<u64>().unwrap_or_default();
+            println!("Waiting for {} seconds...", seconds);
+            println!("lldb -p {}", process::id());
+            thread::sleep(Duration::from_secs(seconds));
+        }
+
         let mut servo_capabilities = ServoCapabilities::new();
-        let processed_capabilities = match parameters {
-            NewSessionParameters::Legacy(_) => Some(Capabilities::new()),
-            NewSessionParameters::Spec(capabilities) => {
-                capabilities.match_browser(&mut servo_capabilities)?
-            },
-        };
+        let processed_capabilities = parameters.match_browser(&mut servo_capabilities)?;
 
         if self.session.is_none() {
             match processed_capabilities {
@@ -652,6 +667,7 @@ impl Handler {
             url,
             None,
             Referrer::NoReferrer,
+            ReferrerPolicy::EmptyString,
             None,
             None,
         );
@@ -668,13 +684,16 @@ impl Handler {
     }
 
     fn wait_for_load(&self) -> WebDriverResult<WebDriverResponse> {
+        debug!("waiting for load");
         let timeout = self.session()?.load_timeout;
-        select! {
+        let result = select! {
             recv(self.load_status_receiver) -> _ => Ok(WebDriverResponse::Void),
             recv(after(Duration::from_millis(timeout))) -> _ => Err(
                 WebDriverError::new(ErrorStatus::Timeout, "Load timed out")
             ),
-        }
+        };
+        debug!("finished waiting for load with {:?}", result);
+        result
     }
 
     fn handle_current_url(&self) -> WebDriverResult<WebDriverResponse> {
@@ -713,14 +732,15 @@ impl Handler {
         params: &WindowRectParameters,
     ) -> WebDriverResult<WebDriverResponse> {
         let (sender, receiver) = ipc::channel().unwrap();
-        let width = match params.width {
-            Some(v) => v,
-            None => 0,
-        };
-        let height = match params.height {
-            Some(v) => v,
-            None => 0,
-        };
+
+        // We don't current allow modifying the window x/y positions, so we can just
+        // return the current window rectangle.
+        if params.width.is_none() || params.height.is_none() {
+            return self.handle_window_size();
+        }
+
+        let width = params.width.unwrap_or(0);
+        let height = params.height.unwrap_or(0);
         let size = Size2D::new(width as u32, height as u32);
         let top_level_browsing_context_id = self.session()?.top_level_browsing_context_id;
         let cmd_msg = WebDriverCommandMsg::SetWindowSize(
@@ -830,20 +850,27 @@ impl Handler {
     }
 
     fn handle_window_handle(&self) -> WebDriverResult<WebDriverResponse> {
-        // For now we assume there's only one window so just use the session
-        // id as the window id
-        let handle = self.session.as_ref().unwrap().id.to_string();
-        Ok(WebDriverResponse::Generic(ValueResponse(
-            serde_json::to_value(handle)?,
-        )))
+        let session = self.session.as_ref().unwrap();
+        match session
+            .window_handles
+            .get(&session.top_level_browsing_context_id)
+        {
+            Some(handle) => Ok(WebDriverResponse::Generic(ValueResponse(
+                serde_json::to_value(handle)?,
+            ))),
+            None => Ok(WebDriverResponse::Void),
+        }
     }
 
     fn handle_window_handles(&self) -> WebDriverResult<WebDriverResponse> {
-        // For now we assume there's only one window so just use the session
-        // id as the window id
-        let handles = vec![serde_json::to_value(
-            self.session.as_ref().unwrap().id.to_string(),
-        )?];
+        let handles = self
+            .session
+            .as_ref()
+            .unwrap()
+            .window_handles
+            .values()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(WebDriverResponse::Generic(ValueResponse(
             serde_json::to_value(handles)?,
         )))
@@ -892,20 +919,79 @@ impl Handler {
         }
     }
 
+    fn handle_close_window(&mut self) -> WebDriverResult<WebDriverResponse> {
+        {
+            let session = self.session_mut().unwrap();
+            session
+                .window_handles
+                .remove(&session.top_level_browsing_context_id);
+            let cmd_msg = WebDriverCommandMsg::CloseWebView(session.top_level_browsing_context_id);
+            self.constellation_chan
+                .send(ConstellationMsg::WebDriverCommand(cmd_msg))
+                .unwrap();
+        }
+
+        let top_level_browsing_context_id = self.focus_top_level_browsing_context_id()?;
+        let browsing_context_id = BrowsingContextId::from(top_level_browsing_context_id);
+        let session = self.session_mut().unwrap();
+        session.top_level_browsing_context_id = top_level_browsing_context_id;
+        session.browsing_context_id = browsing_context_id;
+
+        Ok(WebDriverResponse::CloseWindow(CloseWindowResponse(
+            session.window_handles.values().cloned().collect(),
+        )))
+    }
+
+    fn handle_new_window(
+        &mut self,
+        _parameters: &NewWindowParameters,
+    ) -> WebDriverResult<WebDriverResponse> {
+        let (sender, receiver) = ipc::channel().unwrap();
+
+        let session = self.session().unwrap();
+        let cmd_msg = WebDriverCommandMsg::NewWebView(
+            session.top_level_browsing_context_id,
+            sender,
+            self.load_status_sender.clone(),
+        );
+        self.constellation_chan
+            .send(ConstellationMsg::WebDriverCommand(cmd_msg))
+            .unwrap();
+
+        if let Ok(new_top_level_browsing_context_id) = receiver.recv() {
+            let session = self.session_mut().unwrap();
+            session.top_level_browsing_context_id = new_top_level_browsing_context_id;
+            session.browsing_context_id =
+                BrowsingContextId::from(new_top_level_browsing_context_id);
+            let new_handle = Uuid::new_v4().to_string();
+            session
+                .window_handles
+                .insert(new_top_level_browsing_context_id, new_handle);
+        }
+
+        let _ = self.wait_for_load();
+
+        let handle = self.session.as_ref().unwrap().id.to_string();
+        Ok(WebDriverResponse::NewWindow(NewWindowResponse {
+            handle,
+            typ: "tab".to_string(),
+        }))
+    }
+
     fn handle_switch_to_frame(
         &mut self,
         parameters: &SwitchToFrameParameters,
     ) -> WebDriverResult<WebDriverResponse> {
         use webdriver::common::FrameId;
         let frame_id = match parameters.id {
-            None => {
+            FrameId::Top => {
                 let session = self.session_mut()?;
                 session.browsing_context_id =
                     BrowsingContextId::from(session.top_level_browsing_context_id);
                 return Ok(WebDriverResponse::Void);
             },
-            Some(FrameId::Short(ref x)) => WebDriverFrameId::Short(*x),
-            Some(FrameId::Element(ref x)) => WebDriverFrameId::Element(x.to_string()),
+            FrameId::Short(ref x) => WebDriverFrameId::Short(*x),
+            FrameId::Element(ref x) => WebDriverFrameId::Element(x.to_string()),
         };
 
         self.switch_to_frame(frame_id)
@@ -920,9 +1006,21 @@ impl Handler {
         &mut self,
         parameters: &SwitchToWindowParameters,
     ) -> WebDriverResult<WebDriverResponse> {
-        // For now we assume there is only one window which has the current
-        // session's id as window id
-        if parameters.handle == self.session.as_ref().unwrap().id.to_string() {
+        let session = self.session_mut().unwrap();
+        if session.id.to_string() == parameters.handle {
+            // There's only one main window, so there's nothing to do here.
+            Ok(WebDriverResponse::Void)
+        } else if let Some((top_level_browsing_context_id, _)) = session
+            .window_handles
+            .iter()
+            .find(|(_k, v)| **v == parameters.handle)
+        {
+            let top_level_browsing_context_id = *top_level_browsing_context_id;
+            session.top_level_browsing_context_id = top_level_browsing_context_id;
+            session.browsing_context_id = BrowsingContextId::from(top_level_browsing_context_id);
+
+            let msg = ConstellationMsg::FocusWebView(top_level_browsing_context_id);
+            self.constellation_chan.send(msg).unwrap();
             Ok(WebDriverResponse::Void)
         } else {
             Err(WebDriverError::new(
@@ -1258,19 +1356,19 @@ impl Handler {
     ) -> WebDriverResult<WebDriverResponse> {
         let (sender, receiver) = ipc::channel().unwrap();
 
-        let cookie = cookie::Cookie::build(params.name.to_owned(), params.value.to_owned())
+        let cookie_builder = CookieBuilder::new(params.name.to_owned(), params.value.to_owned())
             .secure(params.secure)
             .http_only(params.httpOnly);
-        let cookie = match params.domain {
-            Some(ref domain) => cookie.domain(domain.to_owned()),
-            _ => cookie,
+        let cookie_builder = match params.domain {
+            Some(ref domain) => cookie_builder.domain(domain.to_owned()),
+            _ => cookie_builder,
         };
-        let cookie = match params.path {
-            Some(ref path) => cookie.path(path.to_owned()).finish(),
-            _ => cookie.finish(),
+        let cookie_builder = match params.path {
+            Some(ref path) => cookie_builder.path(path.to_owned()),
+            _ => cookie_builder,
         };
 
-        let cmd = WebDriverScriptCommand::AddCookie(cookie, sender);
+        let cmd = WebDriverScriptCommand::AddCookie(cookie_builder.build(), sender);
         self.browsing_context_script_command(cmd)?;
         match receiver.recv().unwrap() {
             Ok(_) => Ok(WebDriverResponse::Void),
@@ -1368,7 +1466,7 @@ impl Handler {
         let input_cancel_list = {
             let session = self.session_mut()?;
             session.input_cancel_list.reverse();
-            mem::replace(&mut session.input_cancel_list, Vec::new())
+            mem::take(&mut session.input_cancel_list)
         };
 
         if let Err(error) = self.dispatch_actions(&input_cancel_list) {
@@ -1386,12 +1484,23 @@ impl Handler {
         parameters: &JavascriptCommandParameters,
     ) -> WebDriverResult<WebDriverResponse> {
         let func_body = &parameters.script;
-        let args_string = "";
+        let args_string: Vec<_> = parameters
+            .args
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(webdriver_value_to_js_argument)
+            .collect();
 
         // This is pretty ugly; we really want something that acts like
         // new Function() and then takes the resulting function and executes
         // it with a vec of arguments.
-        let script = format!("(function() {{ {} }})({})", func_body, args_string);
+        let script = format!(
+            "(function() {{ {} }})({})",
+            func_body,
+            args_string.join(", ")
+        );
+        debug!("{}", script);
 
         let (sender, receiver) = ipc::channel().unwrap();
         let command = WebDriverScriptCommand::ExecuteScript(script, sender);
@@ -1405,7 +1514,14 @@ impl Handler {
         parameters: &JavascriptCommandParameters,
     ) -> WebDriverResult<WebDriverResponse> {
         let func_body = &parameters.script;
-        let args_string = "window.webdriverCallback";
+        let mut args_string: Vec<_> = parameters
+            .args
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .map(webdriver_value_to_js_argument)
+            .collect();
+        args_string.push("window.webdriverCallback".to_string());
 
         let timeout_script = if let Some(script_timeout) = self.session()?.script_timeout {
             format!("setTimeout(webdriverTimeout, {});", script_timeout)
@@ -1413,9 +1529,12 @@ impl Handler {
             "".into()
         };
         let script = format!(
-            "{} (function(callback) {{ {} }})({})",
-            timeout_script, func_body, args_string
+            "{} (function() {{ {} }})({})",
+            timeout_script,
+            func_body,
+            args_string.join(", "),
         );
+        debug!("{}", script);
 
         let (sender, receiver) = ipc::channel().unwrap();
         let command = WebDriverScriptCommand::ExecuteAsyncScript(script, sender);
@@ -1471,7 +1590,7 @@ impl Handler {
         receiver
             .recv()
             .unwrap()
-            .or_else(|error| Err(WebDriverError::new(error, "")))?;
+            .map_err(|error| WebDriverError::new(error, ""))?;
 
         let input_events = send_keys(&keys.text);
 
@@ -1588,16 +1707,16 @@ impl Handler {
             },
         };
 
-        // The compositor always sends RGB pixels.
+        // The compositor always sends RGBA pixels.
         assert_eq!(
             img.format,
-            PixelFormat::RGB8,
+            PixelFormat::RGBA8,
             "Unexpected screenshot pixel format"
         );
 
-        let rgb = RgbImage::from_raw(img.width, img.height, img.bytes.to_vec()).unwrap();
+        let rgb = RgbaImage::from_raw(img.width, img.height, img.bytes.to_vec()).unwrap();
         let mut png_data = Cursor::new(Vec::new());
-        DynamicImage::ImageRgb8(rgb)
+        DynamicImage::ImageRgba8(rgb)
             .write_to(&mut png_data, ImageFormat::Png)
             .unwrap();
 
@@ -1629,12 +1748,10 @@ impl Handler {
                     serde_json::to_value(encoded)?,
                 )))
             },
-            Err(_) => {
-                return Err(WebDriverError::new(
-                    ErrorStatus::StaleElementReference,
-                    "Element not found",
-                ));
-            },
+            Err(_) => Err(WebDriverError::new(
+                ErrorStatus::StaleElementReference,
+                "Element not found",
+            )),
         }
     }
 
@@ -1648,7 +1765,7 @@ impl Handler {
             .map(|item| {
                 (
                     item.clone(),
-                    serde_json::to_value(prefs::pref_map().get(item)).unwrap(),
+                    serde_json::to_value(prefs::get().get_value(item)).unwrap(),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -1662,11 +1779,12 @@ impl Handler {
         &self,
         parameters: &SetPrefsParameters,
     ) -> WebDriverResult<WebDriverResponse> {
-        for &(ref key, ref value) in parameters.prefs.iter() {
-            prefs::pref_map()
-                .set(key, value.0.clone())
-                .expect("Failed to set preference");
+        let mut current_preferences = prefs::get().clone();
+        for (key, value) in parameters.prefs.iter() {
+            current_preferences.set_value(key, value.0.clone());
         }
+        prefs::set(current_preferences);
+
         Ok(WebDriverResponse::Void)
     }
 
@@ -1674,26 +1792,29 @@ impl Handler {
         &self,
         parameters: &GetPrefsParameters,
     ) -> WebDriverResult<WebDriverResponse> {
-        let prefs = if parameters.prefs.len() == 0 {
-            prefs::pref_map().reset_all();
-            BTreeMap::new()
+        let (new_preferences, map) = if parameters.prefs.is_empty() {
+            (Preferences::default(), BTreeMap::new())
         } else {
-            parameters
+            // If we only want to reset some of the preferences.
+            let mut new_preferences = prefs::get().clone();
+            let default_preferences = Preferences::default();
+            for key in parameters.prefs.iter() {
+                new_preferences.set_value(key, default_preferences.get_value(key))
+            }
+
+            let map = parameters
                 .prefs
                 .iter()
-                .map(|item| {
-                    (
-                        item.clone(),
-                        serde_json::to_value(
-                            prefs::pref_map().reset(item).unwrap_or(PrefValue::Missing),
-                        )
-                        .unwrap(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>()
+                .map(|item| (item.clone(), new_preferences.get_value(item)))
+                .collect::<BTreeMap<_, _>>();
+
+            (new_preferences, map)
         };
+
+        prefs::set(new_preferences);
+
         Ok(WebDriverResponse::Generic(ValueResponse(
-            serde_json::to_value(prefs)?,
+            serde_json::to_value(map)?,
         )))
     }
 }
@@ -1732,6 +1853,8 @@ impl WebDriverHandler<ServoExtensionRoute> for Handler {
             WebDriverCommand::GetTitle => self.handle_title(),
             WebDriverCommand::GetWindowHandle => self.handle_window_handle(),
             WebDriverCommand::GetWindowHandles => self.handle_window_handles(),
+            WebDriverCommand::NewWindow(ref parameters) => self.handle_new_window(parameters),
+            WebDriverCommand::CloseWindow => self.handle_close_window(),
             WebDriverCommand::SwitchToFrame(ref parameters) => {
                 self.handle_switch_to_frame(parameters)
             },
@@ -1795,5 +1918,28 @@ impl WebDriverHandler<ServoExtensionRoute> for Handler {
 
     fn teardown_session(&mut self, _session: SessionTeardownKind) {
         self.session = None;
+    }
+}
+
+fn webdriver_value_to_js_argument(v: &Value) -> String {
+    match v {
+        Value::String(ref s) => format!("\"{}\"", s),
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Array(list) => {
+            let elems = list
+                .iter()
+                .map(|v| webdriver_value_to_js_argument(v).to_string())
+                .collect::<Vec<_>>();
+            format!("[{}]", elems.join(", "))
+        },
+        Value::Object(map) => {
+            let elems = map
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, webdriver_value_to_js_argument(v)))
+                .collect::<Vec<_>>();
+            format!("{{{}}}", elems.join(", "))
+        },
     }
 }

@@ -2,12 +2,17 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use app_units::Au;
 use style::color::AbsoluteColor;
+use style::computed_values::image_rendering::T as ComputedImageRendering;
 use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::text_decoration_style::T as ComputedTextDecorationStyle;
 use style::computed_values::transform_style::T as ComputedTransformStyle;
-use style::values::computed::{Filter as ComputedFilter, Length};
-use webrender_api::{units, FilterOp, LineStyle, MixBlendMode, Shadow, TransformStyle};
+use style::values::computed::Filter as ComputedFilter;
+use style::values::specified::border::BorderImageRepeatKeyword;
+use webrender_api::{
+    units, FilterOp, ImageRendering, LineStyle, MixBlendMode, RepeatMode, Shadow, TransformStyle,
+};
 
 use crate::geom::{PhysicalPoint, PhysicalRect, PhysicalSides, PhysicalSize};
 
@@ -65,6 +70,7 @@ impl ToWebRender for ComputedMixBlendMode {
             ComputedMixBlendMode::Saturation => MixBlendMode::Saturation,
             ComputedMixBlendMode::Color => MixBlendMode::Color,
             ComputedMixBlendMode::Luminosity => MixBlendMode::Luminosity,
+            ComputedMixBlendMode::PlusLighter => MixBlendMode::PlusLighter,
         }
     }
 }
@@ -79,35 +85,38 @@ impl ToWebRender for ComputedTransformStyle {
     }
 }
 
-impl ToWebRender for PhysicalPoint<Length> {
+impl ToWebRender for PhysicalPoint<Au> {
     type Type = units::LayoutPoint;
     fn to_webrender(&self) -> Self::Type {
-        units::LayoutPoint::new(self.x.px(), self.y.px())
+        units::LayoutPoint::new(self.x.to_f32_px(), self.y.to_f32_px())
     }
 }
 
-impl ToWebRender for PhysicalSize<Length> {
+impl ToWebRender for PhysicalSize<Au> {
     type Type = units::LayoutSize;
     fn to_webrender(&self) -> Self::Type {
-        units::LayoutSize::new(self.width.px(), self.height.px())
+        units::LayoutSize::new(self.width.to_f32_px(), self.height.to_f32_px())
     }
 }
 
-impl ToWebRender for PhysicalRect<Length> {
+impl ToWebRender for PhysicalRect<Au> {
     type Type = units::LayoutRect;
     fn to_webrender(&self) -> Self::Type {
-        units::LayoutRect::new(self.origin.to_webrender(), self.size.to_webrender())
+        units::LayoutRect::from_origin_and_size(
+            self.origin.to_webrender(),
+            self.size.to_webrender(),
+        )
     }
 }
 
-impl ToWebRender for PhysicalSides<Length> {
+impl ToWebRender for PhysicalSides<Au> {
     type Type = units::LayoutSideOffsets;
     fn to_webrender(&self) -> Self::Type {
         units::LayoutSideOffsets::new(
-            self.top.px(),
-            self.right.px(),
-            self.bottom.px(),
-            self.left.px(),
+            self.top.to_f32_px(),
+            self.right.to_f32_px(),
+            self.bottom.to_f32_px(),
+            self.left.to_f32_px(),
         )
     }
 }
@@ -121,6 +130,31 @@ impl ToWebRender for ComputedTextDecorationStyle {
             ComputedTextDecorationStyle::Dashed => LineStyle::Dashed,
             ComputedTextDecorationStyle::Wavy => LineStyle::Wavy,
             _ => LineStyle::Solid,
+        }
+    }
+}
+
+impl ToWebRender for BorderImageRepeatKeyword {
+    type Type = RepeatMode;
+
+    fn to_webrender(&self) -> Self::Type {
+        match *self {
+            BorderImageRepeatKeyword::Stretch => RepeatMode::Stretch,
+            BorderImageRepeatKeyword::Repeat => RepeatMode::Repeat,
+            BorderImageRepeatKeyword::Round => RepeatMode::Round,
+            BorderImageRepeatKeyword::Space => RepeatMode::Space,
+        }
+    }
+}
+
+impl ToWebRender for ComputedImageRendering {
+    type Type = ImageRendering;
+
+    fn to_webrender(&self) -> Self::Type {
+        match self {
+            ComputedImageRendering::Auto => ImageRendering::Auto,
+            ComputedImageRendering::CrispEdges => ImageRendering::CrispEdges,
+            ComputedImageRendering::Pixelated => ImageRendering::Pixelated,
         }
     }
 }

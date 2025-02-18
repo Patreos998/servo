@@ -5,7 +5,7 @@
 use dom_struct::dom_struct;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, ToCssWithGuard};
-use style::stylesheets::FontFaceRule;
+use style::stylesheets::{CssRuleType, FontFaceRule};
 
 use crate::dom::bindings::reflector::reflect_dom_object;
 use crate::dom::bindings::root::DomRoot;
@@ -13,9 +13,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CSSFontFaceRule {
+pub(crate) struct CSSFontFaceRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -29,12 +30,12 @@ impl CSSFontFaceRule {
     ) -> CSSFontFaceRule {
         CSSFontFaceRule {
             cssrule: CSSRule::new_inherited(parent_stylesheet),
-            fontfacerule: fontfacerule,
+            fontfacerule,
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         fontfacerule: Arc<Locked<FontFaceRule>>,
@@ -45,14 +46,14 @@ impl CSSFontFaceRule {
                 fontfacerule,
             )),
             window,
+            CanGc::note(),
         )
     }
 }
 
 impl SpecificCSSRule for CSSFontFaceRule {
-    fn ty(&self) -> u16 {
-        use crate::dom::bindings::codegen::Bindings::CSSRuleBinding::CSSRuleConstants;
-        CSSRuleConstants::FONT_FACE_RULE
+    fn ty(&self) -> CssRuleType {
+        CssRuleType::FontFace
     }
 
     fn get_css(&self) -> DOMString {

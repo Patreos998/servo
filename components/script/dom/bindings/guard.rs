@@ -5,7 +5,7 @@
 //! Machinery to conditionally expose things.
 
 use js::rust::HandleObject;
-use servo_config::prefs;
+use servo_config::prefs::get;
 
 use crate::dom::bindings::codegen::InterfaceObjectMap;
 use crate::dom::bindings::interface::is_exposed_in;
@@ -13,26 +13,42 @@ use crate::dom::globalscope::GlobalScope;
 use crate::realms::{AlreadyInRealm, InRealm};
 use crate::script_runtime::JSContext;
 
-/// A container with a condition.
-pub struct Guard<T: Clone + Copy> {
-    condition: Condition,
+/// A container with a list of conditions.
+pub(crate) struct Guard<T: Clone + Copy> {
+    conditions: &'static [Condition],
     value: T,
 }
 
 impl<T: Clone + Copy> Guard<T> {
     /// Construct a new guarded value.
-    pub const fn new(condition: Condition, value: T) -> Self {
-        Guard {
-            condition: condition,
-            value: value,
-        }
+    pub(crate) const fn new(conditions: &'static [Condition], value: T) -> Self {
+        Guard { conditions, value }
     }
 
-    /// Expose the value if the condition is satisfied.
+    /// Expose the value if the conditions are satisfied.
     ///
     /// The passed handle is the object on which the value may be exposed.
-    pub fn expose(&self, cx: JSContext, obj: HandleObject, global: HandleObject) -> Option<T> {
-        if self.condition.is_satisfied(cx, obj, global) {
+    pub(crate) fn expose(
+        &self,
+        cx: JSContext,
+        obj: HandleObject,
+        global: HandleObject,
+    ) -> Option<T> {
+        let mut exposed_on_global = false;
+        let conditions_satisfied = self.conditions.iter().all(|c| match c {
+            Condition::Satisfied => {
+                exposed_on_global = true;
+                true
+            },
+            // If there are multiple Exposed conditions, we just need one of them to be true
+            Condition::Exposed(globals) => {
+                exposed_on_global |= is_exposed_in(global, *globals);
+                true
+            },
+            _ => c.is_satisfied(cx, obj, global),
+        });
+
+        if conditions_satisfied && exposed_on_global {
             Some(self.value)
         } else {
             None
@@ -41,7 +57,8 @@ impl<T: Clone + Copy> Guard<T> {
 }
 
 /// A condition to expose things.
-pub enum Condition {
+#[derive(Clone, Copy)]
+pub(crate) enum Condition {
     /// The condition is satisfied if the function returns true.
     Func(fn(JSContext, HandleObject) -> bool),
     /// The condition is satisfied if the preference is set.
@@ -61,9 +78,14 @@ fn is_secure_context(cx: JSContext) -> bool {
 }
 
 impl Condition {
-    pub fn is_satisfied(&self, cx: JSContext, obj: HandleObject, global: HandleObject) -> bool {
+    pub(crate) fn is_satisfied(
+        &self,
+        cx: JSContext,
+        obj: HandleObject,
+        global: HandleObject,
+    ) -> bool {
         match *self {
-            Condition::Pref(name) => prefs::pref_map().get(name).as_bool().unwrap_or(false),
+            Condition::Pref(name) => get().get_value(name).try_into().unwrap_or(false),
             Condition::Func(f) => f(cx, obj),
             Condition::Exposed(globals) => is_exposed_in(global, globals),
             Condition::SecureContext() => is_secure_context(cx),

@@ -3,62 +3,55 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::cmp::{self, Ord, Ordering};
+use std::cmp::{Ord, Ordering};
 use std::collections::HashMap;
 use std::default::Default;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use deny_public_fields::DenyPublicFields;
-use euclid::Length;
-use ipc_channel::ipc::IpcSender;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, UndefinedValue};
 use js::rust::HandleValue;
-use script_traits::{
-    precise_time_ms, MsDuration, TimerEvent, TimerEventId, TimerEventRequest, TimerSchedulerMsg,
-    TimerSource,
-};
 use servo_config::pref;
+use timers::{BoxedTimerCallback, TimerEvent, TimerEventId, TimerEventRequest, TimerSource};
 
 use crate::dom::bindings::callback::ExceptionHandling::Report;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::FunctionBinding::Function;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
+use crate::dom::bindings::reflector::{DomGlobal, DomObject};
+use crate::dom::bindings::root::Dom;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::FakeRequestAnimationFrameCallback;
 use crate::dom::eventsource::EventSourceTimeoutCallback;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::htmlmetaelement::RefreshRedirectDue;
 use crate::dom::testbinding::TestBindingCallback;
+use crate::dom::types::{Window, WorkerGlobalScope};
 use crate::dom::xmlhttprequest::XHRTimeoutCallback;
 use crate::script_module::ScriptFetchOptions;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
+use crate::task_source::SendableTaskSource;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
-pub struct OneshotTimerHandle(i32);
+pub(crate) struct OneshotTimerHandle(i32);
 
 #[derive(DenyPublicFields, JSTraceable, MallocSizeOf)]
-pub struct OneshotTimers {
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+pub(crate) struct OneshotTimers {
+    global_scope: Dom<GlobalScope>,
     js_timers: JsTimers,
-    #[ignore_malloc_size_of = "Defined in std"]
-    #[no_trace]
-    /// The sender, to be cloned for each timer,
-    /// on which the timer scheduler in the constellation can send an event
-    /// when the timer is due.
-    timer_event_chan: DomRefCell<Option<IpcSender<TimerEvent>>>,
-    #[ignore_malloc_size_of = "Defined in std"]
-    #[no_trace]
-    /// The sender to the timer scheduler in the constellation.
-    scheduler_chan: IpcSender<TimerSchedulerMsg>,
     next_timer_handle: Cell<OneshotTimerHandle>,
     timers: DomRefCell<Vec<OneshotTimer>>,
-    #[no_trace]
-    suspended_since: Cell<Option<MsDuration>>,
+    suspended_since: Cell<Option<Instant>>,
     /// Initially 0, increased whenever the associated document is reactivated
     /// by the amount of ms the document was inactive. The current time can be
     /// offset back by this amount for a coherent time across document
     /// activations.
-    #[no_trace]
-    suspension_offset: Cell<MsDuration>,
+    suspension_offset: Cell<Duration>,
     /// Calls to `fire_timer` with a different argument than this get ignored.
     /// They were previously scheduled and got invalidated when
     ///  - timers were suspended,
@@ -75,30 +68,31 @@ struct OneshotTimer {
     #[no_trace]
     source: TimerSource,
     callback: OneshotTimerCallback,
-    #[no_trace]
-    scheduled_for: MsDuration,
+    scheduled_for: Instant,
 }
 
 // This enum is required to work around the fact that trait objects do not support generic methods.
 // A replacement trait would have a method such as
 //     `invoke<T: DomObject>(self: Box<Self>, this: &T, js_timers: &JsTimers);`.
 #[derive(JSTraceable, MallocSizeOf)]
-pub enum OneshotTimerCallback {
+pub(crate) enum OneshotTimerCallback {
     XhrTimeout(XHRTimeoutCallback),
     EventSourceTimeout(EventSourceTimeoutCallback),
     JsTimer(JsTimerTask),
     TestBindingCallback(TestBindingCallback),
     FakeRequestAnimationFrame(FakeRequestAnimationFrameCallback),
+    RefreshRedirectDue(RefreshRedirectDue),
 }
 
 impl OneshotTimerCallback {
-    fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers) {
+    fn invoke<T: DomObject>(self, this: &T, js_timers: &JsTimers, can_gc: CanGc) {
         match self {
-            OneshotTimerCallback::XhrTimeout(callback) => callback.invoke(),
+            OneshotTimerCallback::XhrTimeout(callback) => callback.invoke(can_gc),
             OneshotTimerCallback::EventSourceTimeout(callback) => callback.invoke(),
-            OneshotTimerCallback::JsTimer(task) => task.invoke(this, js_timers),
+            OneshotTimerCallback::JsTimer(task) => task.invoke(this, js_timers, can_gc),
             OneshotTimerCallback::TestBindingCallback(callback) => callback.invoke(),
-            OneshotTimerCallback::FakeRequestAnimationFrame(callback) => callback.invoke(),
+            OneshotTimerCallback::FakeRequestAnimationFrame(callback) => callback.invoke(can_gc),
+            OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(can_gc),
         }
     }
 }
@@ -121,47 +115,38 @@ impl PartialOrd for OneshotTimer {
 impl Eq for OneshotTimer {}
 impl PartialEq for OneshotTimer {
     fn eq(&self, other: &OneshotTimer) -> bool {
-        self as *const OneshotTimer == other as *const OneshotTimer
+        std::ptr::eq(self, other)
     }
 }
 
 impl OneshotTimers {
-    pub fn new(scheduler_chan: IpcSender<TimerSchedulerMsg>) -> OneshotTimers {
+    pub(crate) fn new(global_scope: &GlobalScope) -> OneshotTimers {
         OneshotTimers {
-            js_timers: JsTimers::new(),
-            timer_event_chan: DomRefCell::new(None),
-            scheduler_chan: scheduler_chan,
+            global_scope: Dom::from_ref(global_scope),
+            js_timers: JsTimers::default(),
             next_timer_handle: Cell::new(OneshotTimerHandle(1)),
             timers: DomRefCell::new(Vec::new()),
             suspended_since: Cell::new(None),
-            suspension_offset: Cell::new(Length::new(0)),
+            suspension_offset: Cell::new(Duration::ZERO),
             expected_event_id: Cell::new(TimerEventId(0)),
         }
     }
 
-    pub fn setup_scheduling(&self, timer_event_chan: IpcSender<TimerEvent>) {
-        let mut chan = self.timer_event_chan.borrow_mut();
-        assert!(chan.is_none());
-        *chan = Some(timer_event_chan);
-    }
-
-    pub fn schedule_callback(
+    pub(crate) fn schedule_callback(
         &self,
         callback: OneshotTimerCallback,
-        duration: MsDuration,
+        duration: Duration,
         source: TimerSource,
     ) -> OneshotTimerHandle {
         let new_handle = self.next_timer_handle.get();
         self.next_timer_handle
             .set(OneshotTimerHandle(new_handle.0 + 1));
 
-        let scheduled_for = self.base_time() + duration;
-
         let timer = OneshotTimer {
             handle: new_handle,
-            source: source,
-            callback: callback,
-            scheduled_for: scheduled_for,
+            source,
+            callback,
+            scheduled_for: self.base_time() + duration,
         };
 
         {
@@ -177,7 +162,7 @@ impl OneshotTimers {
         new_handle
     }
 
-    pub fn unschedule_callback(&self, handle: OneshotTimerHandle) {
+    pub(crate) fn unschedule_callback(&self, handle: OneshotTimerHandle) {
         let was_next = self.is_next_timer(handle);
 
         self.timers.borrow_mut().retain(|t| t.handle != handle);
@@ -191,11 +176,11 @@ impl OneshotTimers {
     fn is_next_timer(&self, handle: OneshotTimerHandle) -> bool {
         match self.timers.borrow().last() {
             None => false,
-            Some(ref max_timer) => max_timer.handle == handle,
+            Some(max_timer) => max_timer.handle == handle,
         }
     }
 
-    pub fn fire_timer(&self, id: TimerEventId, global: &GlobalScope) {
+    pub(crate) fn fire_timer(&self, id: TimerEventId, global: &GlobalScope, can_gc: CanGc) {
         let expected_id = self.expected_event_id.get();
         if expected_id != id {
             debug!(
@@ -238,45 +223,45 @@ impl OneshotTimers {
                 return;
             }
             let callback = timer.callback;
-            callback.invoke(global, &self.js_timers);
+            callback.invoke(global, &self.js_timers, can_gc);
         }
 
         self.schedule_timer_call();
     }
 
-    fn base_time(&self) -> MsDuration {
+    fn base_time(&self) -> Instant {
         let offset = self.suspension_offset.get();
-
         match self.suspended_since.get() {
-            Some(time) => time - offset,
-            None => precise_time_ms() - offset,
+            Some(suspend_time) => suspend_time - offset,
+            None => Instant::now() - offset,
         }
     }
 
-    pub fn slow_down(&self) {
-        let duration = pref!(js.timers.minimum_duration) as u64;
-        self.js_timers.set_min_duration(MsDuration::new(duration));
+    pub(crate) fn slow_down(&self) {
+        let min_duration_ms = pref!(js_timers_minimum_duration) as u64;
+        self.js_timers
+            .set_min_duration(Duration::from_millis(min_duration_ms));
     }
 
-    pub fn speed_up(&self) {
+    pub(crate) fn speed_up(&self) {
         self.js_timers.remove_min_duration();
     }
 
-    pub fn suspend(&self) {
+    pub(crate) fn suspend(&self) {
         // Suspend is idempotent: do nothing if the timers are already suspended.
         if self.suspended_since.get().is_some() {
             return warn!("Suspending an already suspended timer.");
         }
 
         debug!("Suspending timers.");
-        self.suspended_since.set(Some(precise_time_ms()));
+        self.suspended_since.set(Some(Instant::now()));
         self.invalidate_expected_event_id();
     }
 
-    pub fn resume(&self) {
+    pub(crate) fn resume(&self) {
         // Resume is idempotent: do nothing if the timers are already resumed.
         let additional_offset = match self.suspended_since.get() {
-            Some(suspended_since) => precise_time_ms() - suspended_since,
+            Some(suspended_since) => Instant::now() - suspended_since,
             None => return warn!("Resuming an already resumed timer."),
         };
 
@@ -295,29 +280,29 @@ impl OneshotTimers {
         }
 
         let timers = self.timers.borrow();
+        let Some(timer) = timers.last() else {
+            return;
+        };
 
-        if let Some(timer) = timers.last() {
-            let expected_event_id = self.invalidate_expected_event_id();
-
-            let delay = Length::new(
-                timer
-                    .scheduled_for
-                    .get()
-                    .saturating_sub(precise_time_ms().get()),
-            );
-            let request = TimerEventRequest(
-                self.timer_event_chan
-                    .borrow()
-                    .clone()
-                    .expect("Timer event chan not setup to schedule timers."),
-                timer.source,
-                expected_event_id,
-                delay,
-            );
-            self.scheduler_chan
-                .send(TimerSchedulerMsg(request))
-                .unwrap();
+        let callback = TimerListener {
+            context: Trusted::new(&*self.global_scope),
+            task_source: self
+                .global_scope
+                .task_manager()
+                .timer_task_source()
+                .to_sendable(),
         }
+        .into_callback();
+
+        let expected_event_id = self.invalidate_expected_event_id();
+        let event_request = TimerEventRequest {
+            callback,
+            source: timer.source,
+            id: expected_event_id,
+            duration: timer.scheduled_for - Instant::now(),
+        };
+
+        self.global_scope.schedule_timer(event_request);
     }
 
     fn invalidate_expected_event_id(&self) -> TimerEventId {
@@ -331,12 +316,12 @@ impl OneshotTimers {
         next_id
     }
 
-    pub fn set_timeout_or_interval(
+    pub(crate) fn set_timeout_or_interval(
         &self,
         global: &GlobalScope,
         callback: TimerCallback,
         arguments: Vec<HandleValue>,
-        timeout: i32,
+        timeout: Duration,
         is_interval: IsInterval,
         source: TimerSource,
     ) -> i32 {
@@ -350,24 +335,23 @@ impl OneshotTimers {
         )
     }
 
-    pub fn clear_timeout_or_interval(&self, global: &GlobalScope, handle: i32) {
+    pub(crate) fn clear_timeout_or_interval(&self, global: &GlobalScope, handle: i32) {
         self.js_timers.clear_timeout_or_interval(global, handle)
     }
 }
 
 #[derive(Clone, Copy, Eq, Hash, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
-pub struct JsTimerHandle(i32);
+pub(crate) struct JsTimerHandle(i32);
 
 #[derive(DenyPublicFields, JSTraceable, MallocSizeOf)]
-pub struct JsTimers {
+pub(crate) struct JsTimers {
     next_timer_handle: Cell<JsTimerHandle>,
     /// <https://html.spec.whatwg.org/multipage/#list-of-active-timers>
     active_timers: DomRefCell<HashMap<JsTimerHandle, JsTimerEntry>>,
     /// The nesting level of the currently executing timer task or 0.
     nesting_level: Cell<u32>,
     /// Used to introduce a minimum delay in event intervals
-    #[no_trace]
-    min_duration: Cell<Option<MsDuration>>,
+    min_duration: Cell<Option<Duration>>,
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
@@ -380,7 +364,7 @@ struct JsTimerEntry {
 //      to the function when calling it)
 // TODO: Handle rooting during invocation when movable GC is turned on
 #[derive(JSTraceable, MallocSizeOf)]
-pub struct JsTimerTask {
+pub(crate) struct JsTimerTask {
     #[ignore_malloc_size_of = "Because it is non-owning"]
     handle: JsTimerHandle,
     #[no_trace]
@@ -388,20 +372,19 @@ pub struct JsTimerTask {
     callback: InternalTimerCallback,
     is_interval: IsInterval,
     nesting_level: u32,
-    #[no_trace]
-    duration: MsDuration,
+    duration: Duration,
     is_user_interacting: bool,
 }
 
 // Enum allowing more descriptive values for the is_interval field
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf, PartialEq)]
-pub enum IsInterval {
+pub(crate) enum IsInterval {
     Interval,
     NonInterval,
 }
 
 #[derive(Clone)]
-pub enum TimerCallback {
+pub(crate) enum TimerCallback {
     StringTimerCallback(DOMString),
     FunctionTimerCallback(Rc<Function>),
 }
@@ -415,8 +398,8 @@ enum InternalTimerCallback {
     ),
 }
 
-impl JsTimers {
-    pub fn new() -> JsTimers {
+impl Default for JsTimers {
+    fn default() -> Self {
         JsTimers {
             next_timer_handle: Cell::new(JsTimerHandle(1)),
             active_timers: DomRefCell::new(HashMap::new()),
@@ -424,20 +407,27 @@ impl JsTimers {
             min_duration: Cell::new(None),
         }
     }
+}
 
+impl JsTimers {
     // see https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
-    pub fn set_timeout_or_interval(
+    pub(crate) fn set_timeout_or_interval(
         &self,
         global: &GlobalScope,
         callback: TimerCallback,
         arguments: Vec<HandleValue>,
-        timeout: i32,
+        timeout: Duration,
         is_interval: IsInterval,
         source: TimerSource,
     ) -> i32 {
         let callback = match callback {
             TimerCallback::StringTimerCallback(code_str) => {
-                InternalTimerCallback::StringTimerCallback(code_str)
+                let cx = GlobalScope::get_cx();
+                if global.is_js_evaluation_allowed(cx) {
+                    InternalTimerCallback::StringTimerCallback(code_str)
+                } else {
+                    return 0;
+                }
             },
             TimerCallback::FunctionTimerCallback(function) => {
                 // This is a bit complicated, but this ensures that the vector's
@@ -465,16 +455,16 @@ impl JsTimers {
         // step 4
         let mut task = JsTimerTask {
             handle: JsTimerHandle(new_handle),
-            source: source,
-            callback: callback,
-            is_interval: is_interval,
+            source,
+            callback,
+            is_interval,
             is_user_interacting: ScriptThread::is_user_interacting(),
             nesting_level: 0,
-            duration: Length::new(0),
+            duration: Duration::ZERO,
         };
 
         // step 5
-        task.duration = Length::new(cmp::max(0, timeout) as u64);
+        task.duration = timeout.max(Duration::ZERO);
 
         // step 3, 6-9, 11-14
         self.initialize_and_schedule(global, task);
@@ -483,7 +473,7 @@ impl JsTimers {
         new_handle
     }
 
-    pub fn clear_timeout_or_interval(&self, global: &GlobalScope, handle: i32) {
+    pub(crate) fn clear_timeout_or_interval(&self, global: &GlobalScope, handle: i32) {
         let mut active_timers = self.active_timers.borrow_mut();
 
         if let Some(entry) = active_timers.remove(&JsTimerHandle(handle)) {
@@ -491,18 +481,18 @@ impl JsTimers {
         }
     }
 
-    pub fn set_min_duration(&self, duration: MsDuration) {
+    pub(crate) fn set_min_duration(&self, duration: Duration) {
         self.min_duration.set(Some(duration));
     }
 
-    pub fn remove_min_duration(&self) {
+    pub(crate) fn remove_min_duration(&self) {
         self.min_duration.set(None);
     }
 
     // see step 13 of https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
-    fn user_agent_pad(&self, current_duration: MsDuration) -> MsDuration {
+    fn user_agent_pad(&self, current_duration: Duration) -> Duration {
         match self.min_duration.get() {
-            Some(min_duration) => cmp::max(min_duration, current_duration),
+            Some(min_duration) => min_duration.max(current_duration),
             None => current_duration,
         }
     }
@@ -525,23 +515,23 @@ impl JsTimers {
         let oneshot_handle = global.schedule_callback(callback, duration);
 
         // step 3
-        let entry = active_timers.entry(handle).or_insert(JsTimerEntry {
-            oneshot_handle: oneshot_handle,
-        });
+        let entry = active_timers
+            .entry(handle)
+            .or_insert(JsTimerEntry { oneshot_handle });
         entry.oneshot_handle = oneshot_handle;
     }
 }
 
 // see step 7 of https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
-fn clamp_duration(nesting_level: u32, unclamped: MsDuration) -> MsDuration {
-    let lower_bound = if nesting_level > 5 { 4 } else { 0 };
-
-    cmp::max(Length::new(lower_bound), unclamped)
+fn clamp_duration(nesting_level: u32, unclamped: Duration) -> Duration {
+    let lower_bound_ms = if nesting_level > 5 { 4 } else { 0 };
+    let lower_bound = Duration::from_millis(lower_bound_ms);
+    lower_bound.max(unclamped)
 }
 
 impl JsTimerTask {
     // see https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
-    pub fn invoke<T: DomObject>(self, this: &T, timers: &JsTimers) {
+    pub(crate) fn invoke<T: DomObject>(self, this: &T, timers: &JsTimers, can_gc: CanGc) {
         // step 4.1 can be ignored, because we proactively prevent execution
         // of this task when its scheduled execution is canceled.
 
@@ -562,11 +552,13 @@ impl JsTimerTask {
                     rval.handle_mut(),
                     ScriptFetchOptions::default_classic_script(&global),
                     global.api_base_url(),
+                    can_gc,
                 );
             },
             InternalTimerCallback::FunctionTimerCallback(ref function, ref arguments) => {
                 let arguments = self.collect_heap_args(arguments);
-                let _ = function.Call_(this, arguments, Report);
+                rooted!(in(*GlobalScope::get_cx()) let mut value: JSVal);
+                let _ = function.Call_(this, arguments, value.handle_mut(), Report);
             },
         };
         ScriptThread::set_user_interacting(was_user_interacting);
@@ -591,5 +583,42 @@ impl JsTimerTask {
         args.iter()
             .map(|arg| unsafe { HandleValue::from_raw(arg.handle()) })
             .collect()
+    }
+}
+
+/// A wrapper between timer events coming in over IPC, and the event-loop.
+#[derive(Clone)]
+struct TimerListener {
+    task_source: SendableTaskSource,
+    context: Trusted<GlobalScope>,
+}
+
+impl TimerListener {
+    /// Handle a timer-event coming from the [`timers::TimerScheduler`]
+    /// by queuing the appropriate task on the relevant event-loop.
+    fn handle(&self, event: TimerEvent) {
+        let context = self.context.clone();
+        // Step 18, queue a task,
+        // https://html.spec.whatwg.org/multipage/#timer-initialisation-steps
+        self.task_source.queue(task!(timer_event: move || {
+                let global = context.root();
+                let TimerEvent(source, id) = event;
+                match source {
+                    TimerSource::FromWorker => {
+                        global.downcast::<WorkerGlobalScope>().expect("Window timer delivered to worker");
+                    },
+                    TimerSource::FromWindow(pipeline) => {
+                        assert_eq!(pipeline, global.pipeline_id());
+                        global.downcast::<Window>().expect("Worker timer delivered to window");
+                    },
+                };
+                // Step 7, substeps run in a task.
+                global.fire_timer(id, CanGc::note());
+            })
+        );
+    }
+
+    fn into_callback(self) -> BoxedTimerCallback {
+        Box::new(move |timer_event| self.handle(timer_event))
     }
 }

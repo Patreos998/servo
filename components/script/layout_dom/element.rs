@@ -2,19 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
+use std::hash::Hash;
 use std::sync::atomic::Ordering;
+use std::{fmt, slice};
 
 use atomic_refcell::{AtomicRef, AtomicRefMut};
 use html5ever::{local_name, namespace_url, ns, LocalName, Namespace};
+use js::jsapi::JSObject;
 use script_layout_interface::wrapper_traits::{
-    GetStyleAndOpaqueLayoutData, LayoutDataTrait, LayoutNode, PseudoElementType,
-    ThreadSafeLayoutElement, ThreadSafeLayoutNode,
+    LayoutNode, PseudoElementType, ThreadSafeLayoutElement, ThreadSafeLayoutNode,
 };
-use script_layout_interface::{LayoutNodeType, StyleAndOpaqueLayoutData, StyleData};
+use script_layout_interface::{LayoutNodeType, StyleData};
+use script_traits::UntrustedNodeAddress;
 use selectors::attr::{AttrSelectorOperation, CaseSensitivity, NamespaceConstraint};
+use selectors::bloom::{BloomFilter, BLOOM_HASH_MASK};
 use selectors::matching::{ElementSelectorFlags, MatchingContext, VisitedHandlingMode};
 use selectors::sink::Push;
 use servo_arc::{Arc, ArcBorrow};
@@ -22,6 +23,7 @@ use servo_atoms::Atom;
 use style::animation::AnimationSetKey;
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::attr::AttrValue;
+use style::bloom::each_relevant_element_hash;
 use style::context::SharedStyleContext;
 use style::data::ElementData;
 use style::dom::{DomChildren, LayoutIterator, TDocument, TElement, TNode, TShadowRoot};
@@ -31,56 +33,32 @@ use style::selector_parser::{
     SelectorImpl,
 };
 use style::shared_lock::Locked as StyleLocked;
+use style::stylesheets::scope_rule::ImplicitScopeRoot;
 use style::values::computed::Display;
 use style::values::{AtomIdent, AtomString};
 use style::CaseSensitivityExt;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::attr::AttrHelpersForLayout;
 use crate::dom::bindings::inheritance::{
-    CharacterDataTypeId, DocumentFragmentTypeId, ElementTypeId, HTMLElementTypeId, NodeTypeId,
-    TextTypeId,
+    Castable, CharacterDataTypeId, DocumentFragmentTypeId, ElementTypeId, HTMLElementTypeId,
+    NodeTypeId, TextTypeId,
 };
 use crate::dom::bindings::root::LayoutDom;
 use crate::dom::characterdata::LayoutCharacterDataHelpers;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::node::{LayoutNodeHelpers, NodeFlags};
+use crate::dom::htmlslotelement::HTMLSlotElement;
+use crate::dom::node::{LayoutNodeHelpers, Node, NodeFlags};
 use crate::layout_dom::{ServoLayoutNode, ServoShadowRoot, ServoThreadSafeLayoutNode};
 
 /// A wrapper around elements that ensures layout can only ever access safe properties.
-pub struct ServoLayoutElement<'dom, LayoutDataType: LayoutDataTrait> {
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct ServoLayoutElement<'dom> {
     /// The wrapped private DOM Element.
     element: LayoutDom<'dom, Element>,
-
-    /// A PhantomData that is used to track the type of the stored layout data.
-    phantom: PhantomData<LayoutDataType>,
 }
 
-// These impls are required because `derive` has trouble with PhantomData.
-// See https://github.com/rust-lang/rust/issues/52079
-impl<'dom, LayoutDataType: LayoutDataTrait> Clone for ServoLayoutElement<'dom, LayoutDataType> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<'dom, LayoutDataType: LayoutDataTrait> Copy for ServoLayoutElement<'dom, LayoutDataType> {}
-impl<'dom, LayoutDataType: LayoutDataTrait> PartialEq for ServoLayoutElement<'dom, LayoutDataType> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.as_node() == other.as_node()
-    }
-}
-
-// `Hash` + `Eq` + `Debug` are required by ::style::dom::TElement.
-impl<'dom, LayoutDataType: LayoutDataTrait> Eq for ServoLayoutElement<'dom, LayoutDataType> {}
-impl<'dom, LayoutDataType: LayoutDataTrait> Hash for ServoLayoutElement<'dom, LayoutDataType> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.element.hash(state);
-    }
-}
-impl<'dom, LayoutDataType: LayoutDataTrait> fmt::Debug
-    for ServoLayoutElement<'dom, LayoutDataType>
-{
+impl fmt::Debug for ServoLayoutElement<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "<{}", self.element.local_name())?;
         if let Some(id) = self.id() {
@@ -90,12 +68,13 @@ impl<'dom, LayoutDataType: LayoutDataTrait> fmt::Debug
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> ServoLayoutElement<'dom, LayoutDataType> {
+impl<'dom> ServoLayoutElement<'dom> {
     pub(super) fn from_layout_js(el: LayoutDom<'dom, Element>) -> Self {
-        ServoLayoutElement {
-            element: el,
-            phantom: PhantomData,
-        }
+        ServoLayoutElement { element: el }
+    }
+
+    pub(super) fn is_html_element(&self) -> bool {
+        self.element.is_html_element()
     }
 
     #[inline]
@@ -109,16 +88,27 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ServoLayoutElement<'dom, LayoutDataT
     }
 
     fn get_style_data(&self) -> Option<&StyleData> {
-        self.get_style_and_opaque_layout_data()
-            .map(|data| &data.style_data)
+        self.as_node().style_data()
     }
 
+    /// Unset the snapshot flags on the underlying DOM object for this element.
+    ///
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
     pub unsafe fn unset_snapshot_flags(&self) {
         self.as_node()
             .node
             .set_flag(NodeFlags::HAS_SNAPSHOT | NodeFlags::HANDLED_SNAPSHOT, false);
     }
 
+    /// Unset the snapshot flags on the underlying DOM object for this element.
+    ///
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
     pub unsafe fn set_has_snapshot(&self) {
         self.as_node().node.set_flag(NodeFlags::HAS_SNAPSHOT, true);
     }
@@ -147,42 +137,73 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ServoLayoutElement<'dom, LayoutDataT
     fn is_root(&self) -> bool {
         match self.as_node().parent_node() {
             None => false,
-            Some(node) => match node.script_type_id() {
-                NodeTypeId::Document(_) => true,
-                _ => false,
+            Some(node) => matches!(node.script_type_id(), NodeTypeId::Document(_)),
+        }
+    }
+}
+
+pub enum DOMDescendantIterator<E>
+where
+    E: TElement,
+{
+    /// Iterating over the children of a node, including children of a potential
+    /// [ShadowRoot](crate::dom::shadow_root::ShadowRoot)
+    Children(DomChildren<E::ConcreteNode>),
+    /// Iterating over the content's of a [`<slot>`](HTMLSlotElement) element.
+    Slottables { slot: E, index: usize },
+}
+
+impl<E> Iterator for DOMDescendantIterator<E>
+where
+    E: TElement,
+{
+    type Item = E::ConcreteNode;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Children(children) => children.next(),
+            Self::Slottables { slot, index } => {
+                let slottables = slot.slotted_nodes();
+                let slot = slottables.get(*index)?;
+                *index += 1;
+                Some(*slot)
             },
         }
     }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> GetStyleAndOpaqueLayoutData<'dom>
-    for ServoLayoutElement<'dom, LayoutDataType>
-{
-    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData> {
-        self.as_node().get_style_and_opaque_layout_data()
-    }
-}
+impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
+    type ConcreteNode = ServoLayoutNode<'dom>;
+    type TraversalChildrenIterator = DOMDescendantIterator<Self>;
 
-impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
-    for ServoLayoutElement<'dom, LayoutDataType>
-{
-    type ConcreteNode = ServoLayoutNode<'dom, LayoutDataType>;
-    type TraversalChildrenIterator = DomChildren<Self::ConcreteNode>;
-
-    fn as_node(&self) -> ServoLayoutNode<'dom, LayoutDataType> {
+    fn as_node(&self) -> ServoLayoutNode<'dom> {
         ServoLayoutNode::from_layout_js(self.element.upcast())
     }
 
     fn traversal_children(&self) -> LayoutIterator<Self::TraversalChildrenIterator> {
-        LayoutIterator(if let Some(shadow) = self.shadow_root() {
-            shadow.as_node().dom_children()
+        let iterator = if self.slotted_nodes().is_empty() {
+            let children = if let Some(shadow_root) = self.shadow_root() {
+                shadow_root.as_node().dom_children()
+            } else {
+                self.as_node().dom_children()
+            };
+            DOMDescendantIterator::Children(children)
         } else {
-            self.as_node().dom_children()
-        })
+            DOMDescendantIterator::Slottables {
+                slot: *self,
+                index: 0,
+            }
+        };
+
+        LayoutIterator(iterator)
+    }
+
+    fn traversal_parent(&self) -> Option<Self> {
+        self.as_node().traversal_parent()
     }
 
     fn is_html_element(&self) -> bool {
-        self.element.is_html_element()
+        ServoLayoutElement::is_html_element(self)
     }
 
     fn is_mathml_element(&self) -> bool {
@@ -253,8 +274,8 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
     where
         F: FnMut(&AtomIdent),
     {
-        if let Some(ref classes) = self.element.get_classes_for_layout() {
-            for class in *classes {
+        if let Some(classes) = self.element.get_classes_for_layout() {
+            for class in classes {
                 callback(AtomIdent::cast(class))
             }
         }
@@ -323,13 +344,11 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
     }
 
     unsafe fn clear_data(&self) {
-        if self.get_style_and_opaque_layout_data().is_some() {
-            drop(self.as_node().take_style_and_opaque_layout_data());
-        }
+        self.as_node().get_jsmanaged().clear_style_and_layout_data()
     }
 
     unsafe fn ensure_data(&self) -> AtomicRefMut<ElementData> {
-        self.as_node().initialize_data();
+        self.as_node().get_jsmanaged().initialize_style_data();
         self.mutate_data().unwrap()
     }
 
@@ -355,8 +374,8 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
 
     fn has_animations(&self, context: &SharedStyleContext) -> bool {
         // This is not used for pseudo elements currently so we can pass None.
-        return self.has_css_animations(context, /* pseudo_element = */ None) ||
-            self.has_css_transitions(context, /* pseudo_element = */ None);
+        self.has_css_animations(context, /* pseudo_element = */ None) ||
+            self.has_css_transitions(context, /* pseudo_element = */ None)
     }
 
     fn has_css_animations(
@@ -407,7 +426,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
             Some(None) => AtomString::default(),
             None => AtomString::from(&*self.element.get_lang_for_layout()),
         };
-        extended_filtering(&element_lang, &*value)
+        extended_filtering(&element_lang, value)
     }
 
     fn is_html_document_body_element(&self) -> bool {
@@ -426,14 +445,14 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
     }
 
     /// The shadow root this element is a host of.
-    fn shadow_root(&self) -> Option<ServoShadowRoot<'dom, LayoutDataType>> {
+    fn shadow_root(&self) -> Option<ServoShadowRoot<'dom>> {
         self.element
             .get_shadow_root_for_layout()
             .map(ServoShadowRoot::from_layout_js)
     }
 
     /// The shadow root which roots the subtree this element is contained in.
-    fn containing_shadow(&self) -> Option<ServoShadowRoot<'dom, LayoutDataType>> {
+    fn containing_shadow(&self) -> Option<ServoShadowRoot<'dom>> {
         self.element
             .upcast()
             .containing_shadow_root_for_layout()
@@ -454,11 +473,61 @@ impl<'dom, LayoutDataType: LayoutDataTrait> style::dom::TElement
     ) -> euclid::default::Size2D<Option<app_units::Au>> {
         todo!();
     }
+
+    fn has_selector_flags(&self, flags: ElementSelectorFlags) -> bool {
+        self.element.get_selector_flags().contains(flags)
+    }
+
+    fn relative_selector_search_direction(&self) -> ElementSelectorFlags {
+        self.element
+            .get_selector_flags()
+            .intersection(ElementSelectorFlags::RELATIVE_SELECTOR_SEARCH_DIRECTION_ANCESTOR_SIBLING)
+    }
+
+    fn each_custom_state<F>(&self, _callback: F)
+    where
+        F: FnMut(&AtomIdent),
+    {
+    }
+
+    /// Returns the implicit scope root for given sheet index and host.
+    fn implicit_scope_for_sheet_in_shadow_root(
+        opaque_host: ::selectors::OpaqueElement,
+        sheet_index: usize,
+    ) -> Option<ImplicitScopeRoot> {
+        // As long as this "unopaqued" element does not escape this function, we're not leaking
+        // potentially-mutable elements from opaque elements.
+        let host = unsafe {
+            let ptr = opaque_host.as_const_ptr::<JSObject>();
+            let untrusted_address = UntrustedNodeAddress::from_id(ptr as usize);
+            let node = Node::from_untrusted_node_address(untrusted_address);
+            let trusted_address = node.to_trusted_node_address();
+            let servo_layout_node = ServoLayoutNode::new(&trusted_address);
+            servo_layout_node.as_element().unwrap()
+        };
+        host.shadow_root()?.implicit_scope_for_sheet(sheet_index)
+    }
+
+    fn slotted_nodes(&self) -> &[Self::ConcreteNode] {
+        let Some(slot_element) = self.element.unsafe_get().downcast::<HTMLSlotElement>() else {
+            return &[];
+        };
+        let assigned_nodes = slot_element.assigned_nodes();
+
+        // SAFETY:
+        // Self::ConcreteNode (aka ServoLayoutNode) and Slottable are guaranteed to have the same
+        // layout and alignment as ptr::NonNull<T>. Lifetimes are not an issue because the
+        // slottables are being kept alive by the slot element.
+        unsafe {
+            slice::from_raw_parts(
+                assigned_nodes.as_ptr() as *const Self::ConcreteNode,
+                assigned_nodes.len(),
+            )
+        }
+    }
 }
 
-impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
-    for ServoLayoutElement<'dom, LayoutDataType>
-{
+impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
     type Impl = SelectorImpl;
 
     fn opaque(&self) -> ::selectors::OpaqueElement {
@@ -494,7 +563,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
         None
     }
 
-    fn next_sibling_element(&self) -> Option<ServoLayoutElement<'dom, LayoutDataType>> {
+    fn next_sibling_element(&self) -> Option<ServoLayoutElement<'dom>> {
         let mut node = self.as_node();
         while let Some(sibling) = node.next_sibling() {
             if let Some(element) = sibling.as_element() {
@@ -518,9 +587,9 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
         operation: &AttrSelectorOperation<&AtomString>,
     ) -> bool {
         match *ns {
-            NamespaceConstraint::Specific(ref ns) => self
+            NamespaceConstraint::Specific(ns) => self
                 .get_attr_enum(ns, local_name)
-                .map_or(false, |value| value.eval_selector(operation)),
+                .is_some_and(|value| value.eval_selector(operation)),
             NamespaceConstraint::Any => self
                 .element
                 .get_attr_vals_for_layout(local_name)
@@ -583,36 +652,45 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
             NonTSPseudoClass::Link | NonTSPseudoClass::AnyLink => self.is_link(),
             NonTSPseudoClass::Visited => false,
 
-            NonTSPseudoClass::Lang(ref lang) => self.match_element_lang(None, &*lang),
+            NonTSPseudoClass::CustomState(ref state) => self.has_custom_state(&state.0),
+            NonTSPseudoClass::Lang(ref lang) => self.match_element_lang(None, lang),
 
-            NonTSPseudoClass::ServoNonZeroBorder => {
-                match self
-                    .element
-                    .get_attr_for_layout(&ns!(), &local_name!("border"))
-                {
-                    None | Some(&AttrValue::UInt(_, 0)) => false,
-                    _ => true,
-                }
-            },
+            NonTSPseudoClass::ServoNonZeroBorder => !matches!(
+                self.element
+                    .get_attr_for_layout(&ns!(), &local_name!("border")),
+                None | Some(&AttrValue::UInt(_, 0))
+            ),
             NonTSPseudoClass::ReadOnly => !self
                 .element
                 .get_state_for_layout()
-                .contains(pseudo_class.state_flag()),
+                .contains(NonTSPseudoClass::ReadWrite.state_flag()),
 
             NonTSPseudoClass::Active |
+            NonTSPseudoClass::Autofill |
+            NonTSPseudoClass::Checked |
+            NonTSPseudoClass::Default |
+            NonTSPseudoClass::Defined |
+            NonTSPseudoClass::Disabled |
+            NonTSPseudoClass::Enabled |
             NonTSPseudoClass::Focus |
+            NonTSPseudoClass::FocusVisible |
+            NonTSPseudoClass::FocusWithin |
             NonTSPseudoClass::Fullscreen |
             NonTSPseudoClass::Hover |
-            NonTSPseudoClass::Defined |
-            NonTSPseudoClass::Enabled |
-            NonTSPseudoClass::Disabled |
-            NonTSPseudoClass::Checked |
-            NonTSPseudoClass::Valid |
-            NonTSPseudoClass::Invalid |
+            NonTSPseudoClass::InRange |
             NonTSPseudoClass::Indeterminate |
-            NonTSPseudoClass::ReadWrite |
+            NonTSPseudoClass::Invalid |
+            NonTSPseudoClass::Modal |
+            NonTSPseudoClass::Optional |
+            NonTSPseudoClass::OutOfRange |
             NonTSPseudoClass::PlaceholderShown |
-            NonTSPseudoClass::Target => self
+            NonTSPseudoClass::PopoverOpen |
+            NonTSPseudoClass::ReadWrite |
+            NonTSPseudoClass::Required |
+            NonTSPseudoClass::Target |
+            NonTSPseudoClass::UserInvalid |
+            NonTSPseudoClass::UserValid |
+            NonTSPseudoClass::Valid => self
                 .element
                 .get_state_for_layout()
                 .contains(pseudo_class.state_flag()),
@@ -641,7 +719,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
         unsafe {
             (*self.element.id_attribute())
                 .as_ref()
-                .map_or(false, |atom| case_sensitivity.eq_atom(atom, id))
+                .is_some_and(|atom| case_sensitivity.eq_atom(atom, id))
         }
     }
 
@@ -660,7 +738,12 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
     }
 
     fn is_html_slot_element(&self) -> bool {
-        self.element.is_html_element() && self.local_name() == &local_name!("slot")
+        self.element.is::<HTMLSlotElement>()
+    }
+
+    #[allow(unsafe_code)]
+    fn assigned_slot(&self) -> Option<Self> {
+        self.as_node().assigned_slot()
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
@@ -682,49 +765,36 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
             }
         }
     }
+
+    fn add_element_unique_hashes(&self, filter: &mut BloomFilter) -> bool {
+        each_relevant_element_hash(*self, |hash| filter.insert_hash(hash & BLOOM_HASH_MASK));
+        true
+    }
+
+    fn has_custom_state(&self, _name: &AtomIdent) -> bool {
+        false
+    }
 }
 
 /// A wrapper around elements that ensures layout can only
 /// ever access safe properties and cannot race on elements.
-pub struct ServoThreadSafeLayoutElement<'dom, LayoutDataType: LayoutDataTrait> {
-    pub(super) element: ServoLayoutElement<'dom, LayoutDataType>,
+#[derive(Clone, Copy, Debug)]
+pub struct ServoThreadSafeLayoutElement<'dom> {
+    pub(super) element: ServoLayoutElement<'dom>,
 
     /// The pseudo-element type, with (optionally)
     /// a specified display value to override the stylesheet.
     pub(super) pseudo: PseudoElementType,
 }
 
-// These impls are required because `derive` has trouble with PhantomData.
-// See https://github.com/rust-lang/rust/issues/52079
-impl<'dom, LayoutDataType: LayoutDataTrait> Clone
-    for ServoThreadSafeLayoutElement<'dom, LayoutDataType>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<'dom, LayoutDataType: LayoutDataTrait> Copy
-    for ServoThreadSafeLayoutElement<'dom, LayoutDataType>
-{
-}
-impl<'dom, LayoutDataType: LayoutDataTrait> fmt::Debug
-    for ServoThreadSafeLayoutElement<'dom, LayoutDataType>
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.element.fmt(f)
-    }
-}
+impl<'dom> ThreadSafeLayoutElement<'dom> for ServoThreadSafeLayoutElement<'dom> {
+    type ConcreteThreadSafeLayoutNode = ServoThreadSafeLayoutNode<'dom>;
+    type ConcreteElement = ServoLayoutElement<'dom>;
 
-impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutElement<'dom>
-    for ServoThreadSafeLayoutElement<'dom, LayoutDataType>
-{
-    type ConcreteThreadSafeLayoutNode = ServoThreadSafeLayoutNode<'dom, LayoutDataType>;
-    type ConcreteElement = ServoLayoutElement<'dom, LayoutDataType>;
-
-    fn as_node(&self) -> ServoThreadSafeLayoutNode<'dom, LayoutDataType> {
+    fn as_node(&self) -> ServoThreadSafeLayoutNode<'dom> {
         ServoThreadSafeLayoutNode {
             node: self.element.as_node(),
-            pseudo: self.pseudo.clone(),
+            pseudo: self.pseudo,
         }
     }
 
@@ -734,7 +804,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutElement<'dom>
 
     fn with_pseudo(&self, pseudo: PseudoElementType) -> Self {
         ServoThreadSafeLayoutElement {
-            element: self.element.clone(),
+            element: self.element,
             pseudo,
         }
     }
@@ -743,8 +813,12 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutElement<'dom>
         self.as_node().type_id()
     }
 
-    unsafe fn unsafe_get(self) -> ServoLayoutElement<'dom, LayoutDataType> {
+    fn unsafe_get(self) -> ServoLayoutElement<'dom> {
         self.element
+    }
+
+    fn get_local_name(&self) -> &LocalName {
+        self.element.local_name()
     }
 
     fn get_attr_enum(&self, namespace: &Namespace, name: &LocalName) -> Option<&AttrValue> {
@@ -780,9 +854,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ThreadSafeLayoutElement<'dom>
 ///
 /// Note that the element implementation is needed only for selector matching,
 /// not for inheritance (styles are inherited appropriately).
-impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
-    for ServoThreadSafeLayoutElement<'dom, LayoutDataType>
-{
+impl ::selectors::Element for ServoThreadSafeLayoutElement<'_> {
     type Impl = SelectorImpl;
 
     fn opaque(&self) -> ::selectors::OpaqueElement {
@@ -829,8 +901,7 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
     }
 
     fn is_html_element_in_html_document(&self) -> bool {
-        debug!("ServoThreadSafeLayoutElement::is_html_element_in_html_document called");
-        true
+        self.element.is_html_element_in_html_document()
     }
 
     #[inline]
@@ -864,9 +935,9 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
         operation: &AttrSelectorOperation<&AtomString>,
     ) -> bool {
         match *ns {
-            NamespaceConstraint::Specific(ref ns) => self
+            NamespaceConstraint::Specific(ns) => self
                 .get_attr_enum(ns, local_name)
-                .map_or(false, |value| value.eval_selector(operation)),
+                .is_some_and(|value| value.eval_selector(operation)),
             NamespaceConstraint::Any => self
                 .element
                 .element
@@ -937,12 +1008,15 @@ impl<'dom, LayoutDataType: LayoutDataTrait> ::selectors::Element
             }
         }
     }
-}
 
-impl<'dom, LayoutDataType: LayoutDataTrait> GetStyleAndOpaqueLayoutData<'dom>
-    for ServoThreadSafeLayoutElement<'dom, LayoutDataType>
-{
-    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData> {
-        self.element.as_node().get_style_and_opaque_layout_data()
+    fn add_element_unique_hashes(&self, filter: &mut BloomFilter) -> bool {
+        each_relevant_element_hash(self.element, |hash| {
+            filter.insert_hash(hash & BLOOM_HASH_MASK)
+        });
+        true
+    }
+
+    fn has_custom_state(&self, _name: &AtomIdent) -> bool {
+        false
     }
 }

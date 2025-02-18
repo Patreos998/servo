@@ -12,9 +12,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::performance::PerformanceEntryList;
 use crate::dom::performanceentry::PerformanceEntry;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct PerformanceObserverEntryList {
+pub(crate) struct PerformanceObserverEntryList {
     reflector_: Reflector,
     entries: DomRefCell<PerformanceEntryList>,
 }
@@ -27,17 +28,17 @@ impl PerformanceObserverEntryList {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         global: &GlobalScope,
         entries: PerformanceEntryList,
     ) -> DomRoot<PerformanceObserverEntryList> {
         let observer_entry_list = PerformanceObserverEntryList::new_inherited(entries);
-        reflect_dom_object(Box::new(observer_entry_list), global)
+        reflect_dom_object(Box::new(observer_entry_list), global, CanGc::note())
     }
 }
 
-impl PerformanceObserverEntryListMethods for PerformanceObserverEntryList {
+impl PerformanceObserverEntryListMethods<crate::DomTypeHolder> for PerformanceObserverEntryList {
     // https://w3c.github.io/performance-timeline/#dom-performanceobserver
     fn GetEntries(&self) -> Vec<DomRoot<PerformanceEntry>> {
         self.entries

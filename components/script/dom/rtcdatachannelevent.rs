@@ -11,16 +11,17 @@ use crate::dom::bindings::codegen::Bindings::RTCDataChannelEventBinding::{
     RTCDataChannelEventInit, RTCDataChannelEventMethods,
 };
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::rtcdatachannel::RTCDataChannel;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct RTCDataChannelEvent {
+pub(crate) struct RTCDataChannelEvent {
     event: Event,
     channel: Dom<RTCDataChannel>,
 }
@@ -33,14 +34,15 @@ impl RTCDataChannelEvent {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
         bubbles: bool,
         cancelable: bool,
         channel: &RTCDataChannel,
+        can_gc: CanGc,
     ) -> DomRoot<RTCDataChannelEvent> {
-        Self::new_with_proto(global, None, type_, bubbles, cancelable, channel)
+        Self::new_with_proto(global, None, type_, bubbles, cancelable, channel, can_gc)
     }
 
     fn new_with_proto(
@@ -50,11 +52,13 @@ impl RTCDataChannelEvent {
         bubbles: bool,
         cancelable: bool,
         channel: &RTCDataChannel,
+        can_gc: CanGc,
     ) -> DomRoot<RTCDataChannelEvent> {
         let event = reflect_dom_object_with_proto(
-            Box::new(RTCDataChannelEvent::new_inherited(&channel)),
+            Box::new(RTCDataChannelEvent::new_inherited(channel)),
             global,
             proto,
+            can_gc,
         );
         {
             let event = event.upcast::<Event>();
@@ -62,11 +66,14 @@ impl RTCDataChannelEvent {
         }
         event
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl RTCDataChannelEventMethods<crate::DomTypeHolder> for RTCDataChannelEvent {
+    // https://www.w3.org/TR/webrtc/#dom-rtcdatachannelevent-constructor
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &RTCDataChannelEventInit,
     ) -> DomRoot<RTCDataChannelEvent> {
@@ -77,11 +84,10 @@ impl RTCDataChannelEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             &init.channel,
+            can_gc,
         )
     }
-}
 
-impl RTCDataChannelEventMethods for RTCDataChannelEvent {
     // https://www.w3.org/TR/webrtc/#dom-datachannelevent-channel
     fn Channel(&self) -> DomRoot<RTCDataChannel> {
         DomRoot::from_ref(&*self.channel)

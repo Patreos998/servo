@@ -9,7 +9,7 @@ use style::dom::{NodeInfo, TElement, TNode};
 use style::traversal::{recalc_style_at, DomTraversal, PerLevelTraversalData};
 
 use crate::context::LayoutContext;
-use crate::dom::NodeExt;
+use crate::dom::DOMLayoutData;
 
 pub struct RecalcStyle<'a> {
     context: LayoutContext<'a>,
@@ -17,7 +17,7 @@ pub struct RecalcStyle<'a> {
 
 impl<'a> RecalcStyle<'a> {
     pub fn new(context: LayoutContext<'a>) -> Self {
-        RecalcStyle { context: context }
+        RecalcStyle { context }
     }
 
     pub fn context(&self) -> &LayoutContext<'a> {
@@ -30,7 +30,7 @@ impl<'a> RecalcStyle<'a> {
 }
 
 #[allow(unsafe_code)]
-impl<'a, 'dom, E> DomTraversal<E> for RecalcStyle<'a>
+impl<'dom, E> DomTraversal<E> for RecalcStyle<'_>
 where
     E: TElement,
     E::ConcreteNode: 'dom + LayoutNode<'dom>,
@@ -45,7 +45,7 @@ where
         F: FnMut(E::ConcreteNode),
     {
         unsafe {
-            node.initialize_data();
+            node.initialize_style_and_layout_data::<DOMLayoutData>();
             if !node.is_text_node() {
                 let el = node.as_element().unwrap();
                 let mut data = el.mutate_data().unwrap();
@@ -65,7 +65,7 @@ where
     }
 
     fn text_node_needs_traversal(node: E::ConcreteNode, parent_data: &ElementData) -> bool {
-        node.get_style_and_layout_data().is_none() || !parent_data.damage.is_empty()
+        node.layout_data().is_none() || !parent_data.damage.is_empty()
     }
 
     fn shared_context(&self) -> &SharedStyleContext {

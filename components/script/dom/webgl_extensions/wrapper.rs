@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::any::Any;
 use std::ptr::NonNull;
 
 use js::jsapi::JSObject;
@@ -16,7 +15,7 @@ use crate::dom::webglrenderingcontext::WebGLRenderingContext;
 
 /// Trait used internally by WebGLExtensions to store and
 /// handle the different WebGL extensions in a common list.
-pub trait WebGLExtensionWrapper: JSTraceable + MallocSizeOf {
+pub(crate) trait WebGLExtensionWrapper: JSTraceable + MallocSizeOf {
     fn instance_or_init(
         &self,
         ctx: &WebGLRenderingContext,
@@ -27,19 +26,18 @@ pub trait WebGLExtensionWrapper: JSTraceable + MallocSizeOf {
     fn is_enabled(&self) -> bool;
     fn enable(&self, ext: &WebGLExtensions);
     fn name(&self) -> &'static str;
-    fn as_any(&self) -> &dyn Any;
 }
 
-#[crown::unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 #[derive(JSTraceable, MallocSizeOf)]
-pub struct TypedWebGLExtensionWrapper<T: WebGLExtension> {
+pub(crate) struct TypedWebGLExtensionWrapper<T: WebGLExtension> {
     extension: MutNullableDom<T::Extension>,
 }
 
 /// Typed WebGL Extension implementation.
 /// Exposes the exact `MutNullableDom<DOMObject>` type defined by the extension.
 impl<T: WebGLExtension> TypedWebGLExtensionWrapper<T> {
-    pub fn new() -> TypedWebGLExtensionWrapper<T> {
+    pub(crate) fn new() -> TypedWebGLExtensionWrapper<T> {
         TypedWebGLExtensionWrapper {
             extension: MutNullableDom::new(None),
         }
@@ -85,9 +83,5 @@ where
 
     fn name(&self) -> &'static str {
         T::name()
-    }
-
-    fn as_any<'a>(&'a self) -> &'a dyn Any {
-        self
     }
 }

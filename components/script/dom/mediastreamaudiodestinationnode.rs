@@ -16,26 +16,28 @@ use crate::dom::bindings::codegen::Bindings::AudioNodeBinding::{
 use crate::dom::bindings::codegen::Bindings::MediaStreamAudioDestinationNodeBinding::MediaStreamAudioDestinationNodeMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::mediastream::MediaStream;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MediaStreamAudioDestinationNode {
+pub(crate) struct MediaStreamAudioDestinationNode {
     node: AudioNode,
     stream: Dom<MediaStream>,
 }
 
 impl MediaStreamAudioDestinationNode {
-    #[allow(crown::unrooted_must_root)]
-    pub fn new_inherited(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new_inherited(
         context: &AudioContext,
         options: &AudioNodeOptions,
+        can_gc: CanGc,
     ) -> Fallible<MediaStreamAudioDestinationNode> {
-        let media = ServoMedia::get().unwrap();
+        let media = ServoMedia::get();
         let (socket, id) = media.create_stream_and_socket(MediaStreamType::Audio);
-        let stream = MediaStream::new_single(&context.global(), id, MediaStreamType::Audio);
+        let stream = MediaStream::new_single(&context.global(), id, MediaStreamType::Audio, can_gc);
         let node_options = options.unwrap_or(
             2,
             ChannelCountMode::Explicit,
@@ -43,7 +45,7 @@ impl MediaStreamAudioDestinationNode {
         );
         let node = AudioNode::new_inherited(
             AudioNodeInit::MediaStreamDestinationNode(socket),
-            &context.upcast(),
+            context.upcast(),
             node_options,
             1, // inputs
             0, // outputs
@@ -54,37 +56,47 @@ impl MediaStreamAudioDestinationNode {
         })
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         context: &AudioContext,
         options: &AudioNodeOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaStreamAudioDestinationNode>> {
-        Self::new_with_proto(window, None, context, options)
+        Self::new_with_proto(window, None, context, options, can_gc)
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
         context: &AudioContext,
         options: &AudioNodeOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<MediaStreamAudioDestinationNode>> {
-        let node = MediaStreamAudioDestinationNode::new_inherited(context, options)?;
-        Ok(reflect_dom_object_with_proto(Box::new(node), window, proto))
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        context: &AudioContext,
-        options: &AudioNodeOptions,
-    ) -> Fallible<DomRoot<MediaStreamAudioDestinationNode>> {
-        MediaStreamAudioDestinationNode::new_with_proto(window, proto, context, options)
+        let node = MediaStreamAudioDestinationNode::new_inherited(context, options, can_gc)?;
+        Ok(reflect_dom_object_with_proto(
+            Box::new(node),
+            window,
+            proto,
+            can_gc,
+        ))
     }
 }
 
-impl MediaStreamAudioDestinationNodeMethods for MediaStreamAudioDestinationNode {
+impl MediaStreamAudioDestinationNodeMethods<crate::DomTypeHolder>
+    for MediaStreamAudioDestinationNode
+{
+    /// <https://webaudio.github.io/web-audio-api/#dom-mediastreamaudiodestinationnode-mediastreamaudiodestinationnode>
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        context: &AudioContext,
+        options: &AudioNodeOptions,
+    ) -> Fallible<DomRoot<MediaStreamAudioDestinationNode>> {
+        MediaStreamAudioDestinationNode::new_with_proto(window, proto, context, options, can_gc)
+    }
+
     /// <https://webaudio.github.io/web-audio-api/#dom-mediastreamaudiodestinationnode-stream>
     fn Stream(&self) -> DomRoot<MediaStream> {
         DomRoot::from_ref(&self.stream)

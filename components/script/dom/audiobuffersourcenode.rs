@@ -10,7 +10,7 @@ use js::rust::HandleObject;
 use servo_media::audio::buffer_source_node::{
     AudioBufferSourceNodeMessage, AudioBufferSourceNodeOptions,
 };
-use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage};
+use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage, AudioNodeType};
 use servo_media::audio::param::ParamType;
 
 use crate::dom::audiobuffer::AudioBuffer;
@@ -28,9 +28,10 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct AudioBufferSourceNode {
+pub(crate) struct AudioBufferSourceNode {
     source_node: AudioScheduledSourceNode,
     buffer: MutNullableDom<AudioBuffer>,
     buffer_set: Cell<bool>,
@@ -42,7 +43,7 @@ pub struct AudioBufferSourceNode {
 }
 
 impl AudioBufferSourceNode {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(
         window: &Window,
         context: &BaseAudioContext,
@@ -58,9 +59,10 @@ impl AudioBufferSourceNode {
         )?;
         let node_id = source_node.node().node_id();
         let playback_rate = AudioParam::new(
-            &window,
+            window,
             context,
             node_id,
+            AudioNodeType::AudioBufferSourceNode,
             ParamType::PlaybackRate,
             AutomationRate::K_rate,
             *options.playbackRate,
@@ -68,9 +70,10 @@ impl AudioBufferSourceNode {
             f32::MAX,
         );
         let detune = AudioParam::new(
-            &window,
+            window,
             context,
             node_id,
+            AudioNodeType::AudioBufferSourceNode,
             ParamType::Detune,
             AutomationRate::K_rate,
             *options.detune,
@@ -87,47 +90,51 @@ impl AudioBufferSourceNode {
             loop_start: Cell::new(*options.loopStart),
             loop_end: Cell::new(*options.loopEnd),
         };
-        if let Some(ref buffer) = options.buffer {
-            if let Some(ref buffer) = buffer {
-                if let Err(err) = node.SetBuffer(Some(&**buffer)) {
-                    return Err(err);
-                }
-            }
+        if let Some(Some(ref buffer)) = options.buffer {
+            node.SetBuffer(Some(buffer))?;
         }
         Ok(node)
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         context: &BaseAudioContext,
         options: &AudioBufferSourceOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
-        Self::new_with_proto(window, None, context, options)
+        Self::new_with_proto(window, None, context, options, can_gc)
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &AudioBufferSourceOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
         let node = AudioBufferSourceNode::new_inherited(window, context, options)?;
-        Ok(reflect_dom_object_with_proto(Box::new(node), window, proto))
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        context: &BaseAudioContext,
-        options: &AudioBufferSourceOptions,
-    ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
-        AudioBufferSourceNode::new_with_proto(window, proto, context, options)
+        Ok(reflect_dom_object_with_proto(
+            Box::new(node),
+            window,
+            proto,
+            can_gc,
+        ))
     }
 }
 
-impl AudioBufferSourceNodeMethods for AudioBufferSourceNode {
+impl AudioBufferSourceNodeMethods<crate::DomTypeHolder> for AudioBufferSourceNode {
+    // https://webaudio.github.io/web-audio-api/#dom-audiobuffersourcenode-audiobuffersourcenode
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        context: &BaseAudioContext,
+        options: &AudioBufferSourceOptions,
+    ) -> Fallible<DomRoot<AudioBufferSourceNode>> {
+        AudioBufferSourceNode::new_with_proto(window, proto, context, options, can_gc)
+    }
+
     // https://webaudio.github.io/web-audio-api/#dom-audiobuffersourcenode-buffer
     fn GetBuffer(&self) -> Fallible<Option<DomRoot<AudioBuffer>>> {
         Ok(self.buffer.get())
@@ -267,15 +274,10 @@ impl AudioBufferSourceNodeMethods for AudioBufferSourceNode {
 impl<'a> From<&'a AudioBufferSourceOptions> for AudioBufferSourceNodeOptions {
     fn from(options: &'a AudioBufferSourceOptions) -> Self {
         Self {
-            buffer: if let Some(ref buffer) = options.buffer {
-                if let Some(ref buffer) = buffer {
-                    (*buffer.get_channels()).clone()
-                } else {
-                    None
-                }
-            } else {
-                None
-            },
+            buffer: options
+                .buffer
+                .as_ref()
+                .and_then(|b| (*b.as_ref()?.get_channels()).clone()),
             detune: *options.detune,
             loop_enabled: options.loop_,
             loop_end: Some(*options.loopEnd),

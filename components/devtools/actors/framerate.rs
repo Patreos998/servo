@@ -5,9 +5,9 @@
 use std::mem;
 use std::net::TcpStream;
 
+use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg;
 use ipc_channel::ipc::IpcSender;
-use msg::constellation_msg::PipelineId;
 use serde_json::{Map, Value};
 
 use crate::actor::{Actor, ActorMessageStatus, ActorRegistry};
@@ -18,7 +18,6 @@ pub struct FramerateActor {
     name: String,
     pipeline: PipelineId,
     script_sender: IpcSender<DevtoolScriptControlMsg>,
-
     is_recording: bool,
     ticks: Vec<HighResolutionStamp>,
 }
@@ -41,7 +40,7 @@ impl Actor for FramerateActor {
 }
 
 impl FramerateActor {
-    /// return name of actor
+    /// Return name of actor
     pub fn create(
         registry: &ActorRegistry,
         pipeline_id: PipelineId,
@@ -51,7 +50,7 @@ impl FramerateActor {
         let mut actor = FramerateActor {
             name: actor_name.clone(),
             pipeline: pipeline_id,
-            script_sender: script_sender,
+            script_sender,
             is_recording: false,
             ticks: Vec::new(),
         };
@@ -71,7 +70,7 @@ impl FramerateActor {
     }
 
     pub fn take_pending_ticks(&mut self) -> Vec<HighResolutionStamp> {
-        mem::replace(&mut self.ticks, Vec::new())
+        mem::take(&mut self.ticks)
     }
 
     fn start_recording(&mut self) {

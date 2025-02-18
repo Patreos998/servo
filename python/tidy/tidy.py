@@ -17,14 +17,14 @@ import os
 import re
 import subprocess
 import sys
-from typing import List
+from typing import Any, Dict, List
 
 import colorama
 import toml
 
 import wpt.manifestupdate
 
-from .licenseck import OLD_MPL, MPL, APACHE, COPYRIGHT, licenses_toml, licenses_dep_toml
+from .licenseck import OLD_MPL, MPL, APACHE, COPYRIGHT, licenses_toml
 
 TOPDIR = os.path.abspath(os.path.dirname(sys.argv[0]))
 WPT_PATH = os.path.join(".", "tests", "wpt")
@@ -32,6 +32,11 @@ CONFIG_FILE_PATH = os.path.join(".", "servo-tidy.toml")
 WPT_CONFIG_INI_PATH = os.path.join(WPT_PATH, "config.ini")
 # regex source https://stackoverflow.com/questions/6883049/
 URL_REGEX = re.compile(br'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+')
+UTF8_URL_REGEX = re.compile(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+')
+CARGO_LOCK_FILE = os.path.join(TOPDIR, "Cargo.lock")
+CARGO_DENY_CONFIG_FILE = os.path.join(TOPDIR, "deny.toml")
+
+ERROR_RAW_URL_IN_RUSTDOC = "Found raw link in rustdoc. Please escape it with angle brackets or use a markdown link."
 
 sys.path.append(os.path.join(WPT_PATH, "tests"))
 sys.path.append(os.path.join(WPT_PATH, "tests", "tools", "wptrunner"))
@@ -41,7 +46,6 @@ config = {
     "skip-check-length": False,
     "skip-check-licenses": False,
     "check-alphabetical-order": True,
-    "check-ordered-json-keys": [],
     "lint-scripts": [],
     "blocked-packages": {},
     "ignore": {
@@ -84,6 +88,7 @@ WEBIDL_STANDARDS = [
     b"//encoding.spec.whatwg.org",
     b"//fetch.spec.whatwg.org",
     b"//html.spec.whatwg.org",
+    b"//streams.spec.whatwg.org",
     b"//url.spec.whatwg.org",
     b"//xhr.spec.whatwg.org",
     b"//w3c.github.io",
@@ -129,6 +134,18 @@ def progress_wrapper(iterator):
         yield thing
 
 
+def git_changes_since_last_merge(path):
+    args = ["git", "log", "-n1", "--committer", "noreply@github.com", "--format=%H"]
+    last_merge = subprocess.check_output(args, universal_newlines=True).strip()
+    if not last_merge:
+        return
+
+    args = ["git", "diff", "--name-only", last_merge, path]
+    file_list = normilize_paths(subprocess.check_output(args, universal_newlines=True).splitlines())
+
+    return file_list
+
+
 class FileList(object):
     def __init__(self, directory, only_changed_files=False, exclude_dirs=[], progress=True):
         self.directory = directory
@@ -145,14 +162,9 @@ class FileList(object):
                 yield os.path.join(root, f)
 
     def _git_changed_files(self):
-        args = ["git", "log", "-n1", "--committer", "noreply@github.com", "--format=%H"]
-        last_merge = subprocess.check_output(args, universal_newlines=True).strip()
-        if not last_merge:
+        file_list = git_changes_since_last_merge(self.directory)
+        if not file_list:
             return
-
-        args = ["git", "diff", "--name-only", last_merge, self.directory]
-        file_list = normilize_paths(subprocess.check_output(args, universal_newlines=True).splitlines())
-
         for f in file_list:
             if not any(os.path.join('.', os.path.dirname(f)).startswith(path) for path in self.excluded):
                 yield os.path.join('.', f)
@@ -271,14 +283,14 @@ def is_unsplittable(file_name, line):
 def check_whatwg_specific_url(idx, line):
     match = re.search(br"https://html\.spec\.whatwg\.org/multipage/[\w-]+\.html#([\w\'\:-]+)", line)
     if match is not None:
-        preferred_link = "https://html.spec.whatwg.org/multipage/#{}".format(match.group(1))
+        preferred_link = "https://html.spec.whatwg.org/multipage/#{}".format(match.group(1).decode("utf-8"))
         yield (idx + 1, "link to WHATWG may break in the future, use this format instead: {}".format(preferred_link))
 
 
 def check_whatwg_single_page_url(idx, line):
     match = re.search(br"https://html\.spec\.whatwg\.org/#([\w\'\:-]+)", line)
     if match is not None:
-        preferred_link = "https://html.spec.whatwg.org/multipage/#{}".format(match.group(1))
+        preferred_link = "https://html.spec.whatwg.org/multipage/#{}".format(match.group(1).decode("utf-8"))
         yield (idx + 1, "links to WHATWG single-page url, change to multi page: {}".format(preferred_link))
 
 
@@ -298,13 +310,39 @@ def check_whitespace(idx, line):
         yield (idx + 1, "CR on line")
 
 
-def check_by_line(file_name, lines):
+def check_for_raw_urls_in_rustdoc(file_name: str, idx: int, line: bytes):
+    """Check that rustdoc comments in Rust source code do not have raw URLs. These appear
+    as warnings when rustdoc is run. rustdoc warnings could be made fatal, but adding this
+    check as part of tidy catches this common problem without having to run rustdoc for all
+    of Servo."""
+    if not file_name.endswith(".rs"):
+        return
+
+    if b"///" not in line and b"//!" not in line:
+        return
+
+    # Types of URLS that are allowed:
+    #  - A URL surrounded by angle or square brackets.
+    #  - A markdown link.
+    #  - A URL as part of a markdown definition identifer.
+    #    [link text]: https://example.com
+    match = URL_REGEX.search(line)
+    if match and (
+            not line[match.start() - 1:].startswith(b"<")
+            and not line[match.start() - 1:].startswith(b"[")
+            and not line[match.start() - 2:].startswith(b"](")
+            and not line[match.start() - 3:].startswith(b"]: ")):
+        yield (idx + 1, ERROR_RAW_URL_IN_RUSTDOC)
+
+
+def check_by_line(file_name: str, lines: list[bytes]):
     for idx, line in enumerate(lines):
         errors = itertools.chain(
             check_length(file_name, idx, line),
             check_whitespace(idx, line),
             check_whatwg_specific_url(idx, line),
             check_whatwg_single_page_url(idx, line),
+            check_for_raw_urls_in_rustdoc(file_name, idx, line),
         )
 
         for error in errors:
@@ -326,88 +364,54 @@ def check_flake8(file_name, contents):
         yield line_num, message.strip()
 
 
-def check_cargo_lock_file(filename, print_text=True):
-    if print_text:
-        print(f"\r ➤  Checking cargo lock ({filename})...")
+def run_cargo_deny_lints():
+    print("\r ➤  Running `cargo-deny` checks...")
+    result = subprocess.run(["cargo-deny", "--format=json", "--all-features", "check"],
+                            encoding='utf-8',
+                            capture_output=True)
+    assert result.stderr is not None, "cargo deny should return error information via stderr when failing"
 
-    with open(filename) as cargo_lock_file:
-        content = toml.load(cargo_lock_file)
+    errors = []
+    for line in result.stderr.splitlines():
+        error_fields = json.loads(line)["fields"]
+        error_code = error_fields.get("code", "unknown")
+        error_severity = error_fields.get("severity", "unknown")
+        message = error_fields.get("message", "")
+        labels = error_fields.get("labels", [])
 
-    def find_reverse_dependencies(name, content):
-        for package in itertools.chain([content.get("root", {})], content["package"]):
-            for dependency in package.get("dependencies", []):
-                parts = dependency.split()
-                dependency = (parts[0], parts[1] if len(parts) > 1 else None, parts[2] if len(parts) > 2 else None)
-                if dependency[0] == name:
-                    yield package["name"], package["version"], dependency
+        span = ""
+        line = 1
+        if len(labels) > 0:
+            span = labels[0]["span"]
+            line = labels[0]["line"]
 
-    # Package names to be neglected (as named by cargo)
-    exceptions = config["ignore"]["packages"]
+        # This is an effort to detect the license failures, so that we can print
+        # a more helpful message -- which normally does not include the license
+        # name.
+        if error_code == "rejected":
+            crate = CargoDenyKrate(error_fields["graphs"][0])
+            license_name = error_fields["notes"][0]
+            errors.append((
+                CARGO_LOCK_FILE,
+                1,
+                f"Rust dependency {crate}: Rejected license \"{license_name}\""
+            ))
+        # This detects if a crate has been marked as banned in the configuration file.
+        elif error_code == "banned":
+            crate = CargoDenyKrate(error_fields["graphs"][0])
+            parents = ", ".join([str(parent) for parent in crate.parents])
+            errors.append((CARGO_LOCK_FILE, 1, f"{message}: used by ({parents})"))
+        # This detects when two version of a crate have been used, but are not skipped
+        # by the configuration file.
+        elif error_code == "duplicate":
+            errors.append((CARGO_LOCK_FILE, 1, f"{message}:\n {span}"))
+        # This detects any other problem, typically caused by an unnecessary exception
+        # in the deny.toml file.
+        elif error_severity in ["warning", "error"]:
+            errors.append((CARGO_DENY_CONFIG_FILE, line, f"{message}: {span}"))
 
-    packages_by_name = {}
-    for package in content.get("package", []):
-        if "replace" in package:
-            continue
-        source = package.get("source", "")
-        if source == r"registry+https://github.com/rust-lang/crates.io-index":
-            source = "crates.io"
-        packages_by_name.setdefault(package["name"], []).append((package["version"], source))
-
-    for name in exceptions:
-        if name not in packages_by_name:
-            yield (filename, 1, "duplicates are allowed for `{}` but it is not a dependency".format(name))
-
-    for (name, packages) in packages_by_name.items():
-        has_duplicates = len(packages) > 1
-        duplicates_allowed = name in exceptions
-
-        if has_duplicates == duplicates_allowed:
-            continue
-
-        if duplicates_allowed:
-            message = 'duplicates for `{}` are allowed, but only single version found'.format(name)
-        else:
-            message = "duplicate versions for package `{}`".format(name)
-
-        packages.sort()
-        packages_dependencies = list(find_reverse_dependencies(name, content))
-        for version, source in packages:
-            short_source = source.split("#")[0].replace("git+", "")
-            message += "\n\t\033[93mThe following packages depend on version {} from '{}':\033[0m" \
-                       .format(version, short_source)
-            for pname, package_version, dependency in packages_dependencies:
-                if (not dependency[1] or version in dependency[1]) and \
-                   (not dependency[2] or short_source in dependency[2]):
-                    message += "\n\t\t" + pname + " " + package_version
-        yield (filename, 1, message)
-
-    # Check to see if we are transitively using any blocked packages
-    blocked_packages = config["blocked-packages"]
-    # Create map to keep track of visited exception packages
-    visited_whitelisted_packages = {package: {} for package in blocked_packages.keys()}
-
-    for package in content.get("package", []):
-        package_name = package.get("name")
-        package_version = package.get("version")
-        for dependency in package.get("dependencies", []):
-            dependency = dependency.split()
-            dependency_name = dependency[0]
-            whitelist = blocked_packages.get(dependency_name)
-            if whitelist is not None:
-                if package_name not in whitelist:
-                    fmt = "Package {} {} depends on blocked package {}."
-                    message = fmt.format(package_name, package_version, dependency_name)
-                    yield (filename, 1, message)
-                else:
-                    visited_whitelisted_packages[dependency_name][package_name] = True
-
-    # Check if all the exceptions to blocked packages actually depend on the blocked package
-    for dependency_name, package_names in blocked_packages.items():
-        for package_name in package_names:
-            if not visited_whitelisted_packages[dependency_name].get(package_name):
-                fmt = "Package {} is not required to be an exception of blocked package {}."
-                message = fmt.format(package_name, dependency_name)
-                yield (filename, 1, message)
+    for error in errors:
+        yield error
 
 
 def check_toml(file_name, lines):
@@ -422,6 +426,8 @@ def check_toml(file_name, lines):
             yield (idx + 1, "found asterisk instead of minimum version number")
         for license_line in licenses_toml:
             ok_licensed |= (license_line in line)
+        if "license.workspace" in line:
+            ok_licensed = True
     if not ok_licensed:
         yield (0, ".toml file should contain a valid license.")
 
@@ -702,44 +708,6 @@ def check_webidl_spec(file_name, contents):
     yield (0, "No specification link found.")
 
 
-def check_for_possible_duplicate_json_keys(key_value_pairs):
-    keys = [x[0] for x in key_value_pairs]
-    seen_keys = set()
-    for key in keys:
-        if key in seen_keys:
-            raise KeyError("Duplicated Key (%s)" % key)
-
-        seen_keys.add(key)
-
-
-def check_for_alphabetical_sorted_json_keys(key_value_pairs):
-    for a, b in zip(key_value_pairs[:-1], key_value_pairs[1:]):
-        if a[0] > b[0]:
-            raise KeyError("Unordered key (found %s before %s)" % (a[0], b[0]))
-
-
-def check_json_requirements(filename):
-    def check_fn(key_value_pairs):
-        check_for_possible_duplicate_json_keys(key_value_pairs)
-        if filename in normilize_paths(config["check-ordered-json-keys"]):
-            check_for_alphabetical_sorted_json_keys(key_value_pairs)
-    return check_fn
-
-
-def check_json(filename, contents):
-    if not filename.endswith(".json"):
-        return
-
-    try:
-        json.loads(contents, object_pairs_hook=check_json_requirements(filename))
-    except ValueError as e:
-        match = re.search(r"line (\d+) ", e.args[0])
-        line_no = match and match.group(1)
-        yield (line_no, e.args[0])
-    except KeyError as e:
-        yield (None, e.args[0])
-
-
 def check_that_manifests_exist():
     # Determine the metadata and test directories from the configuration file.
     metadata_dirs = []
@@ -799,7 +767,7 @@ def run_wpt_lints(only_changed_files: bool):
         yield (WPT_CONFIG_INI_PATH, 0, f"{WPT_CONFIG_INI_PATH} is required but was not found")
         return
 
-    if not list(FileList("./tests/wpt", only_changed_files=True, progress=False)):
+    if not list(FileList("./tests/wpt", only_changed_files=only_changed_files, progress=False)):
         print("\r ➤  Skipping WPT lint checks, because no relevant files changed.")
         return
 
@@ -822,14 +790,14 @@ def check_spec(file_name, lines):
     macro_patt = re.compile(r"^\s*\S+!(.*)$")
 
     # Pattern representing a line with comment containing a spec link
-    link_patt = re.compile(r"^\s*///? (<https://.+>|https://.+)$")
+    link_patt = re.compile(r"^\s*///? (<https://.+>.*|https://.+)$")
 
     # Pattern representing a line with comment or attribute
     comment_patt = re.compile(r"^\s*(///?.+|#\[.+\])$")
 
     brace_count = 0
     in_impl = False
-    pattern = "impl {}Methods for {} {{".format(file_name, file_name)
+    pattern = "impl {}Methods<crate::DomTypeHolder> for {} {{".format(file_name, file_name)
 
     for idx, line in enumerate(map(lambda line: line.decode("utf-8"), lines)):
         if "// check-tidy: no specs after this line" in line:
@@ -873,7 +841,7 @@ def check_config_file(config_file, print_text=True):
 
     # Check for invalid listed ignored directories
     exclude_dirs = [d for p in exclude.get("directories", []) for d in (glob.glob(p) or [p])]
-    skip_dirs = ["./target", "./tests"]
+    skip_dirs = ["./target", "./tests", "./support/crown/target"]
     invalid_dirs = [d for d in exclude_dirs if not os.path.isdir(d) and not any(s in d for s in skip_dirs)]
 
     # Check for invalid listed ignored files
@@ -974,7 +942,7 @@ def collect_errors_for_files(files_to_check, checking_functions, line_checking_f
     if not has_element:
         return
     if print_text:
-        print("\r ➤  Checking files for tidiness")
+        print("\r ➤  Checking files for tidiness...")
 
     for filename in files_to_check:
         if not os.path.exists(filename):
@@ -994,28 +962,6 @@ def collect_errors_for_files(files_to_check, checking_functions, line_checking_f
                     yield (filename,) + error
 
 
-def get_dep_toml_files(only_changed_files=False):
-    if not only_changed_files:
-        print('\nRunning the dependency licensing lint...')
-        for root, directories, filenames in os.walk(".cargo"):
-            for filename in filenames:
-                if filename == "Cargo.toml":
-                    yield os.path.join(root, filename)
-
-
-def check_dep_license_errors(filenames, progress=True):
-    filenames = progress_wrapper(filenames) if progress else filenames
-    for filename in filenames:
-        with open(filename, "r") as f:
-            ok_licensed = False
-            lines = f.readlines()
-            for idx, line in enumerate(lines):
-                for license_line in licenses_dep_toml:
-                    ok_licensed |= (license_line in line)
-            if not ok_licensed:
-                yield (filename, 0, "dependency should contain a valid license.")
-
-
 def scan(only_changed_files=False, progress=False):
     # check config file for errors
     config_errors = check_config_file(CONFIG_FILE_PATH)
@@ -1023,19 +969,17 @@ def scan(only_changed_files=False, progress=False):
     directory_errors = check_directory_files(config['check_ext'])
     # standard checks
     files_to_check = filter_files('.', only_changed_files, progress)
-    checking_functions = (check_flake8, check_webidl_spec, check_json)
+    checking_functions = (check_flake8, check_webidl_spec)
     line_checking_functions = (check_license, check_by_line, check_toml, check_shell,
                                check_rust, check_spec, check_modeline)
-    lock_errors = check_cargo_lock_file(os.path.join(TOPDIR, "Cargo.lock"))
     file_errors = collect_errors_for_files(files_to_check, checking_functions, line_checking_functions)
-    # check dependecy licenses
-    dep_license_errors = check_dep_license_errors(get_dep_toml_files(only_changed_files), progress)
 
+    cargo_lock_errors = run_cargo_deny_lints()
     wpt_errors = run_wpt_lints(only_changed_files)
 
     # chain all the iterators
-    errors = itertools.chain(config_errors, directory_errors, lock_errors, file_errors,
-                             dep_license_errors, wpt_errors)
+    errors = itertools.chain(config_errors, directory_errors, file_errors,
+                             wpt_errors, cargo_lock_errors)
 
     colorama.init()
     error = None
@@ -1046,3 +990,14 @@ def scan(only_changed_files=False, progress=False):
               + f"{colorama.Fore.RED}{error[2]}{colorama.Style.RESET_ALL}")
 
     return int(error is not None)
+
+
+class CargoDenyKrate:
+    def __init__(self, data: Dict[Any, Any]):
+        crate = data['Krate']
+        self.name = crate['name']
+        self.version = crate['version']
+        self.parents = [CargoDenyKrate(parent) for parent in data.get('parents', [])]
+
+    def __str__(self):
+        return f"{self.name}@{self.version}"

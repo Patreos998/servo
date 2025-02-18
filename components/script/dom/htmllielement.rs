@@ -15,9 +15,10 @@ use crate::dom::document::Document;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLLIElement {
+pub(crate) struct HTMLLIElement {
     htmlelement: HTMLElement,
 }
 
@@ -32,22 +33,24 @@ impl HTMLLIElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLLIElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLLIElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-impl HTMLLIElementMethods for HTMLLIElement {
+impl HTMLLIElementMethods<crate::DomTypeHolder> for HTMLLIElement {
     // https://html.spec.whatwg.org/multipage/#dom-li-value
     make_int_getter!(Value, "value");
 

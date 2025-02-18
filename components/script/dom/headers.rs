@@ -9,7 +9,9 @@ use data_url::mime::Mime as DataUrlMime;
 use dom_struct::dom_struct;
 use http::header::{HeaderMap as HyperHeaders, HeaderName, HeaderValue};
 use js::rust::HandleObject;
-use net_traits::fetch::headers::get_value_from_header_list;
+use net_traits::fetch::headers::{
+    get_decode_and_split_header_value, get_value_from_header_list, is_forbidden_method,
+};
 use net_traits::request::is_cors_safelisted_request_header;
 
 use crate::dom::bindings::cell::DomRefCell;
@@ -20,9 +22,10 @@ use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{is_token, ByteString};
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct Headers {
+pub(crate) struct Headers {
     reflector_: Reflector,
     guard: Cell<Guard>,
     #[ignore_malloc_size_of = "Defined in hyper"]
@@ -32,7 +35,7 @@ pub struct Headers {
 
 // https://fetch.spec.whatwg.org/#concept-headers-guard
 #[derive(Clone, Copy, Debug, JSTraceable, MallocSizeOf, PartialEq)]
-pub enum Guard {
+pub(crate) enum Guard {
     Immutable,
     Request,
     RequestNoCors,
@@ -41,7 +44,7 @@ pub enum Guard {
 }
 
 impl Headers {
-    pub fn new_inherited() -> Headers {
+    pub(crate) fn new_inherited() -> Headers {
         Headers {
             reflector_: Reflector::new(),
             guard: Cell::new(Guard::None),
@@ -49,28 +52,32 @@ impl Headers {
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<Headers> {
-        Self::new_with_proto(global, None)
+    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Headers> {
+        Self::new_with_proto(global, None, can_gc)
     }
 
-    fn new_with_proto(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<Headers> {
-        reflect_dom_object_with_proto(Box::new(Headers::new_inherited()), global, proto)
-    }
-
-    // https://fetch.spec.whatwg.org/#dom-headers
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
-        init: Option<HeadersInit>,
-    ) -> Fallible<DomRoot<Headers>> {
-        let dom_headers_new = Headers::new_with_proto(global, proto);
-        dom_headers_new.fill(init)?;
-        Ok(dom_headers_new)
+        can_gc: CanGc,
+    ) -> DomRoot<Headers> {
+        reflect_dom_object_with_proto(Box::new(Headers::new_inherited()), global, proto, can_gc)
     }
 }
 
-impl HeadersMethods for Headers {
+impl HeadersMethods<crate::DomTypeHolder> for Headers {
+    // https://fetch.spec.whatwg.org/#dom-headers
+    fn Constructor(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        init: Option<HeadersInit>,
+    ) -> Fallible<DomRoot<Headers>> {
+        let dom_headers_new = Headers::new_with_proto(global, proto, can_gc);
+        dom_headers_new.fill(init)?;
+        Ok(dom_headers_new)
+    }
+
     // https://fetch.spec.whatwg.org/#concept-headers-append
     fn Append(&self, name: ByteString, value: ByteString) -> ErrorResult {
         // Step 1
@@ -79,12 +86,15 @@ impl HeadersMethods for Headers {
         // Step 2
         // https://fetch.spec.whatwg.org/#headers-validate
         let (mut valid_name, valid_value) = validate_name_and_value(name, value)?;
+
         valid_name = valid_name.to_lowercase();
 
         if self.guard.get() == Guard::Immutable {
             return Err(Error::Type("Guard is immutable".to_string()));
         }
-        if self.guard.get() == Guard::Request && is_forbidden_header_name(&valid_name) {
+        if self.guard.get() == Guard::Request &&
+            is_forbidden_request_header(&valid_name, &valid_value)
+        {
             return Ok(());
         }
         if self.guard.get() == Guard::Response && is_forbidden_response_header(&valid_name) {
@@ -135,13 +145,18 @@ impl HeadersMethods for Headers {
     // https://fetch.spec.whatwg.org/#dom-headers-delete
     fn Delete(&self, name: ByteString) -> ErrorResult {
         // Step 1
-        let valid_name = validate_name(name)?;
+        let (mut valid_name, valid_value) = validate_name_and_value(name, ByteString::new(vec![]))?;
+
+        valid_name = valid_name.to_lowercase();
+
         // Step 2
         if self.guard.get() == Guard::Immutable {
             return Err(Error::Type("Guard is immutable".to_string()));
         }
         // Step 3
-        if self.guard.get() == Guard::Request && is_forbidden_header_name(&valid_name) {
+        if self.guard.get() == Guard::Request &&
+            is_forbidden_request_header(&valid_name, &valid_value)
+        {
             return Ok(());
         }
         // Step 4
@@ -165,7 +180,7 @@ impl HeadersMethods for Headers {
         let valid_name = validate_name(name)?;
         Ok(
             get_value_from_header_list(&valid_name, &self.header_list.borrow())
-                .map(|v| ByteString::new(v)),
+                .map(ByteString::new),
         )
     }
 
@@ -199,7 +214,9 @@ impl HeadersMethods for Headers {
             return Err(Error::Type("Guard is immutable".to_string()));
         }
         // Step 4
-        if self.guard.get() == Guard::Request && is_forbidden_header_name(&valid_name) {
+        if self.guard.get() == Guard::Request &&
+            is_forbidden_request_header(&valid_name, &valid_value)
+        {
             return Ok(());
         }
         // Step 5
@@ -214,16 +231,26 @@ impl HeadersMethods for Headers {
         }
         // Step 7
         // https://fetch.spec.whatwg.org/#concept-header-list-set
-        self.header_list.borrow_mut().insert(
-            HeaderName::from_str(&valid_name).unwrap(),
-            HeaderValue::from_bytes(&valid_value).unwrap(),
-        );
+        match HeaderValue::from_bytes(&valid_value) {
+            Ok(value) => {
+                self.header_list
+                    .borrow_mut()
+                    .insert(HeaderName::from_str(&valid_name).unwrap(), value);
+            },
+            Err(_) => {
+                // can't add the header, but we don't need to panic the browser over it
+                warn!(
+                    "Servo thinks \"{:?}\" is a valid HTTP header value but HeaderValue doesn't.",
+                    valid_value
+                );
+            },
+        };
         Ok(())
     }
 }
 
 impl Headers {
-    pub fn copy_from_headers(&self, headers: DomRoot<Headers>) -> ErrorResult {
+    pub(crate) fn copy_from_headers(&self, headers: DomRoot<Headers>) -> ErrorResult {
         for (name, value) in headers.header_list.borrow().iter() {
             self.Append(
                 ByteString::new(Vec::from(name.as_str())),
@@ -234,7 +261,7 @@ impl Headers {
     }
 
     // https://fetch.spec.whatwg.org/#concept-headers-fill
-    pub fn fill(&self, filler: Option<HeadersInit>) -> ErrorResult {
+    pub(crate) fn fill(&self, filler: Option<HeadersInit>) -> ErrorResult {
         match filler {
             Some(HeadersInit::ByteStringSequenceSequence(v)) => {
                 for mut seq in v {
@@ -260,41 +287,41 @@ impl Headers {
         }
     }
 
-    pub fn for_request(global: &GlobalScope) -> DomRoot<Headers> {
-        let headers_for_request = Headers::new(global);
+    pub(crate) fn for_request(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Headers> {
+        let headers_for_request = Headers::new(global, can_gc);
         headers_for_request.guard.set(Guard::Request);
         headers_for_request
     }
 
-    pub fn for_response(global: &GlobalScope) -> DomRoot<Headers> {
-        let headers_for_response = Headers::new(global);
+    pub(crate) fn for_response(global: &GlobalScope, can_gc: CanGc) -> DomRoot<Headers> {
+        let headers_for_response = Headers::new(global, can_gc);
         headers_for_response.guard.set(Guard::Response);
         headers_for_response
     }
 
-    pub fn set_guard(&self, new_guard: Guard) {
+    pub(crate) fn set_guard(&self, new_guard: Guard) {
         self.guard.set(new_guard)
     }
 
-    pub fn get_guard(&self) -> Guard {
+    pub(crate) fn get_guard(&self) -> Guard {
         self.guard.get()
     }
 
-    pub fn set_headers(&self, hyper_headers: HyperHeaders) {
+    pub(crate) fn set_headers(&self, hyper_headers: HyperHeaders) {
         *self.header_list.borrow_mut() = hyper_headers;
     }
 
-    pub fn get_headers_list(&self) -> HyperHeaders {
+    pub(crate) fn get_headers_list(&self) -> HyperHeaders {
         self.header_list.borrow_mut().clone()
     }
 
     // https://fetch.spec.whatwg.org/#concept-header-extract-mime-type
-    pub fn extract_mime_type(&self) -> Vec<u8> {
-        extract_mime_type(&*self.header_list.borrow()).unwrap_or(vec![])
+    pub(crate) fn extract_mime_type(&self) -> Vec<u8> {
+        extract_mime_type(&self.header_list.borrow()).unwrap_or_default()
     }
 
     // https://fetch.spec.whatwg.org/#concept-header-list-sort-and-combine
-    pub fn sort_and_combine(&self) -> Vec<(String, Vec<u8>)> {
+    pub(crate) fn sort_and_combine(&self) -> Vec<(String, Vec<u8>)> {
         let borrowed_header_list = self.header_list.borrow();
         let mut header_vec = vec![];
 
@@ -314,7 +341,7 @@ impl Headers {
     }
 
     // https://fetch.spec.whatwg.org/#ref-for-privileged-no-cors-request-header-name
-    pub fn remove_privileged_no_cors_request_headers(&self) {
+    pub(crate) fn remove_privileged_no_cors_request_headers(&self) {
         // https://fetch.spec.whatwg.org/#privileged-no-cors-request-header-name
         self.header_list.borrow_mut().remove("range");
     }
@@ -342,17 +369,12 @@ impl Iterable for Headers {
     }
 }
 
-// https://fetch.spec.whatwg.org/#forbidden-response-header-name
-fn is_forbidden_response_header(name: &str) -> bool {
-    match name {
-        "set-cookie" | "set-cookie2" => true,
-        _ => false,
-    }
-}
-
-// https://fetch.spec.whatwg.org/#forbidden-header-name
-pub fn is_forbidden_header_name(name: &str) -> bool {
-    let disallowed_headers = [
+/// This function will internally convert `name` to lowercase for matching, so explicitly converting
+/// before calling is not necessary
+///
+/// <https://fetch.spec.whatwg.org/#forbidden-request-header>
+pub(crate) fn is_forbidden_request_header(name: &str, value: &[u8]) -> bool {
+    let forbidden_header_names = [
         "accept-charset",
         "accept-encoding",
         "access-control-request-headers",
@@ -373,14 +395,61 @@ pub fn is_forbidden_header_name(name: &str) -> bool {
         "transfer-encoding",
         "upgrade",
         "via",
+        // This list is defined in the fetch spec, however the draft spec for private-network-access
+        // proposes this additional forbidden name, which is currently included in WPT tests. See:
+        // https://wicg.github.io/private-network-access/#forbidden-header-names
+        "access-control-request-private-network",
     ];
 
-    let disallowed_header_prefixes = ["sec-", "proxy-"];
+    // Step 1: If name is a byte-case-insensitive match for one of (forbidden_header_names), return
+    // true
+    let lowercase_name = name.to_lowercase();
 
-    disallowed_headers.iter().any(|header| *header == name) ||
-        disallowed_header_prefixes
+    if forbidden_header_names
+        .iter()
+        .any(|header| *header == lowercase_name.as_str())
+    {
+        return true;
+    }
+
+    let forbidden_header_prefixes = ["sec-", "proxy-"];
+
+    // Step 2: If name when byte-lowercased starts with `proxy-` or `sec-`, then return true.
+    if forbidden_header_prefixes
+        .iter()
+        .any(|prefix| lowercase_name.starts_with(prefix))
+    {
+        return true;
+    }
+
+    let potentially_forbidden_header_names = [
+        "x-http-method",
+        "x-http-method-override",
+        "x-method-override",
+    ];
+
+    // Step 3: If name is a byte-case-insensitive match for one of (potentially_forbidden_header_names)
+    if potentially_forbidden_header_names
+        .iter()
+        .any(|header| *header == lowercase_name)
+    {
+        // Step 3.1: Let parsedValues be the result of getting, decoding, and splitting value.
+        let parsed_values = get_decode_and_split_header_value(value.to_vec());
+
+        // Step 3.2: For each method of parsedValues: if the isomorphic encoding of method is a
+        // forbidden method, then return true.
+        return parsed_values
             .iter()
-            .any(|prefix| name.starts_with(prefix))
+            .any(|s| is_forbidden_method(s.as_bytes()));
+    }
+
+    // Step 4: Return false.
+    false
+}
+
+// https://fetch.spec.whatwg.org/#forbidden-response-header-name
+fn is_forbidden_response_header(name: &str) -> bool {
+    matches!(name, "set-cookie" | "set-cookie2")
 }
 
 // There is some unresolved confusion over the definition of a name and a value.
@@ -446,7 +515,7 @@ fn index_of_last_non_whitespace(value: &ByteString) -> Option<usize> {
 
 // http://tools.ietf.org/html/rfc7230#section-3.2
 fn is_field_name(name: &ByteString) -> bool {
-    is_token(&*name)
+    is_token(name)
 }
 
 // https://fetch.spec.whatg.org/#concept-header-value
@@ -486,26 +555,20 @@ fn is_legal_header_value(value: &ByteString) -> bool {
 }
 
 // https://tools.ietf.org/html/rfc5234#appendix-B.1
-pub fn is_vchar(x: u8) -> bool {
-    match x {
-        0x21..=0x7E => true,
-        _ => false,
-    }
+pub(crate) fn is_vchar(x: u8) -> bool {
+    matches!(x, 0x21..=0x7E)
 }
 
 // http://tools.ietf.org/html/rfc7230#section-3.2.6
-pub fn is_obs_text(x: u8) -> bool {
-    match x {
-        0x80..=0xFF => true,
-        _ => false,
-    }
+pub(crate) fn is_obs_text(x: u8) -> bool {
+    matches!(x, 0x80..=0xFF)
 }
 
 // https://fetch.spec.whatwg.org/#concept-header-extract-mime-type
 // This function uses data_url::Mime to parse the MIME Type because
 // mime::Mime does not provide a parser following the Fetch spec
 // see https://github.com/hyperium/mime/issues/106
-pub fn extract_mime_type(headers: &HyperHeaders) -> Option<Vec<u8>> {
+pub(crate) fn extract_mime_type(headers: &HyperHeaders) -> Option<Vec<u8>> {
     let mut charset: Option<String> = None;
     let mut essence: String = "".to_string();
     let mut mime_type: Option<DataUrlMime> = None;
@@ -544,7 +607,7 @@ pub fn extract_mime_type(headers: &HyperHeaders) -> Option<Vec<u8>> {
                 // Step 6.4
                 if temp_essence != essence {
                     charset = temp_charset.map(|c| c.to_string());
-                    essence = temp_essence.to_owned();
+                    temp_essence.clone_into(&mut essence);
                 } else {
                     // Step 6.5
                     if temp_charset.is_none() && charset.is_some() {
@@ -567,5 +630,5 @@ pub fn extract_mime_type(headers: &HyperHeaders) -> Option<Vec<u8>> {
     }
 
     // Step 7, 8
-    return mime_type.map(|m| format!("{}", m).into_bytes());
+    mime_type.map(|m| format!("{}", m).into_bytes())
 }

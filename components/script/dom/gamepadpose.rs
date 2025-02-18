@@ -3,30 +3,30 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use dom_struct::dom_struct;
-use js::typedarray::Float32Array;
+use js::typedarray::{Float32, Float32Array};
 
-use super::bindings::typedarrays::HeapFloat32Array;
+use super::bindings::buffer_source::HeapBufferSource;
 use crate::dom::bindings::codegen::Bindings::GamepadPoseBinding::GamepadPoseMethods;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 #[dom_struct]
-pub struct GamepadPose {
+pub(crate) struct GamepadPose {
     reflector_: Reflector,
     #[ignore_malloc_size_of = "mozjs"]
-    position: HeapFloat32Array,
+    position: HeapBufferSource<Float32>,
     #[ignore_malloc_size_of = "mozjs"]
-    orientation: HeapFloat32Array,
+    orientation: HeapBufferSource<Float32>,
     #[ignore_malloc_size_of = "mozjs"]
-    linear_vel: HeapFloat32Array,
+    linear_vel: HeapBufferSource<Float32>,
     #[ignore_malloc_size_of = "mozjs"]
-    angular_vel: HeapFloat32Array,
+    angular_vel: HeapBufferSource<Float32>,
     #[ignore_malloc_size_of = "mozjs"]
-    linear_acc: HeapFloat32Array,
+    linear_acc: HeapBufferSource<Float32>,
     #[ignore_malloc_size_of = "mozjs"]
-    angular_acc: HeapFloat32Array,
+    angular_acc: HeapBufferSource<Float32>,
 }
 
 // TODO: support gamepad discovery
@@ -35,24 +35,28 @@ impl GamepadPose {
     fn new_inherited() -> GamepadPose {
         GamepadPose {
             reflector_: Reflector::new(),
-            position: HeapFloat32Array::default(),
-            orientation: HeapFloat32Array::default(),
-            linear_vel: HeapFloat32Array::default(),
-            angular_vel: HeapFloat32Array::default(),
-            linear_acc: HeapFloat32Array::default(),
-            angular_acc: HeapFloat32Array::default(),
+            position: HeapBufferSource::default(),
+            orientation: HeapBufferSource::default(),
+            linear_vel: HeapBufferSource::default(),
+            angular_vel: HeapBufferSource::default(),
+            linear_acc: HeapBufferSource::default(),
+            angular_acc: HeapBufferSource::default(),
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<GamepadPose> {
-        reflect_dom_object(Box::new(GamepadPose::new_inherited()), global)
+    pub(crate) fn new(global: &GlobalScope) -> DomRoot<GamepadPose> {
+        reflect_dom_object(
+            Box::new(GamepadPose::new_inherited()),
+            global,
+            CanGc::note(),
+        )
     }
 }
 
-impl GamepadPoseMethods for GamepadPose {
+impl GamepadPoseMethods<crate::DomTypeHolder> for GamepadPose {
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-position
     fn GetPosition(&self, _cx: JSContext) -> Option<Float32Array> {
-        self.position.internal_to_option()
+        self.position.buffer_to_option()
     }
 
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-hasposition
@@ -62,17 +66,17 @@ impl GamepadPoseMethods for GamepadPose {
 
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-linearvelocity
     fn GetLinearVelocity(&self, _cx: JSContext) -> Option<Float32Array> {
-        self.linear_vel.internal_to_option()
+        self.linear_vel.buffer_to_option()
     }
 
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-linearacceleration
     fn GetLinearAcceleration(&self, _cx: JSContext) -> Option<Float32Array> {
-        self.linear_acc.internal_to_option()
+        self.linear_acc.buffer_to_option()
     }
 
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-orientation
     fn GetOrientation(&self, _cx: JSContext) -> Option<Float32Array> {
-        self.orientation.internal_to_option()
+        self.orientation.buffer_to_option()
     }
 
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-orientation
@@ -82,11 +86,11 @@ impl GamepadPoseMethods for GamepadPose {
 
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-angularvelocity
     fn GetAngularVelocity(&self, _cx: JSContext) -> Option<Float32Array> {
-        self.angular_vel.internal_to_option()
+        self.angular_vel.buffer_to_option()
     }
 
     // https://w3c.github.io/gamepad/extensions.html#dom-gamepadpose-angularacceleration
     fn GetAngularAcceleration(&self, _cx: JSContext) -> Option<Float32Array> {
-        self.angular_acc.internal_to_option()
+        self.angular_acc.buffer_to_option()
     }
 }

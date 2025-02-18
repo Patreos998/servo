@@ -15,14 +15,15 @@ use crate::dom::bindings::codegen::Bindings::EXTColorBufferHalfFloatBinding::EXT
 use crate::dom::bindings::codegen::Bindings::WEBGLColorBufferFloatBinding::WEBGLColorBufferFloatConstants;
 use crate::dom::bindings::codegen::Bindings::WebGL2RenderingContextBinding::WebGL2RenderingContextConstants as constants;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::webglframebuffer::WebGLFramebuffer;
 use crate::dom::webglobject::WebGLObject;
 use crate::dom::webglrenderingcontext::{Operation, WebGLRenderingContext};
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct WebGLRenderbuffer {
+pub(crate) struct WebGLRenderbuffer {
     webgl_object: WebGLObject,
     #[no_trace]
     id: WebGLRenderbufferId,
@@ -38,7 +39,7 @@ impl WebGLRenderbuffer {
     fn new_inherited(context: &WebGLRenderingContext, id: WebGLRenderbufferId) -> Self {
         Self {
             webgl_object: WebGLObject::new_inherited(context),
-            id: id,
+            id,
             ever_bound: Cell::new(false),
             is_deleted: Cell::new(false),
             internal_format: Cell::new(None),
@@ -48,7 +49,7 @@ impl WebGLRenderbuffer {
         }
     }
 
-    pub fn maybe_new(context: &WebGLRenderingContext) -> Option<DomRoot<Self>> {
+    pub(crate) fn maybe_new(context: &WebGLRenderingContext) -> Option<DomRoot<Self>> {
         let (sender, receiver) = webgl_channel().unwrap();
         context.send_command(WebGLCommand::CreateRenderbuffer(sender));
         receiver
@@ -57,43 +58,44 @@ impl WebGLRenderbuffer {
             .map(|id| WebGLRenderbuffer::new(context, id))
     }
 
-    pub fn new(context: &WebGLRenderingContext, id: WebGLRenderbufferId) -> DomRoot<Self> {
+    pub(crate) fn new(context: &WebGLRenderingContext, id: WebGLRenderbufferId) -> DomRoot<Self> {
         reflect_dom_object(
             Box::new(WebGLRenderbuffer::new_inherited(context, id)),
             &*context.global(),
+            CanGc::note(),
         )
     }
 }
 
 impl WebGLRenderbuffer {
-    pub fn id(&self) -> WebGLRenderbufferId {
+    pub(crate) fn id(&self) -> WebGLRenderbufferId {
         self.id
     }
 
-    pub fn size(&self) -> Option<(i32, i32)> {
+    pub(crate) fn size(&self) -> Option<(i32, i32)> {
         self.size.get()
     }
 
-    pub fn internal_format(&self) -> u32 {
+    pub(crate) fn internal_format(&self) -> u32 {
         self.internal_format.get().unwrap_or(constants::RGBA4)
     }
 
-    pub fn mark_initialized(&self) {
+    pub(crate) fn mark_initialized(&self) {
         self.is_initialized.set(true);
     }
 
-    pub fn is_initialized(&self) -> bool {
+    pub(crate) fn is_initialized(&self) -> bool {
         self.is_initialized.get()
     }
 
-    pub fn bind(&self, target: u32) {
+    pub(crate) fn bind(&self, target: u32) {
         self.ever_bound.set(true);
         self.upcast::<WebGLObject>()
             .context()
             .send_command(WebGLCommand::BindRenderbuffer(target, Some(self.id)));
     }
 
-    pub fn delete(&self, operation_fallibility: Operation) {
+    pub(crate) fn delete(&self, operation_fallibility: Operation) {
         if !self.is_deleted.get() {
             self.is_deleted.set(true);
 
@@ -123,15 +125,15 @@ impl WebGLRenderbuffer {
         }
     }
 
-    pub fn is_deleted(&self) -> bool {
+    pub(crate) fn is_deleted(&self) -> bool {
         self.is_deleted.get()
     }
 
-    pub fn ever_bound(&self) -> bool {
+    pub(crate) fn ever_bound(&self) -> bool {
         self.ever_bound.get()
     }
 
-    pub fn storage(
+    pub(crate) fn storage(
         &self,
         api_type: GlType,
         sample_count: i32,
@@ -235,7 +237,7 @@ impl WebGLRenderbuffer {
                 ),
             );
             let samples = receiver.recv().unwrap();
-            if sample_count < 0 || sample_count > samples.get(0).cloned().unwrap_or(0) {
+            if sample_count < 0 || sample_count > samples.first().cloned().unwrap_or(0) {
                 return Err(WebGLError::InvalidOperation);
             }
         }
@@ -268,11 +270,11 @@ impl WebGLRenderbuffer {
         Ok(())
     }
 
-    pub fn attach_to_framebuffer(&self, fb: &WebGLFramebuffer) {
+    pub(crate) fn attach_to_framebuffer(&self, fb: &WebGLFramebuffer) {
         self.attached_framebuffer.set(Some(fb));
     }
 
-    pub fn detach_from_framebuffer(&self) {
+    pub(crate) fn detach_from_framebuffer(&self) {
         self.attached_framebuffer.set(None);
     }
 }

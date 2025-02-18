@@ -16,9 +16,10 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct ProgressEvent {
+pub(crate) struct ProgressEvent {
     event: Event,
     length_computable: bool,
     loaded: u64,
@@ -29,13 +30,14 @@ impl ProgressEvent {
     fn new_inherited(length_computable: bool, loaded: u64, total: u64) -> ProgressEvent {
         ProgressEvent {
             event: Event::new_inherited(),
-            length_computable: length_computable,
-            loaded: loaded,
-            total: total,
+            length_computable,
+            loaded,
+            total,
         }
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
         can_bubble: EventBubbles,
@@ -43,6 +45,7 @@ impl ProgressEvent {
         length_computable: bool,
         loaded: u64,
         total: u64,
+        can_gc: CanGc,
     ) -> DomRoot<ProgressEvent> {
         Self::new_with_proto(
             global,
@@ -53,9 +56,11 @@ impl ProgressEvent {
             length_computable,
             loaded,
             total,
+            can_gc,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -65,6 +70,7 @@ impl ProgressEvent {
         length_computable: bool,
         loaded: u64,
         total: u64,
+        can_gc: CanGc,
     ) -> DomRoot<ProgressEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(ProgressEvent::new_inherited(
@@ -74,6 +80,7 @@ impl ProgressEvent {
             )),
             global,
             proto,
+            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -81,11 +88,14 @@ impl ProgressEvent {
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl ProgressEventMethods<crate::DomTypeHolder> for ProgressEvent {
+    // https://xhr.spec.whatwg.org/#dom-progressevent-progressevent
+    fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &ProgressEventBinding::ProgressEventInit,
     ) -> Fallible<DomRoot<ProgressEvent>> {
@@ -100,12 +110,11 @@ impl ProgressEvent {
             init.lengthComputable,
             init.loaded,
             init.total,
+            can_gc,
         );
         Ok(ev)
     }
-}
 
-impl ProgressEventMethods for ProgressEvent {
     // https://xhr.spec.whatwg.org/#dom-progressevent-lengthcomputable
     fn LengthComputable(&self) -> bool {
         self.length_computable

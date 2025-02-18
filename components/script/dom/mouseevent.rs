@@ -16,7 +16,7 @@ use crate::dom::bindings::codegen::Bindings::MouseEventBinding::MouseEventMethod
 use crate::dom::bindings::codegen::Bindings::UIEventBinding::UIEventMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomGlobal};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
@@ -24,9 +24,10 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::node::Node;
 use crate::dom::uievent::UIEvent;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MouseEvent {
+pub(crate) struct MouseEvent {
     uievent: UIEvent,
     screen_x: Cell<i32>,
     screen_y: Cell<i32>,
@@ -50,7 +51,7 @@ pub struct MouseEvent {
 }
 
 impl MouseEvent {
-    pub fn new_inherited() -> MouseEvent {
+    pub(crate) fn new_inherited() -> MouseEvent {
         MouseEvent {
             uievent: UIEvent::new_inherited(),
             screen_x: Cell::new(0),
@@ -74,18 +75,20 @@ impl MouseEvent {
         }
     }
 
-    pub fn new_uninitialized(window: &Window) -> DomRoot<MouseEvent> {
-        Self::new_uninitialized_with_proto(window, None)
+    pub(crate) fn new_uninitialized(window: &Window, can_gc: CanGc) -> DomRoot<MouseEvent> {
+        Self::new_uninitialized_with_proto(window, None, can_gc)
     }
 
     fn new_uninitialized_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<MouseEvent> {
-        reflect_dom_object_with_proto(Box::new(MouseEvent::new_inherited()), window, proto)
+        reflect_dom_object_with_proto(Box::new(MouseEvent::new_inherited()), window, proto, can_gc)
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         window: &Window,
         type_: DOMString,
         can_bubble: EventBubbles,
@@ -104,6 +107,7 @@ impl MouseEvent {
         buttons: u16,
         related_target: Option<&EventTarget>,
         point_in_target: Option<Point2D<f32>>,
+        can_gc: CanGc,
     ) -> DomRoot<MouseEvent> {
         Self::new_with_proto(
             window,
@@ -125,9 +129,11 @@ impl MouseEvent {
             buttons,
             related_target,
             point_in_target,
+            can_gc,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -148,12 +154,13 @@ impl MouseEvent {
         buttons: u16,
         related_target: Option<&EventTarget>,
         point_in_target: Option<Point2D<f32>>,
+        can_gc: CanGc,
     ) -> DomRoot<MouseEvent> {
-        let ev = MouseEvent::new_uninitialized_with_proto(window, proto);
-        ev.InitMouseEvent(
+        let ev = MouseEvent::new_uninitialized_with_proto(window, proto, can_gc);
+        ev.initialize_mouse_event(
             type_,
-            bool::from(can_bubble),
-            bool::from(cancelable),
+            can_bubble,
+            cancelable,
             view,
             detail,
             screen_x,
@@ -165,20 +172,79 @@ impl MouseEvent {
             shift_key,
             meta_key,
             button,
+            buttons,
             related_target,
+            point_in_target,
         );
-        ev.buttons.set(buttons);
-        ev.point_in_target.set(point_in_target);
-        // TODO: Set proper values in https://github.com/servo/servo/issues/24415
-        ev.page_x.set(client_x);
-        ev.page_y.set(client_y);
         ev
     }
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+    /// <https://w3c.github.io/uievents/#initialize-a-mouseevent>
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn initialize_mouse_event(
+        &self,
+        type_: DOMString,
+        can_bubble: EventBubbles,
+        cancelable: EventCancelable,
+        view: Option<&Window>,
+        detail: i32,
+        screen_x: i32,
+        screen_y: i32,
+        client_x: i32,
+        client_y: i32,
+        ctrl_key: bool,
+        alt_key: bool,
+        shift_key: bool,
+        meta_key: bool,
+        button: i16,
+        buttons: u16,
+        related_target: Option<&EventTarget>,
+        point_in_target: Option<Point2D<f32>>,
+    ) {
+        self.uievent.initialize_ui_event(
+            type_,
+            view.map(|window| window.upcast::<EventTarget>()),
+            can_bubble,
+            cancelable,
+        );
+
+        self.uievent.set_detail(detail);
+
+        self.screen_x.set(screen_x);
+        self.screen_y.set(screen_y);
+        self.client_x.set(client_x);
+        self.client_y.set(client_y);
+        self.page_x.set(self.PageX());
+        self.page_y.set(self.PageY());
+
+        // skip setting flags as they are absent
+        self.shift_key.set(shift_key);
+        self.ctrl_key.set(ctrl_key);
+        self.alt_key.set(alt_key);
+        self.meta_key.set(meta_key);
+
+        self.button.set(button);
+        self.buttons.set(buttons);
+        // skip step 3: Initialize PointerLock attributes for MouseEvent with event,
+        // as movementX, movementY is absent
+
+        self.related_target.set(related_target);
+
+        // below is not in the spec
+        self.point_in_target.set(point_in_target);
+    }
+
+    pub(crate) fn point_in_target(&self) -> Option<Point2D<f32>> {
+        self.point_in_target.get()
+    }
+}
+
+impl MouseEventMethods<crate::DomTypeHolder> for MouseEvent {
+    // https://w3c.github.io/uievents/#dom-mouseevent-mouseevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &MouseEventBinding::MouseEventInit,
     ) -> Fallible<DomRoot<MouseEvent>> {
@@ -204,16 +270,11 @@ impl MouseEvent {
             init.buttons,
             init.relatedTarget.as_deref(),
             None,
+            can_gc,
         );
         Ok(event)
     }
 
-    pub fn point_in_target(&self) -> Option<Point2D<f32>> {
-        self.point_in_target.get()
-    }
-}
-
-impl MouseEventMethods for MouseEvent {
     // https://w3c.github.io/uievents/#widl-MouseEvent-screenX
     fn ScreenX(&self) -> i32 {
         self.screen_x.get()
@@ -267,13 +328,13 @@ impl MouseEventMethods for MouseEvent {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
-    fn OffsetX(&self) -> i32 {
+    fn OffsetX(&self, can_gc: CanGc) -> i32 {
         let event = self.upcast::<Event>();
         if event.dispatching() {
             match event.GetTarget() {
                 Some(target) => {
                     if let Some(node) = target.downcast::<Node>() {
-                        let rect = node.client_rect();
+                        let rect = node.client_rect(can_gc);
                         self.client_x.get() - rect.origin.x
                     } else {
                         self.offset_x.get()
@@ -287,13 +348,13 @@ impl MouseEventMethods for MouseEvent {
     }
 
     // https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsety
-    fn OffsetY(&self) -> i32 {
+    fn OffsetY(&self, can_gc: CanGc) -> i32 {
         let event = self.upcast::<Event>();
         if event.dispatching() {
             match event.GetTarget() {
                 Some(target) => {
                     if let Some(node) = target.downcast::<Node>() {
-                        let rect = node.client_rect();
+                        let rect = node.client_rect(can_gc);
                         self.client_y.get() - rect.origin.y
                     } else {
                         self.offset_y.get()
@@ -347,7 +408,7 @@ impl MouseEventMethods for MouseEvent {
     // This returns the same result as current gecko.
     // https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/which
     fn Which(&self) -> i32 {
-        if pref!(dom.mouse_event.which.enabled) {
+        if pref!(dom_mouse_event_which_enabled) {
             (self.button.get() + 1) as i32
         } else {
             0

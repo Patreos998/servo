@@ -7,14 +7,13 @@
 use std::fmt;
 
 use app_units::Au;
+use base::print_tree::PrintTree;
 use euclid::default::{Point2D, Rect, SideOffsets2D, Size2D};
-use gfx_traits::print_tree::PrintTree;
 use log::{debug, trace};
 use script_layout_interface::wrapper_traits::ThreadSafeLayoutNode;
 use serde::Serialize;
 use style::logical_geometry::{LogicalMargin, LogicalRect, LogicalSize, WritingMode};
 use style::properties::ComputedValues;
-use style::values::computed::length::Size;
 use style::values::computed::Color;
 use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
 use style::values::specified::BorderStyle;
@@ -27,8 +26,7 @@ use crate::display_list::{
 use crate::flow::{Flow, FlowClass, FlowFlags, GetBaseFlow, OpaqueFlow};
 use crate::fragment::{Fragment, FragmentBorderBoxIterator, Overflow};
 use crate::table::InternalTable;
-use crate::table_row::{CollapsedBorder, CollapsedBorderProvenance};
-use crate::{layout_debug, layout_debug_scope};
+use crate::table_row::{CollapsedBorder, CollapsedBorderFrom};
 
 #[allow(unsafe_code)]
 unsafe impl crate::flow::HasBaseFlow for TableCellFlow {}
@@ -73,9 +71,9 @@ impl TableCellFlow {
         TableCellFlow {
             block_flow: BlockFlow::from_fragment(fragment),
             collapsed_borders: CollapsedBordersForCell::new(),
-            column_span: node.get_colspan(),
-            row_span: node.get_rowspan(),
-            visible: visible,
+            column_span: node.get_colspan().unwrap_or(1),
+            row_span: node.get_rowspan().unwrap_or(1),
+            visible,
         }
     }
 
@@ -200,16 +198,14 @@ impl Flow for TableCellFlow {
     /// Minimum/preferred inline-sizes set by this function are used in automatic table layout
     /// calculation.
     fn bubble_inline_sizes(&mut self) {
-        let _scope = layout_debug_scope!(
-            "table_cell::bubble_inline_sizes {:x}",
-            self.block_flow.base.debug_id()
-        );
-
         self.block_flow.bubble_inline_sizes_for_block(true);
-        let specified_inline_size = match self.block_flow.fragment.style().content_inline_size() {
-            Size::Auto => Au(0),
-            Size::LengthPercentage(ref lp) => lp.to_used_value(Au(0)),
-        };
+        let specified_inline_size = self
+            .block_flow
+            .fragment
+            .style()
+            .content_inline_size()
+            .to_used_value(Au(0))
+            .unwrap_or(Au(0));
 
         if self
             .block_flow
@@ -248,10 +244,6 @@ impl Flow for TableCellFlow {
     /// When called on this context, the context has had its inline-size set by the parent table
     /// row.
     fn assign_inline_sizes(&mut self, layout_context: &LayoutContext) {
-        let _scope = layout_debug_scope!(
-            "table_cell::assign_inline_sizes {:x}",
-            self.block_flow.base.debug_id()
-        );
         debug!(
             "assign_inline_sizes({}): assigning inline_size for flow",
             "table_cell"
@@ -406,19 +398,19 @@ impl CollapsedBordersForCell {
     }
 
     fn should_paint_inline_start_border(&self) -> bool {
-        self.inline_start_border.provenance != CollapsedBorderProvenance::FromPreviousTableCell
+        self.inline_start_border.provenance != CollapsedBorderFrom::PreviousTableCell
     }
 
     fn should_paint_inline_end_border(&self) -> bool {
-        self.inline_end_border.provenance != CollapsedBorderProvenance::FromNextTableCell
+        self.inline_end_border.provenance != CollapsedBorderFrom::NextTableCell
     }
 
     fn should_paint_block_start_border(&self) -> bool {
-        self.block_start_border.provenance != CollapsedBorderProvenance::FromPreviousTableCell
+        self.block_start_border.provenance != CollapsedBorderFrom::PreviousTableCell
     }
 
     fn should_paint_block_end_border(&self) -> bool {
-        self.block_end_border.provenance != CollapsedBorderProvenance::FromNextTableCell
+        self.block_end_border.provenance != CollapsedBorderFrom::NextTableCell
     }
 
     pub fn adjust_border_widths_for_painting(&self, border_widths: &mut LogicalMargin<Au>) {
@@ -481,8 +473,8 @@ impl CollapsedBordersForCell {
         // FIXME(pcwalton): Get the real container size.
         let mut logical_bounds =
             LogicalRect::from_physical(writing_mode, *border_bounds, Size2D::new(Au(0), Au(0)));
-        logical_bounds.start.i = logical_bounds.start.i - inline_start_offset;
-        logical_bounds.start.b = logical_bounds.start.b - block_start_offset;
+        logical_bounds.start.i -= inline_start_offset;
+        logical_bounds.start.b -= block_start_offset;
         logical_bounds.size.inline =
             logical_bounds.size.inline + inline_start_offset + inline_end_offset;
         logical_bounds.size.block =

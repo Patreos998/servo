@@ -2,77 +2,96 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::ptr::NonNull;
-
 use dom_struct::dom_struct;
 use js::jsapi::{JSObject, Type};
 use js::rust::CustomAutoRooterGuard;
-use js::typedarray::ArrayBufferView;
+use js::typedarray::{ArrayBufferView, ArrayBufferViewU8, TypedArray};
 use servo_rand::{RngCore, ServoRng};
+use uuid::Uuid;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CryptoBinding::CryptoMethods;
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal, Reflector};
+use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::dom::subtlecrypto::SubtleCrypto;
+use crate::script_runtime::{CanGc, JSContext};
 
 // https://developer.mozilla.org/en-US/docs/Web/API/Crypto
 #[dom_struct]
-pub struct Crypto {
+pub(crate) struct Crypto {
     reflector_: Reflector,
-    #[ignore_malloc_size_of = "Defined in rand"]
     #[no_trace]
     rng: DomRefCell<ServoRng>,
+    subtle: MutNullableDom<SubtleCrypto>,
 }
 
 impl Crypto {
     fn new_inherited() -> Crypto {
         Crypto {
             reflector_: Reflector::new(),
-            rng: DomRefCell::new(ServoRng::new()),
+            rng: DomRefCell::new(ServoRng::default()),
+            subtle: MutNullableDom::default(),
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<Crypto> {
-        reflect_dom_object(Box::new(Crypto::new_inherited()), global)
+    pub(crate) fn new(global: &GlobalScope) -> DomRoot<Crypto> {
+        reflect_dom_object(Box::new(Crypto::new_inherited()), global, CanGc::note())
     }
 }
 
-impl CryptoMethods for Crypto {
+impl CryptoMethods<crate::DomTypeHolder> for Crypto {
+    /// <https://w3c.github.io/webcrypto/#dfn-Crypto-attribute-subtle>
+    fn Subtle(&self) -> DomRoot<SubtleCrypto> {
+        self.subtle.or_init(|| SubtleCrypto::new(&self.global()))
+    }
+
     #[allow(unsafe_code)]
-    // https://dvcs.w3.org/hg/webcrypto-api/raw-file/tip/spec/Overview.html#Crypto-method-getRandomValues
+    // https://w3c.github.io/webcrypto/#Crypto-method-getRandomValues
     fn GetRandomValues(
         &self,
         _cx: JSContext,
         mut input: CustomAutoRooterGuard<ArrayBufferView>,
-    ) -> Fallible<NonNull<JSObject>> {
+    ) -> Fallible<ArrayBufferView> {
         let array_type = input.get_array_type();
 
         if !is_integer_buffer(array_type) {
-            return Err(Error::TypeMismatch);
+            Err(Error::TypeMismatch)
         } else {
-            let mut data = unsafe { input.as_mut_slice() };
+            let data = unsafe { input.as_mut_slice() };
             if data.len() > 65536 {
                 return Err(Error::QuotaExceeded);
             }
-            self.rng.borrow_mut().fill_bytes(&mut data);
+            self.rng.borrow_mut().fill_bytes(data);
+            let underlying_object = unsafe { input.underlying_object() };
+            TypedArray::<ArrayBufferViewU8, *mut JSObject>::from(*underlying_object)
+                .map_err(|_| Error::JSFailed)
         }
+    }
 
-        unsafe { Ok(NonNull::new_unchecked(*input.underlying_object())) }
+    // https://w3c.github.io/webcrypto/#Crypto-method-randomUUID
+    fn RandomUUID(&self) -> DOMString {
+        let uuid = Uuid::new_v4();
+        uuid.hyphenated()
+            .encode_lower(&mut Uuid::encode_buffer())
+            .to_owned()
+            .into()
     }
 }
 
 fn is_integer_buffer(array_type: Type) -> bool {
-    match array_type {
+    matches!(
+        array_type,
         Type::Uint8 |
-        Type::Uint8Clamped |
-        Type::Int8 |
-        Type::Uint16 |
-        Type::Int16 |
-        Type::Uint32 |
-        Type::Int32 => true,
-        _ => false,
-    }
+            Type::Uint8Clamped |
+            Type::Int8 |
+            Type::Uint16 |
+            Type::Int16 |
+            Type::Uint32 |
+            Type::Int32 |
+            Type::BigInt64 |
+            Type::BigUint64
+    )
 }

@@ -8,14 +8,12 @@
 /android-toolchains
 /target
 /tests/wpt/reftests-report/report.html
-/ports/android/bin
-/ports/android/libs
-/ports/android/local.properties
-/ports/android/obj
 /python/_virtualenv*
 /python/_venv*
 /python/tidy/servo_tidy.egg-info
 /tests/wpt/sync
+/tests/wpt/**/**/.cache/
+/tests/dromaeo/dromaeo
 *.pkl
 *.pyc
 *.swp
@@ -26,9 +24,10 @@
 .coverage
 .DS_Store
 Servo.app
+servo.pftrace
 .config.mk.last
 /glfw
-capture_webrender/
+webrender-captures/
 /screenshots
 
 # Allow CSV files to be used as resources in tests
@@ -59,6 +58,7 @@ Session.vim
 Sessionx.vim
 
 /unminified-js
+/unminified-css
 
 # Layout debugger trace files
 layout_trace*

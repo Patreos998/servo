@@ -13,7 +13,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import urllib
 
 from mach.decorators import (
     CommandArgument,
@@ -22,17 +21,6 @@ from mach.decorators import (
 )
 
 from servo.command_base import CommandBase, cd, call
-
-VALID_TRY_BRACHES = [
-    "try",
-    "try-linux",
-    "try-mac",
-    "try-windows",
-    "try-wpt",
-    "try-wpt-2020",
-    "try-wpt-mac",
-    "try-wpt-mac-2020"
-]
 
 
 @CommandProvider
@@ -137,12 +125,12 @@ class MachCommands(CommandBase):
         self.ensure_clobbered()
         return self.run_cargo_build_like_command("fix", params, **kwargs)
 
-    @Command('cargo-clippy',
+    @Command('clippy',
              description='Run "cargo clippy"',
              category='devenv')
     @CommandArgument(
         'params', default=None, nargs='...',
-        help="Command-line arguments to be passed through to cargo-clippy")
+        help="Command-line arguments to be passed through to clippy")
     @CommandBase.common_command_arguments(build_configuration=True, build_type=False)
     def cargo_clippy(self, params, **kwargs):
         if not params:
@@ -150,7 +138,9 @@ class MachCommands(CommandBase):
 
         self.ensure_bootstrapped()
         self.ensure_clobbered()
-        return self.run_cargo_build_like_command("clippy", params, **kwargs)
+        env = self.build_env()
+        env['RUSTC'] = 'rustc'
+        return self.run_cargo_build_like_command("clippy", params, env=env, **kwargs)
 
     @Command('grep',
              description='`git grep` for selected directories.',
@@ -177,24 +167,6 @@ class MachCommands(CommandBase):
             ["git"] + ["grep"] + params + ['--'] + grep_paths + [':(exclude)*.min.js', ':(exclude)*.min.css'],
             env=self.build_env())
 
-    @Command('rustup',
-             description='Update the Rust version to latest Nightly',
-             category='devenv')
-    def rustup(self):
-        nightly_date = urllib.request.urlopen(
-            "https://static.rust-lang.org/dist/channel-rust-nightly-date.txt").read()
-        new_toolchain = f"nightly-{nightly_date.decode('utf-8')}"
-        old_toolchain = self.rust_toolchain()
-
-        filename = path.join(self.context.topdir, "rust-toolchain.toml")
-        with open(filename, "r", encoding="utf-8") as file:
-            contents = file.read()
-        contents = contents.replace(old_toolchain, new_toolchain)
-        with open(filename, "w", encoding="utf-8") as file:
-            file.write(contents)
-
-        self.ensure_bootstrapped()
-
     @Command('fetch',
              description='Fetch Rust, Cargo and Cargo dependencies',
              category='devenv')
@@ -214,7 +186,6 @@ class MachCommands(CommandBase):
             print(logfile + " doesn't exist")
             return -1
 
-        self.cross_compile_target = target
         env = self.build_env()
         ndk_stack = path.join(env["ANDROID_NDK"], "ndk-stack")
         self.setup_configuration_for_android_target(target)
@@ -235,8 +206,6 @@ class MachCommands(CommandBase):
     @CommandArgument('--target', action='store', default="armv7-linux-androideabi",
                      help="Build target")
     def ndk_gdb(self, release, target):
-        self.cross_compile_target = target
-        self.setup_configuration_for_android_target(target)
         env = self.build_env()
         ndk_gdb = path.join(env["ANDROID_NDK"], "ndk-gdb")
         adb_path = path.join(env["ANDROID_SDK"], "platform-tools", "adb")
@@ -277,45 +246,8 @@ class MachCommands(CommandBase):
             ndk_gdb,
             "--adb", adb_path,
             "--project", "support/android/apk/servoapp/src/main/",
-            "--launch", "org.mozilla.servo.MainActivity",
+            "--launch", "org.servo.servoshell.MainActivity",
             "-x", f.name,
             "--verbose",
         ], env=env)
         return p.wait()
-
-    @Command('try',
-             description='Runs try jobs by force pushing to personal fork try branches',
-             category='devenv')
-    @CommandArgument(
-        'jobs', default=["try"], nargs='...',
-        help="Name(s) of job(s) (ex: try, linux, mac, windows, wpt)")
-    def try_jobs(self, jobs):
-        branches = []
-        # we validate branches because force pushing is destructive
-        for job in jobs:
-            # branches must start with try-
-            if "try" not in job:
-                job = "try-" + job
-            if job not in VALID_TRY_BRACHES:
-                print(job + " job doesn't exist")
-                return -1
-            branches.append(job)
-        remote = "origin"
-        if "servo/servo" in subprocess.check_output(["git", "config", "--get", "remote.origin.url"]).decode():
-            # if we have servo/servo for origin check try remote
-            try:
-                if "servo/servo" in subprocess.check_output(["git", "config", "--get", "remote.try.url"]).decode():
-                    # User has servo/servo for try remote
-                    print("You should not use servo/servo for try remote!")
-                    return -1
-                else:
-                    remote = "try"
-            except subprocess.CalledProcessError:
-                print("It looks like you are patching in upstream servo.")
-                print("Set try remote to your personal fork with `git remote add try https://github.com/user/servo`")
-                return -1
-        for b in branches:
-            res = call(["git", "push", remote, "--force", f"HEAD:{b}"], env=self.build_env())
-            if res != 0:
-                return res
-        return 0

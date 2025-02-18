@@ -5,31 +5,31 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use canvas_traits::canvas::{CanvasId, CanvasMsg};
-use devtools_traits::{ScriptToDevtoolsControlMsg, WorkerId};
-use embedder_traits::{EmbedderMsg, MediaSessionEvent};
-use euclid::default::Size2D as UntypedSize2D;
-use euclid::Size2D;
-use gfx_traits::Epoch;
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
-use msg::constellation_msg::{
+use base::id::{
     BroadcastChannelRouterId, BrowsingContextId, HistoryStateId, MessagePortId,
     MessagePortRouterId, PipelineId, ServiceWorkerId, ServiceWorkerRegistrationId,
-    TopLevelBrowsingContextId, TraversalDirection,
+    TopLevelBrowsingContextId,
 };
-use net_traits::request::RequestBuilder;
+use base::Epoch;
+use canvas_traits::canvas::{CanvasId, CanvasMsg};
+use devtools_traits::{ScriptToDevtoolsControlMsg, WorkerId};
+use embedder_traits::{
+    EmbedderMsg, MediaSessionEvent, TouchAction, TouchEventType, TraversalDirection,
+};
+use euclid::default::Size2D as UntypedSize2D;
+use euclid::Size2D;
+use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use net_traits::storage_thread::StorageType;
 use net_traits::CoreResourceMsg;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
-use smallvec::SmallVec;
 use style_traits::CSSPixel;
-use webgpu::{wgpu, WebGPU, WebGPUResponseResult};
-use webrender_api::units::{DeviceIntPoint, DeviceIntSize};
+#[cfg(feature = "webgpu")]
+use webgpu::{wgc, WebGPU, WebGPUResponse};
 
 use crate::{
     AnimationState, AuxiliaryBrowsingContextLoadInfo, BroadcastMsg, DocumentState,
-    IFrameLoadInfoWithData, LayoutControlMsg, LoadData, MessagePortMsg, PortMessageTask,
+    IFrameLoadInfoWithData, LoadData, MessagePortMsg, NavigationHistoryBehavior, PortMessageTask,
     StructuredSerializedData, WindowSizeType, WorkerGlobalScopeInit, WorkerScriptLoadOrigin,
 };
 
@@ -47,8 +47,6 @@ pub struct IFrameSizeMsg {
 /// Messages from the layout to the constellation.
 #[derive(Deserialize, Serialize)]
 pub enum LayoutMsg {
-    /// Inform the constellation of the size of the iframe's viewport.
-    IFrameSizes(Vec<IFrameSizeMsg>),
     /// Requests that the constellation inform the compositor that it needs to record
     /// the time when the frame with the given ID (epoch) is painted.
     PendingPaintMetric(PipelineId, Epoch),
@@ -58,7 +56,6 @@ impl fmt::Debug for LayoutMsg {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         use self::LayoutMsg::*;
         let variant = match *self {
-            IFrameSizes(..) => "IFrameSizes",
             PendingPaintMetric(..) => "PendingPaintMetric",
         };
         write!(formatter, "LayoutMsg::{}", variant)
@@ -69,9 +66,9 @@ impl fmt::Debug for LayoutMsg {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum EventResult {
     /// Allowed by web content
-    DefaultAllowed,
+    DefaultAllowed(TouchAction),
     /// Prevented by web content
-    DefaultPrevented,
+    DefaultPrevented(TouchEventType),
 }
 
 /// A log entry reported to the constellation
@@ -85,15 +82,6 @@ pub enum LogEntry {
     Error(String),
     /// warning, with a reason
     Warn(String),
-}
-
-/// <https://html.spec.whatwg.org/multipage/#replacement-enabled>
-#[derive(Debug, Deserialize, Serialize)]
-pub enum HistoryEntryReplacement {
-    /// Traverse the history with replacement enabled.
-    Enabled,
-    /// Traverse the history with replacement disabled.
-    Disabled,
 }
 
 /// Messages from the script to the constellation.
@@ -141,9 +129,6 @@ pub enum ScriptMsg {
     ScheduleBroadcast(BroadcastChannelRouterId, BroadcastMsg),
     /// Forward a message to the embedder.
     ForwardToEmbedder(EmbedderMsg),
-    /// Requests are sent to constellation and fetches are checked manually
-    /// for cross-origin loads
-    InitiateNavigateRequest(RequestBuilder, /* cancellation_chan */ IpcReceiver<()>),
     /// Broadcast a storage event to every same-origin pipeline.
     /// The strings are key, old value and new value.
     BroadcastStorageEvent(
@@ -185,7 +170,7 @@ pub enum ScriptMsg {
     LoadComplete,
     /// A new load has been requested, with an option to replace the current entry once loaded
     /// instead of adding a new entry.
-    LoadUrl(LoadData, HistoryEntryReplacement),
+    LoadUrl(LoadData, NavigationHistoryBehavior),
     /// Abort loading after sending a LoadUrl message.
     AbortLoadUrl,
     /// Post a message to the currently active window of a given browsing context.
@@ -203,7 +188,7 @@ pub enum ScriptMsg {
         data: StructuredSerializedData,
     },
     /// Inform the constellation that a fragment was navigated to and whether or not it was a replacement navigation.
-    NavigatedToFragment(ServoUrl, HistoryEntryReplacement),
+    NavigatedToFragment(ServoUrl, NavigationHistoryBehavior),
     /// HTMLIFrameElement Forward or Back traversal.
     TraverseHistory(TraversalDirection),
     /// Inform the constellation of a pushed history state.
@@ -215,21 +200,20 @@ pub enum ScriptMsg {
     /// Notification that this iframe should be removed.
     /// Returns a list of pipelines which were closed.
     RemoveIFrame(BrowsingContextId, IpcSender<Vec<PipelineId>>),
-    /// Notifies constellation that an iframe's visibility has been changed.
-    VisibilityChangeComplete(bool),
+    /// Successful response to [crate::ConstellationControlMsg::SetThrottled].
+    SetThrottledComplete(bool),
     /// A load has been requested in an IFrame.
     ScriptLoadedURLInIFrame(IFrameLoadInfoWithData),
     /// A load of the initial `about:blank` has been completed in an IFrame.
-    ScriptNewIFrame(IFrameLoadInfoWithData, IpcSender<LayoutControlMsg>),
+    ScriptNewIFrame(IFrameLoadInfoWithData),
     /// Script has opened a new auxiliary browsing context.
-    ScriptNewAuxiliary(
-        AuxiliaryBrowsingContextLoadInfo,
-        IpcSender<LayoutControlMsg>,
-    ),
+    ScriptNewAuxiliary(AuxiliaryBrowsingContextLoadInfo),
     /// Mark a new document as active
     ActivateDocument,
     /// Set the document state for a pipeline (used by screenshot / reftests)
     SetDocumentState(DocumentState),
+    /// Update the layout epoch in the constellation (used by screenshot / reftests).
+    SetLayoutEpoch(Epoch, IpcSender<bool>),
     /// Update the pipeline Url, which can change after redirections.
     SetFinalUrl(ServoUrl),
     /// Script has handled a touch event, and either prevented or allowed default actions.
@@ -247,25 +231,23 @@ pub enum ScriptMsg {
     ForwardDOMMessage(DOMMessage, ServoUrl),
     /// <https://w3c.github.io/ServiceWorker/#schedule-job-algorithm>
     ScheduleJob(Job),
-    /// Get Window Informations size and position
-    GetClientWindow(IpcSender<(DeviceIntSize, DeviceIntPoint)>),
-    /// Get the screen size (pixel)
-    GetScreenSize(IpcSender<DeviceIntSize>),
-    /// Get the available screen size (pixel)
-    GetScreenAvailSize(IpcSender<DeviceIntSize>),
     /// Notifies the constellation about media session events
     /// (i.e. when there is metadata for the active media session, playback state changes...).
     MediaSessionEvent(PipelineId, MediaSessionEvent),
+    #[cfg(feature = "webgpu")]
     /// Create a WebGPU Adapter instance
     RequestAdapter(
-        IpcSender<Option<WebGPUResponseResult>>,
-        wgpu::instance::RequestAdapterOptions,
-        SmallVec<[wgpu::id::AdapterId; 4]>,
+        IpcSender<WebGPUResponse>,
+        wgc::instance::RequestAdapterOptions,
+        wgc::id::AdapterId,
     ),
+    #[cfg(feature = "webgpu")]
     /// Get WebGPU channel
     GetWebGPUChan(IpcSender<Option<WebGPU>>),
     /// Notify the constellation of a pipeline's document's title.
     TitleChanged(PipelineId, String),
+    /// Notify the constellation that the size of some `<iframe>`s has changed.
+    IFrameSizes(Vec<IFrameSizeMsg>),
 }
 
 impl fmt::Debug for ScriptMsg {
@@ -287,7 +269,6 @@ impl fmt::Debug for ScriptMsg {
             NewBroadcastChannelNameInRouter(..) => "NewBroadcastChannelNameInRouter",
             ScheduleBroadcast(..) => "ScheduleBroadcast",
             ForwardToEmbedder(..) => "ForwardToEmbedder",
-            InitiateNavigateRequest(..) => "InitiateNavigateRequest",
             BroadcastStorageEvent(..) => "BroadcastStorageEvent",
             ChangeRunningAnimationsState(..) => "ChangeRunningAnimationsState",
             CreateCanvasPaintThread(..) => "CreateCanvasPaintThread",
@@ -305,12 +286,13 @@ impl fmt::Debug for ScriptMsg {
             ReplaceHistoryState(..) => "ReplaceHistoryState",
             JointSessionHistoryLength(..) => "JointSessionHistoryLength",
             RemoveIFrame(..) => "RemoveIFrame",
-            VisibilityChangeComplete(..) => "VisibilityChangeComplete",
+            SetThrottledComplete(..) => "SetThrottledComplete",
             ScriptLoadedURLInIFrame(..) => "ScriptLoadedURLInIFrame",
             ScriptNewIFrame(..) => "ScriptNewIFrame",
             ScriptNewAuxiliary(..) => "ScriptNewAuxiliary",
             ActivateDocument => "ActivateDocument",
             SetDocumentState(..) => "SetDocumentState",
+            SetLayoutEpoch(..) => "SetLayoutEpoch",
             SetFinalUrl(..) => "SetFinalUrl",
             TouchEventProcessed(..) => "TouchEventProcessed",
             LogEntry(..) => "LogEntry",
@@ -319,13 +301,13 @@ impl fmt::Debug for ScriptMsg {
             PipelineExited => "PipelineExited",
             ForwardDOMMessage(..) => "ForwardDOMMessage",
             ScheduleJob(..) => "ScheduleJob",
-            GetClientWindow(..) => "GetClientWindow",
-            GetScreenSize(..) => "GetScreenSize",
-            GetScreenAvailSize(..) => "GetScreenAvailSize",
             MediaSessionEvent(..) => "MediaSessionEvent",
+            #[cfg(feature = "webgpu")]
             RequestAdapter(..) => "RequestAdapter",
+            #[cfg(feature = "webgpu")]
             GetWebGPUChan(..) => "GetWebGPUChan",
             TitleChanged(..) => "TitleChanged",
+            IFrameSizes(..) => "IFramSizes",
         };
         write!(formatter, "ScriptMsg::{}", variant)
     }
@@ -402,6 +384,7 @@ pub enum JobError {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)]
 /// Messages sent from Job algorithms steps running in the SW manager,
 /// in order to resolve or reject the job promise.
 pub enum JobResult {

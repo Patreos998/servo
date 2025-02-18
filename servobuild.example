@@ -14,6 +14,8 @@
 [build]
 # Set "mode = dev" or use `mach build --dev` to build the project with warning.
 # or Set "mode = release" or use `mach build --release` for optimized build.
+# Use `mode = <profile>` or `mach build --profile=<profile>` to build the given
+# profile. Check the `Cargo.toml` manifest for a complete list of custom profiles.
 # Defaults to prompting before building
 #mode = "dev"
 
@@ -59,3 +61,8 @@ media-stack = "auto"
 # Defaults to the value of $ANDROID_SDK_ROOT, $ANDROID_NDK_ROOT respectively
 #sdk = "/opt/android-sdk"
 #ndk = "/opt/android-ndk"
+
+# OpenHarmony
+[ohos]
+# Defaults to the value of $OHOS_SDK_NATIVE
+#ndk = "/path/to/ohos-sdk/<host-os>/native"

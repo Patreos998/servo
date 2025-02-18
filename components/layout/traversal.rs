@@ -18,7 +18,8 @@ use crate::construct::FlowConstructor;
 use crate::context::LayoutContext;
 use crate::display_list::DisplayListBuildState;
 use crate::flow::{Flow, FlowFlags, GetBaseFlow, ImmutableFlowUtils};
-use crate::wrapper::{GetStyleAndLayoutData, LayoutNodeLayoutData, ThreadSafeLayoutNodeHelpers};
+use crate::wrapper::ThreadSafeLayoutNodeHelpers;
+use crate::LayoutData;
 
 pub struct RecalcStyleAndConstructFlows<'a> {
     context: LayoutContext<'a>,
@@ -27,7 +28,7 @@ pub struct RecalcStyleAndConstructFlows<'a> {
 impl<'a> RecalcStyleAndConstructFlows<'a> {
     /// Creates a traversal context, taking ownership of the shared layout context.
     pub fn new(context: LayoutContext<'a>) -> Self {
-        RecalcStyleAndConstructFlows { context: context }
+        RecalcStyleAndConstructFlows { context }
     }
 
     pub fn context(&self) -> &LayoutContext<'a> {
@@ -42,7 +43,7 @@ impl<'a> RecalcStyleAndConstructFlows<'a> {
 }
 
 #[allow(unsafe_code)]
-impl<'a, 'dom, E> DomTraversal<E> for RecalcStyleAndConstructFlows<'a>
+impl<'dom, E> DomTraversal<E> for RecalcStyleAndConstructFlows<'_>
 where
     E: TElement,
     E::ConcreteNode: LayoutNode<'dom>,
@@ -58,7 +59,7 @@ where
     {
         // FIXME(pcwalton): Stop allocating here. Ideally this should just be
         // done by the HTML parser.
-        unsafe { node.initialize_data() };
+        unsafe { node.initialize_style_and_layout_data::<LayoutData>() };
 
         if !node.is_text_node() {
             let el = node.as_element().unwrap();
@@ -76,7 +77,7 @@ where
         // flow construction:
         // (1) They child doesn't yet have layout data (preorder traversal initializes it).
         // (2) The parent element has restyle damage (so the text flow also needs fixup).
-        node.get_style_and_layout_data().is_none() || !parent_data.damage.is_empty()
+        node.layout_data().is_none() || !parent_data.damage.is_empty()
     }
 
     fn shared_context(&self) -> &SharedStyleContext {
@@ -186,8 +187,12 @@ where
     fn process(&mut self, node: &ConcreteThreadSafeLayoutNode);
 }
 
-#[allow(unsafe_code)]
+/// # Safety
+///
+/// This function modifies the DOM node represented by the `node` argument, so it is imperitive
+/// that no other thread is modifying the node at the same time.
 #[inline]
+#[allow(unsafe_code)]
 pub unsafe fn construct_flows_at_ancestors<'dom>(
     context: &LayoutContext,
     mut node: impl LayoutNode<'dom>,
@@ -214,16 +219,12 @@ fn construct_flows_at<'dom>(context: &LayoutContext, node: impl LayoutNode<'dom>
         if nonincremental_layout ||
             tnode.restyle_damage() != RestyleDamage::empty() ||
             node.as_element()
-                .map_or(false, |el| el.has_dirty_descendants())
+                .is_some_and(|el| el.has_dirty_descendants())
         {
             let mut flow_constructor = FlowConstructor::new(context);
             if nonincremental_layout || !flow_constructor.repair_if_possible(&tnode) {
                 flow_constructor.process(&tnode);
-                debug!(
-                    "Constructed flow for {:?}: {:x}",
-                    tnode,
-                    tnode.flow_debug_id()
-                );
+                debug!("Constructed flow for {:?}", tnode,);
             }
         }
 
@@ -247,7 +248,7 @@ pub struct BubbleISizes<'a> {
     pub layout_context: &'a LayoutContext<'a>,
 }
 
-impl<'a> PostorderFlowTraversal for BubbleISizes<'a> {
+impl PostorderFlowTraversal for BubbleISizes<'_> {
     #[inline]
     fn process(&self, flow: &mut dyn Flow) {
         flow.bubble_inline_sizes();
@@ -270,7 +271,7 @@ pub struct AssignISizes<'a> {
     pub layout_context: &'a LayoutContext<'a>,
 }
 
-impl<'a> PreorderFlowTraversal for AssignISizes<'a> {
+impl PreorderFlowTraversal for AssignISizes<'_> {
     #[inline]
     fn process(&self, flow: &mut dyn Flow) {
         flow.assign_inline_sizes(self.layout_context);
@@ -292,7 +293,7 @@ pub struct AssignBSizes<'a> {
     pub layout_context: &'a LayoutContext<'a>,
 }
 
-impl<'a> PostorderFlowTraversal for AssignBSizes<'a> {
+impl PostorderFlowTraversal for AssignBSizes<'_> {
     #[inline]
     fn process(&self, flow: &mut dyn Flow) {
         // Can't do anything with anything that floats might flow through until we reach their
@@ -321,7 +322,7 @@ pub struct ComputeStackingRelativePositions<'a> {
     pub layout_context: &'a LayoutContext<'a>,
 }
 
-impl<'a> PreorderFlowTraversal for ComputeStackingRelativePositions<'a> {
+impl PreorderFlowTraversal for ComputeStackingRelativePositions<'_> {
     #[inline]
     fn should_process_subtree(&self, flow: &mut dyn Flow) -> bool {
         flow.base()
@@ -342,7 +343,7 @@ pub struct BuildDisplayList<'a> {
     pub state: DisplayListBuildState<'a>,
 }
 
-impl<'a> BuildDisplayList<'a> {
+impl BuildDisplayList<'_> {
     #[inline]
     pub fn traverse(&mut self, flow: &mut dyn Flow) {
         if flow.has_non_invertible_transform_or_zero_scale() {

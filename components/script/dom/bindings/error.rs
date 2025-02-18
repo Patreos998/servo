@@ -11,9 +11,7 @@ use backtrace::Backtrace;
 use js::error::{throw_range_error, throw_type_error};
 #[cfg(feature = "js_backtrace")]
 use js::jsapi::StackFormat as JSStackFormat;
-use js::jsapi::{
-    ExceptionStackBehavior, JSContext, JS_ClearPendingException, JS_IsExceptionPending,
-};
+use js::jsapi::{ExceptionStackBehavior, JS_ClearPendingException, JS_IsExceptionPending};
 use js::jsval::UndefinedValue;
 use js::rust::wrappers::{JS_ErrorFromException, JS_GetPendingException, JS_SetPendingException};
 use js::rust::{HandleObject, HandleValue, MutableHandleValue};
@@ -29,7 +27,7 @@ use crate::dom::bindings::str::USVString;
 use crate::dom::domexception::{DOMErrorName, DOMException};
 use crate::dom::globalscope::GlobalScope;
 use crate::realms::InRealm;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[cfg(feature = "js_backtrace")]
 thread_local! {
@@ -40,7 +38,7 @@ thread_local! {
 
 /// DOM exceptions that can be thrown by a native DOM method.
 #[derive(Clone, Debug, MallocSizeOf)]
-pub enum Error {
+pub(crate) enum Error {
     /// IndexSizeError DOMException
     IndexSize,
     /// NotFoundError DOMException
@@ -85,6 +83,8 @@ pub enum Error {
     InvalidModification,
     /// NotReadableError DOMException
     NotReadable,
+    /// DataError DOMException
+    Data,
     /// OperationError DOMException
     Operation,
 
@@ -98,14 +98,14 @@ pub enum Error {
 }
 
 /// The return type for IDL operations that can throw DOM exceptions.
-pub type Fallible<T> = Result<T, Error>;
+pub(crate) type Fallible<T> = Result<T, Error>;
 
 /// The return type for IDL operations that can throw DOM exceptions and
 /// return `()`.
-pub type ErrorResult = Fallible<()>;
+pub(crate) type ErrorResult = Fallible<()>;
 
 /// Set a pending exception for the given `result` on `cx`.
-pub fn throw_dom_exception(cx: SafeJSContext, global: &GlobalScope, result: Error) {
+pub(crate) fn throw_dom_exception(cx: SafeJSContext, global: &GlobalScope, result: Error) {
     #[cfg(feature = "js_backtrace")]
     unsafe {
         capture_stack!(in(*cx) let stack);
@@ -139,6 +139,7 @@ pub fn throw_dom_exception(cx: SafeJSContext, global: &GlobalScope, result: Erro
         Error::TypeMismatch => DOMErrorName::TypeMismatchError,
         Error::InvalidModification => DOMErrorName::InvalidModificationError,
         Error::NotReadable => DOMErrorName::NotReadableError,
+        Error::Data => DOMErrorName::DataError,
         Error::Operation => DOMErrorName::OperationError,
         Error::Type(message) => unsafe {
             assert!(!JS_IsExceptionPending(*cx));
@@ -166,42 +167,47 @@ pub fn throw_dom_exception(cx: SafeJSContext, global: &GlobalScope, result: Erro
 }
 
 /// A struct encapsulating information about a runtime script error.
-pub struct ErrorInfo {
+#[derive(Default)]
+pub(crate) struct ErrorInfo {
     /// The error message.
-    pub message: String,
+    pub(crate) message: String,
     /// The file name.
-    pub filename: String,
+    pub(crate) filename: String,
     /// The line number.
-    pub lineno: c_uint,
+    pub(crate) lineno: c_uint,
     /// The column number.
-    pub column: c_uint,
+    pub(crate) column: c_uint,
 }
 
 impl ErrorInfo {
-    unsafe fn from_native_error(object: HandleObject, cx: *mut JSContext) -> Option<ErrorInfo> {
-        let report = JS_ErrorFromException(cx, object);
+    fn from_native_error(object: HandleObject, cx: SafeJSContext) -> Option<ErrorInfo> {
+        let report = unsafe { JS_ErrorFromException(*cx, object) };
         if report.is_null() {
             return None;
         }
 
         let filename = {
-            let filename = (*report)._base.filename as *const u8;
+            let filename = unsafe { (*report)._base.filename.data_ as *const u8 };
             if !filename.is_null() {
-                let length = (0..).find(|idx| *filename.offset(*idx) == 0).unwrap();
-                let filename = from_raw_parts(filename, length as usize);
+                let filename = unsafe {
+                    let length = (0..).find(|idx| *filename.offset(*idx) == 0).unwrap();
+                    from_raw_parts(filename, length as usize)
+                };
                 String::from_utf8_lossy(filename).into_owned()
             } else {
                 "none".to_string()
             }
         };
 
-        let lineno = (*report)._base.lineno;
-        let column = (*report)._base.column;
+        let lineno = unsafe { (*report)._base.lineno };
+        let column = unsafe { (*report)._base.column._base };
 
         let message = {
-            let message = (*report)._base.message_.data_ as *const u8;
-            let length = (0..).find(|idx| *message.offset(*idx) == 0).unwrap();
-            let message = from_raw_parts(message, length as usize);
+            let message = unsafe { (*report)._base.message_.data_ as *const u8 };
+            let message = unsafe {
+                let length = (0..).find(|idx| *message.offset(*idx) == 0).unwrap();
+                from_raw_parts(message, length as usize)
+            };
             String::from_utf8_lossy(message).into_owned()
         };
 
@@ -213,8 +219,8 @@ impl ErrorInfo {
         })
     }
 
-    fn from_dom_exception(object: HandleObject, cx: *mut JSContext) -> Option<ErrorInfo> {
-        let exception = match root_from_object::<DOMException>(object.get(), cx) {
+    fn from_dom_exception(object: HandleObject, cx: SafeJSContext) -> Option<ErrorInfo> {
+        let exception = match root_from_object::<DOMException>(object.get(), *cx) {
             Ok(exception) => exception,
             Err(_) => return None,
         };
@@ -227,25 +233,25 @@ impl ErrorInfo {
         })
     }
 
-    unsafe fn from_object(object: HandleObject, cx: *mut JSContext) -> Option<ErrorInfo> {
+    fn from_object(object: HandleObject, cx: SafeJSContext) -> Option<ErrorInfo> {
         if let Some(info) = ErrorInfo::from_native_error(object, cx) {
             return Some(info);
         }
         if let Some(info) = ErrorInfo::from_dom_exception(object, cx) {
             return Some(info);
         }
-        return None;
+        None
     }
 
-    unsafe fn from_value(value: HandleValue, cx: *mut JSContext) -> ErrorInfo {
+    fn from_value(value: HandleValue, cx: SafeJSContext) -> ErrorInfo {
         if value.is_object() {
-            rooted!(in(cx) let object = value.to_object());
+            rooted!(in(*cx) let object = value.to_object());
             if let Some(info) = ErrorInfo::from_object(object.handle(), cx) {
                 return info;
             }
         }
 
-        match USVString::from_jsval(cx, value, ()) {
+        match unsafe { USVString::from_jsval(*cx, value, ()) } {
             Ok(ConversionResult::Success(USVString(string))) => ErrorInfo {
                 message: format!("uncaught exception: {}", string),
                 filename: String::new(),
@@ -263,25 +269,35 @@ impl ErrorInfo {
 ///
 /// The `dispatch_event` argument is temporary and non-standard; passing false
 /// prevents dispatching the `error` event.
-pub unsafe fn report_pending_exception(cx: *mut JSContext, dispatch_event: bool, realm: InRealm) {
-    if !JS_IsExceptionPending(cx) {
-        return;
+pub(crate) fn report_pending_exception(
+    cx: SafeJSContext,
+    dispatch_event: bool,
+    realm: InRealm,
+    can_gc: CanGc,
+) {
+    unsafe {
+        if !JS_IsExceptionPending(*cx) {
+            return;
+        }
     }
+    rooted!(in(*cx) let mut value = UndefinedValue());
 
-    rooted!(in(cx) let mut value = UndefinedValue());
-    if !JS_GetPendingException(cx, value.handle_mut()) {
-        JS_ClearPendingException(cx);
-        error!("Uncaught exception: JS_GetPendingException failed");
-        return;
+    unsafe {
+        if !JS_GetPendingException(*cx, value.handle_mut()) {
+            JS_ClearPendingException(*cx);
+            error!("Uncaught exception: JS_GetPendingException failed");
+            return;
+        }
+
+        JS_ClearPendingException(*cx);
     }
-
-    JS_ClearPendingException(cx);
     let error_info = ErrorInfo::from_value(value.handle(), cx);
 
     error!(
         "Error at {}:{}:{} {}",
         error_info.filename, error_info.lineno, error_info.column, error_info.message
     );
+
     #[cfg(feature = "js_backtrace")]
     {
         LAST_EXCEPTION_BACKTRACE.with(|backtrace| {
@@ -295,42 +311,49 @@ pub unsafe fn report_pending_exception(cx: *mut JSContext, dispatch_event: bool,
     }
 
     if dispatch_event {
-        GlobalScope::from_context(cx, realm).report_an_error(error_info, value.handle());
+        GlobalScope::from_safe_context(cx, realm).report_an_error(
+            error_info,
+            value.handle(),
+            can_gc,
+        );
     }
 }
 
 /// Throw an exception to signal that a `JSObject` can not be converted to a
 /// given DOM type.
-pub unsafe fn throw_invalid_this(cx: *mut JSContext, proto_id: u16) {
-    debug_assert!(!JS_IsExceptionPending(cx));
+pub(crate) fn throw_invalid_this(cx: SafeJSContext, proto_id: u16) {
+    debug_assert!(unsafe { !JS_IsExceptionPending(*cx) });
     let error = format!(
         "\"this\" object does not implement interface {}.",
         proto_id_to_name(proto_id)
     );
-    throw_type_error(cx, &error);
+    unsafe { throw_type_error(*cx, &error) };
 }
 
-pub unsafe fn throw_constructor_without_new(cx: *mut JSContext, name: &str) {
-    debug_assert!(!JS_IsExceptionPending(cx));
+pub(crate) fn throw_constructor_without_new(cx: SafeJSContext, name: &str) {
+    debug_assert!(unsafe { !JS_IsExceptionPending(*cx) });
     let error = format!("{} constructor: 'new' is required", name);
-    throw_type_error(cx, &error);
+    unsafe { throw_type_error(*cx, &error) };
 }
 
 impl Error {
     /// Convert this error value to a JS value, consuming it in the process.
-    pub unsafe fn to_jsval(
+    #[allow(clippy::wrong_self_convention)]
+    pub(crate) fn to_jsval(
         self,
-        cx: *mut JSContext,
+        cx: SafeJSContext,
         global: &GlobalScope,
         rval: MutableHandleValue,
     ) {
         match self {
             Error::JSFailed => (),
-            _ => assert!(!JS_IsExceptionPending(cx)),
+            _ => unsafe { assert!(!JS_IsExceptionPending(*cx)) },
         }
-        throw_dom_exception(SafeJSContext::from_ptr(cx), global, self);
-        assert!(JS_IsExceptionPending(cx));
-        assert!(JS_GetPendingException(cx, rval));
-        JS_ClearPendingException(cx);
+        throw_dom_exception(cx, global, self);
+        unsafe {
+            assert!(JS_IsExceptionPending(*cx));
+            assert!(JS_GetPendingException(*cx, rval));
+            JS_ClearPendingException(*cx);
+        }
     }
 }

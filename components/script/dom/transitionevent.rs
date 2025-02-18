@@ -18,9 +18,10 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct TransitionEvent {
+pub(crate) struct TransitionEvent {
     event: Event,
     #[no_trace]
     property_name: Atom,
@@ -33,17 +34,18 @@ impl TransitionEvent {
         TransitionEvent {
             event: Event::new_inherited(),
             property_name: Atom::from(init.propertyName.clone()),
-            elapsed_time: init.elapsedTime.clone(),
+            elapsed_time: init.elapsedTime,
             pseudo_element: init.pseudoElement.clone(),
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         type_: Atom,
         init: &TransitionEventInit,
+        can_gc: CanGc,
     ) -> DomRoot<TransitionEvent> {
-        Self::new_with_proto(window, None, type_, init)
+        Self::new_with_proto(window, None, type_, init, can_gc)
     }
 
     fn new_with_proto(
@@ -51,11 +53,13 @@ impl TransitionEvent {
         proto: Option<HandleObject>,
         type_: Atom,
         init: &TransitionEventInit,
+        can_gc: CanGc,
     ) -> DomRoot<TransitionEvent> {
         let ev = reflect_dom_object_with_proto(
             Box::new(TransitionEvent::new_inherited(init)),
             window,
             proto,
+            can_gc,
         );
         {
             let event = ev.upcast::<Event>();
@@ -63,11 +67,14 @@ impl TransitionEvent {
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl TransitionEventMethods<crate::DomTypeHolder> for TransitionEvent {
+    // https://drafts.csswg.org/css-transitions/#dom-transitionevent-transitionevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &TransitionEventInit,
     ) -> Fallible<DomRoot<TransitionEvent>> {
@@ -76,11 +83,10 @@ impl TransitionEvent {
             proto,
             Atom::from(type_),
             init,
+            can_gc,
         ))
     }
-}
 
-impl TransitionEventMethods for TransitionEvent {
     // https://drafts.csswg.org/css-transitions/#Events-TransitionEvent-propertyName
     fn PropertyName(&self) -> DOMString {
         DOMString::from(&*self.property_name)
@@ -88,7 +94,7 @@ impl TransitionEventMethods for TransitionEvent {
 
     // https://drafts.csswg.org/css-transitions/#Events-TransitionEvent-elapsedTime
     fn ElapsedTime(&self) -> Finite<f32> {
-        self.elapsed_time.clone()
+        self.elapsed_time
     }
 
     // https://drafts.csswg.org/css-transitions/#Events-TransitionEvent-pseudoElement

@@ -5,11 +5,11 @@
 use dom_struct::dom_struct;
 use servo_arc::Arc;
 use style::shared_lock::ToCssWithGuard;
-use style::stylesheets::MediaRule;
+use style::stylesheets::{CssRuleType, MediaRule};
 use style_traits::ToCss;
 
 use crate::dom::bindings::codegen::Bindings::CSSMediaRuleBinding::CSSMediaRuleMethods;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssconditionrule::CSSConditionRule;
@@ -17,9 +17,10 @@ use crate::dom::cssrule::SpecificCSSRule;
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::medialist::MediaList;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CSSMediaRule {
+pub(crate) struct CSSMediaRule {
     cssconditionrule: CSSConditionRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -32,13 +33,13 @@ impl CSSMediaRule {
         let list = mediarule.rules.clone();
         CSSMediaRule {
             cssconditionrule: CSSConditionRule::new_inherited(parent_stylesheet, list),
-            mediarule: mediarule,
+            mediarule,
             medialist: MutNullableDom::new(None),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         mediarule: Arc<MediaRule>,
@@ -46,6 +47,7 @@ impl CSSMediaRule {
         reflect_dom_object(
             Box::new(CSSMediaRule::new_inherited(parent_stylesheet, mediarule)),
             window,
+            CanGc::note(),
         )
     }
 
@@ -60,7 +62,7 @@ impl CSSMediaRule {
     }
 
     /// <https://drafts.csswg.org/css-conditional-3/#the-cssmediarule-interface>
-    pub fn get_condition_text(&self) -> DOMString {
+    pub(crate) fn get_condition_text(&self) -> DOMString {
         let guard = self.cssconditionrule.shared_lock().read();
         let list = self.mediarule.media_queries.read_with(&guard);
         list.to_css_string().into()
@@ -68,9 +70,8 @@ impl CSSMediaRule {
 }
 
 impl SpecificCSSRule for CSSMediaRule {
-    fn ty(&self) -> u16 {
-        use crate::dom::bindings::codegen::Bindings::CSSRuleBinding::CSSRuleConstants;
-        CSSRuleConstants::MEDIA_RULE
+    fn ty(&self) -> CssRuleType {
+        CssRuleType::Media
     }
 
     fn get_css(&self) -> DOMString {
@@ -79,7 +80,7 @@ impl SpecificCSSRule for CSSMediaRule {
     }
 }
 
-impl CSSMediaRuleMethods for CSSMediaRule {
+impl CSSMediaRuleMethods<crate::DomTypeHolder> for CSSMediaRule {
     // https://drafts.csswg.org/cssom/#dom-cssgroupingrule-media
     fn Media(&self) -> DomRoot<MediaList> {
         self.medialist()

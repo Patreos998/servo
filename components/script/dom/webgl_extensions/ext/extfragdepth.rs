@@ -6,12 +6,13 @@ use canvas_traits::webgl::{WebGLSLVersion, WebGLVersion};
 use dom_struct::dom_struct;
 
 use super::{WebGLExtension, WebGLExtensionSpec, WebGLExtensions};
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::webglrenderingcontext::WebGLRenderingContext;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct EXTFragDepth {
+pub(crate) struct EXTFragDepth {
     reflector_: Reflector,
 }
 
@@ -27,7 +28,11 @@ impl WebGLExtension for EXTFragDepth {
     type Extension = Self;
 
     fn new(ctx: &WebGLRenderingContext) -> DomRoot<Self> {
-        reflect_dom_object(Box::new(Self::new_inherited()), &*ctx.global())
+        reflect_dom_object(
+            Box::new(Self::new_inherited()),
+            &*ctx.global(),
+            CanGc::note(),
+        )
     }
 
     fn spec() -> WebGLExtensionSpec {

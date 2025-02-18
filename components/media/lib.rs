@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 #![deny(unsafe_code)]
+#![allow(clippy::type_complexity)]
 
 mod media_channel;
 mod media_thread;
@@ -11,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use euclid::default::Size2D;
 use serde::{Deserialize, Serialize};
-use servo_media::player::context::{GlApi, GlContext, NativeDisplay, PlayerGLContext};
+pub use servo_media::player::context::{GlApi, GlContext, NativeDisplay, PlayerGLContext};
 use webrender_traits::{
     WebrenderExternalImageApi, WebrenderExternalImageRegistry, WebrenderImageSource,
 };

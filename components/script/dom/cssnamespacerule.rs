@@ -5,7 +5,7 @@
 use dom_struct::dom_struct;
 use servo_arc::Arc;
 use style::shared_lock::ToCssWithGuard;
-use style::stylesheets::NamespaceRule;
+use style::stylesheets::{CssRuleType, NamespaceRule};
 
 use crate::dom::bindings::codegen::Bindings::CSSNamespaceRuleBinding::CSSNamespaceRuleMethods;
 use crate::dom::bindings::reflector::reflect_dom_object;
@@ -14,9 +14,10 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CSSNamespaceRule {
+pub(crate) struct CSSNamespaceRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -30,12 +31,12 @@ impl CSSNamespaceRule {
     ) -> CSSNamespaceRule {
         CSSNamespaceRule {
             cssrule: CSSRule::new_inherited(parent_stylesheet),
-            namespacerule: namespacerule,
+            namespacerule,
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         namespacerule: Arc<NamespaceRule>,
@@ -46,18 +47,19 @@ impl CSSNamespaceRule {
                 namespacerule,
             )),
             window,
+            CanGc::note(),
         )
     }
 }
 
-impl CSSNamespaceRuleMethods for CSSNamespaceRule {
+impl CSSNamespaceRuleMethods<crate::DomTypeHolder> for CSSNamespaceRule {
     // https://drafts.csswg.org/cssom/#dom-cssnamespacerule-prefix
     fn Prefix(&self) -> DOMString {
         self.namespacerule
             .prefix
             .as_ref()
             .map(|s| s.to_string().into())
-            .unwrap_or(DOMString::new())
+            .unwrap_or_default()
     }
 
     // https://drafts.csswg.org/cssom/#dom-cssnamespacerule-namespaceuri
@@ -67,9 +69,8 @@ impl CSSNamespaceRuleMethods for CSSNamespaceRule {
 }
 
 impl SpecificCSSRule for CSSNamespaceRule {
-    fn ty(&self) -> u16 {
-        use crate::dom::bindings::codegen::Bindings::CSSRuleBinding::CSSRuleConstants;
-        CSSRuleConstants::NAMESPACE_RULE
+    fn ty(&self) -> CssRuleType {
+        CssRuleType::Namespace
     }
 
     fn get_css(&self) -> DOMString {

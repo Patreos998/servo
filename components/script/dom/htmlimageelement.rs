@@ -5,47 +5,45 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::default::Default;
-use std::sync::{Arc, Mutex};
-use std::{char, i32, mem};
+use std::rc::Rc;
+use std::sync::Arc;
+use std::{char, mem};
 
 use app_units::{Au, AU_PER_PX};
 use cssparser::{Parser, ParserInput};
 use dom_struct::dom_struct;
 use euclid::Point2D;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix, QualName};
-use ipc_channel::ipc;
-use ipc_channel::ipc::IpcSender;
-use ipc_channel::router::ROUTER;
 use js::jsapi::JSAutoRealm;
 use js::rust::HandleObject;
 use mime::{self, Mime};
-use msg::constellation_msg::PipelineId;
-use net_traits::image::base::{Image, ImageMetadata};
+use net_traits::http_status::HttpStatus;
 use net_traits::image_cache::{
-    CorsStatus, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponse,
-    PendingImageId, PendingImageResponse, UsePlaceholder,
+    ImageCache, ImageCacheResult, ImageOrMetadataAvailable, ImageResponder, ImageResponse,
+    PendingImageId, UsePlaceholder,
 };
-use net_traits::request::{CorsSettings, Destination, Initiator, Referrer, RequestBuilder};
+use net_traits::request::{Destination, Initiator, RequestId};
 use net_traits::{
     FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError, ReferrerPolicy,
     ResourceFetchTiming, ResourceTimingType,
 };
 use num_traits::ToPrimitive;
-use servo_url::origin::{ImmutableOrigin, MutableOrigin};
+use pixels::{CorsStatus, Image, ImageMetadata};
+use servo_url::origin::MutableOrigin;
 use servo_url::ServoUrl;
-use style::attr::{
-    parse_double, parse_length, parse_unsigned_integer, AttrValue, LengthOrPercentageOrAuto,
-};
+use style::attr::{parse_integer, parse_length, AttrValue, LengthOrPercentageOrAuto};
 use style::context::QuirksMode;
 use style::media_queries::MediaList;
 use style::parser::ParserContext;
-use style::str::is_ascii_digit;
-use style::stylesheets::{CssRuleType, Origin};
+use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
 use style::values::specified::length::{Length, NoCalcLength};
 use style::values::specified::source_size_list::SourceSizeList;
 use style::values::specified::AbsoluteLength;
 use style_traits::ParsingMode;
+use url::Url;
 
+use super::domexception::DOMErrorName;
+use super::types::DOMException;
 use crate::document_loader::{LoadBlocker, LoadType};
 use crate::dom::activation::Activatable;
 use crate::dom::attr::Attr;
@@ -59,14 +57,14 @@ use crate::dom::bindings::codegen::Bindings::WindowBinding::WindowMethods;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::Trusted;
-use crate::dom::bindings::reflector::DomObject;
+use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{DomRoot, LayoutDom, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::document::{determine_policy_for_token, Document};
 use crate::dom::element::{
     cors_setting_for_element, referrer_policy_for_element, reflect_cross_origin_attribute,
-    set_cross_origin_attribute, AttributeMutation, CustomElementCreationMode, Element,
-    ElementCreator, LayoutElementHelpers,
+    reflect_referrer_policy_attribute, set_cross_origin_attribute, AttributeMutation,
+    CustomElementCreationMode, Element, ElementCreator, LayoutElementHelpers,
 };
 use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
@@ -78,29 +76,27 @@ use crate::dom::htmlmapelement::HTMLMapElement;
 use crate::dom::htmlpictureelement::HTMLPictureElement;
 use crate::dom::htmlsourceelement::HTMLSourceElement;
 use crate::dom::mouseevent::MouseEvent;
-use crate::dom::node::{
-    document_from_node, window_from_node, BindContext, Node, NodeDamage, ShadowIncluding,
-    UnbindContext,
-};
+use crate::dom::node::{BindContext, Node, NodeDamage, NodeTraits, ShadowIncluding, UnbindContext};
 use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::promise::Promise;
 use crate::dom::values::UNSIGNED_LONG_MAX;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
 use crate::fetch::create_a_potential_cors_request;
-use crate::image_listener::{generate_cache_listener_for_element, ImageCacheListener};
 use crate::microtask::{Microtask, MicrotaskRunnable};
-use crate::network_listener::{self, NetworkListener, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
 use crate::realms::enter_realm;
+use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
-use crate::task_source::TaskSource;
 
+#[derive(Clone, Copy, Debug)]
 enum ParseState {
     InDescriptor,
     InParens,
     AfterDescriptor,
 }
 
-pub struct SourceSet {
+pub(crate) struct SourceSet {
     image_sources: Vec<ImageSource>,
     source_size: SourceSizeList,
 }
@@ -122,8 +118,8 @@ pub struct ImageSource {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Descriptor {
-    pub wid: Option<u32>,
-    pub den: Option<f64>,
+    pub width: Option<u32>,
+    pub density: Option<f64>,
 }
 
 #[derive(Clone, Copy, JSTraceable, MallocSizeOf)]
@@ -141,13 +137,13 @@ enum ImageRequestPhase {
     Current,
 }
 #[derive(JSTraceable, MallocSizeOf)]
-#[crown::unrooted_must_root_lint::must_root]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct ImageRequest {
     state: State,
     #[no_trace]
     parsed_url: Option<ServoUrl>,
     source_url: Option<USVString>,
-    blocker: Option<LoadBlocker>,
+    blocker: DomRefCell<Option<LoadBlocker>>,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
     image: Option<Arc<Image>>,
@@ -158,7 +154,7 @@ struct ImageRequest {
     current_pixel_density: Option<f64>,
 }
 #[dom_struct]
-pub struct HTMLImageElement {
+pub(crate) struct HTMLImageElement {
     htmlelement: HTMLElement,
     image_request: Cell<ImageRequestPhase>,
     current_request: DomRefCell<ImageRequest>,
@@ -168,14 +164,16 @@ pub struct HTMLImageElement {
     #[ignore_malloc_size_of = "SourceSet"]
     source_set: DomRefCell<SourceSet>,
     last_selected_source: DomRefCell<Option<USVString>>,
+    #[ignore_malloc_size_of = "promises are hard"]
+    image_decode_promises: DomRefCell<Vec<Rc<Promise>>>,
 }
 
 impl HTMLImageElement {
-    pub fn get_url(&self) -> Option<ServoUrl> {
+    pub(crate) fn get_url(&self) -> Option<ServoUrl> {
         self.current_request.borrow().parsed_url.clone()
     }
     // https://html.spec.whatwg.org/multipage/#check-the-usability-of-the-image-argument
-    pub fn is_usable(&self) -> Fallible<bool> {
+    pub(crate) fn is_usable(&self) -> Fallible<bool> {
         // If image has an intrinsic width or intrinsic height (or both) equal to zero, then return bad.
         if let Some(image) = &self.current_request.borrow().image {
             if image.width == 0 || image.height == 0 {
@@ -190,6 +188,10 @@ impl HTMLImageElement {
             // If image is not fully decodable, then return bad.
             State::PartiallyAvailable | State::Unavailable => Ok(false),
         }
+    }
+
+    pub(crate) fn image_data(&self) -> Option<Arc<Image>> {
+        self.current_request.borrow().image.clone()
     }
 }
 
@@ -211,13 +213,19 @@ struct ImageContext {
 }
 
 impl FetchResponseListener for ImageContext {
-    fn process_request_body(&mut self) {}
-    fn process_request_eof(&mut self) {}
+    fn process_request_body(&mut self, _: RequestId) {}
+    fn process_request_eof(&mut self, _: RequestId) {}
 
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>) {
+    fn process_response(
+        &mut self,
+        request_id: RequestId,
+        metadata: Result<FetchMetadata, NetworkError>,
+    ) {
         debug!("got {:?} for {:?}", metadata.as_ref().map(|_| ()), self.url);
-        self.image_cache
-            .notify_pending_response(self.id, FetchResponseMsg::ProcessResponse(metadata.clone()));
+        self.image_cache.notify_pending_response(
+            self.id,
+            FetchResponseMsg::ProcessResponse(request_id, metadata.clone()),
+        );
 
         let metadata = metadata.ok().map(|meta| match meta {
             FetchMetadata::Unfiltered(m) => m,
@@ -234,33 +242,45 @@ impl FetchResponseListener for ImageContext {
             }
         }
 
-        let status_code = metadata
+        let status = metadata
             .as_ref()
-            .and_then(|m| m.status.as_ref().map(|&(code, _)| code))
-            .unwrap_or(0);
+            .map(|m| m.status.clone())
+            .unwrap_or_else(HttpStatus::new_error);
 
-        self.status = match status_code {
-            0 => Err(NetworkError::Internal(
-                "No http status code received".to_owned(),
-            )),
-            200..=299 => Ok(()), // HTTP ok status codes
-            _ => Err(NetworkError::Internal(format!(
-                "HTTP error code {}",
-                status_code
-            ))),
+        self.status = {
+            if status.is_error() {
+                Err(NetworkError::Internal(
+                    "No http status code received".to_owned(),
+                ))
+            } else if status.is_success() {
+                Ok(())
+            } else {
+                Err(NetworkError::Internal(format!(
+                    "HTTP error code {}",
+                    status.code()
+                )))
+            }
         };
     }
 
-    fn process_response_chunk(&mut self, payload: Vec<u8>) {
+    fn process_response_chunk(&mut self, request_id: RequestId, payload: Vec<u8>) {
         if self.status.is_ok() {
-            self.image_cache
-                .notify_pending_response(self.id, FetchResponseMsg::ProcessResponseChunk(payload));
+            self.image_cache.notify_pending_response(
+                self.id,
+                FetchResponseMsg::ProcessResponseChunk(request_id, payload),
+            );
         }
     }
 
-    fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>) {
-        self.image_cache
-            .notify_pending_response(self.id, FetchResponseMsg::ProcessResponseEOF(response));
+    fn process_response_eof(
+        &mut self,
+        request_id: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    ) {
+        self.image_cache.notify_pending_response(
+            self.id,
+            FetchResponseMsg::ProcessResponseEOF(request_id, response),
+        );
     }
 
     fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
@@ -272,7 +292,7 @@ impl FetchResponseListener for ImageContext {
     }
 
     fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self)
+        network_listener::submit_timing(self, CanGc::note())
     }
 }
 
@@ -295,46 +315,16 @@ impl PreInvoke for ImageContext {
     }
 }
 
-#[derive(PartialEq)]
-pub(crate) enum FromPictureOrSrcSet {
-    Yes,
-    No,
-}
-
-// https://html.spec.whatwg.org/multipage/#update-the-image-data steps 17-20
-// This function is also used to prefetch an image in `script::dom::servoparser::prefetch`.
-pub(crate) fn image_fetch_request(
-    img_url: ServoUrl,
-    origin: ImmutableOrigin,
-    referrer: Referrer,
-    pipeline_id: PipelineId,
-    cors_setting: Option<CorsSettings>,
-    referrer_policy: Option<ReferrerPolicy>,
-    from_picture_or_srcset: FromPictureOrSrcSet,
-) -> RequestBuilder {
-    let mut request =
-        create_a_potential_cors_request(img_url, Destination::Image, cors_setting, None, referrer)
-            .origin(origin)
-            .pipeline_id(Some(pipeline_id))
-            .referrer_policy(referrer_policy);
-    if from_picture_or_srcset == FromPictureOrSrcSet::Yes {
-        request = request.initiator(Initiator::ImageSet);
-    }
-    request
-}
-
 #[allow(non_snake_case)]
 impl HTMLImageElement {
     /// Update the current image with a valid URL.
-    fn fetch_image(&self, img_url: &ServoUrl) {
-        let window = window_from_node(self);
-        let image_cache = window.image_cache();
-        let sender = generate_cache_listener_for_element(self);
-        let cache_result = image_cache.track_image(
+    fn fetch_image(&self, img_url: &ServoUrl, can_gc: CanGc) {
+        let window = self.owner_window();
+
+        let cache_result = window.image_cache().get_cached_image_status(
             img_url.clone(),
             window.origin().immutable().clone(),
             cors_setting_for_element(self.upcast()),
-            sender,
             UsePlaceholder::Yes,
         );
 
@@ -345,74 +335,111 @@ impl HTMLImageElement {
                 is_placeholder,
             }) => {
                 if is_placeholder {
-                    self.process_image_response(ImageResponse::PlaceholderLoaded(image, url))
+                    self.process_image_response(
+                        ImageResponse::PlaceholderLoaded(image, url),
+                        can_gc,
+                    )
                 } else {
-                    self.process_image_response(ImageResponse::Loaded(image, url))
+                    self.process_image_response(ImageResponse::Loaded(image, url), can_gc)
                 }
             },
-            ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(m)) => {
-                self.process_image_response(ImageResponse::MetadataLoaded(m))
+            ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(
+                metadata,
+                id,
+            )) => {
+                self.process_image_response(ImageResponse::MetadataLoaded(metadata), can_gc);
+                self.register_image_cache_callback(id, ChangeType::Element);
             },
-            ImageCacheResult::Pending(_) => (),
-            ImageCacheResult::ReadyForRequest(id) => self.fetch_request(img_url, id),
-            ImageCacheResult::LoadError => self.process_image_response(ImageResponse::None),
+            ImageCacheResult::Pending(id) => {
+                self.register_image_cache_callback(id, ChangeType::Element);
+            },
+            ImageCacheResult::ReadyForRequest(id) => {
+                self.fetch_request(img_url, id);
+                self.register_image_cache_callback(id, ChangeType::Element);
+            },
+            ImageCacheResult::LoadError => self.process_image_response(ImageResponse::None, can_gc),
         };
     }
 
-    fn fetch_request(&self, img_url: &ServoUrl, id: PendingImageId) {
-        let document = document_from_node(self);
-        let window = window_from_node(self);
+    fn register_image_cache_callback(&self, id: PendingImageId, change_type: ChangeType) {
+        let trusted_node = Trusted::new(self);
+        let generation = self.generation_id();
+        let window = self.owner_window();
+        let sender = window.register_image_cache_listener(id, move |response| {
+            let trusted_node = trusted_node.clone();
+            let window = trusted_node.root().owner_window();
+            let callback_type = change_type.clone();
 
-        let context = Arc::new(Mutex::new(ImageContext {
+            window
+                .as_global_scope()
+                .task_manager()
+                .networking_task_source()
+                .queue(task!(process_image_response: move || {
+                let element = trusted_node.root();
+
+                // Ignore any image response for a previous request that has been discarded.
+                if generation != element.generation_id() {
+                    return;
+                }
+
+                match callback_type {
+                    ChangeType::Element => {
+                        element.process_image_response(response.response, CanGc::note());
+                    }
+                    ChangeType::Environment { selected_source, selected_pixel_density } => {
+                        element.process_image_response_for_environment_change(
+                            response.response, selected_source, generation, selected_pixel_density, CanGc::note()
+                        );
+                    }
+                }
+            }));
+        });
+
+        window
+            .image_cache()
+            .add_listener(ImageResponder::new(sender, window.pipeline_id(), id));
+    }
+
+    fn fetch_request(&self, img_url: &ServoUrl, id: PendingImageId) {
+        let document = self.owner_document();
+        let window = self.owner_window();
+
+        let context = ImageContext {
             image_cache: window.image_cache(),
             status: Ok(()),
-            id: id,
+            id,
             aborted: false,
             doc: Trusted::new(&document),
             resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
             url: img_url.clone(),
-        }));
-
-        let (action_sender, action_receiver) = ipc::channel().unwrap();
-        let (task_source, canceller) = document
-            .window()
-            .task_manager()
-            .networking_task_source_with_canceller();
-        let listener = NetworkListener {
-            context,
-            task_source,
-            canceller: Some(canceller),
         };
-        ROUTER.add_route(
-            action_receiver.to_opaque(),
-            Box::new(move |message| {
-                listener.notify_fetch(message.to().unwrap());
-            }),
-        );
 
-        let request = image_fetch_request(
+        // https://html.spec.whatwg.org/multipage/#update-the-image-data steps 17-20
+        // This function is also used to prefetch an image in `script::dom::servoparser::prefetch`.
+        let mut request = create_a_potential_cors_request(
+            Some(window.webview_id()),
             img_url.clone(),
-            document.origin().immutable().clone(),
-            document.global().get_referrer(),
-            document.global().pipeline_id(),
+            Destination::Image,
             cors_setting_for_element(self.upcast()),
-            referrer_policy_for_element(self.upcast()),
-            if Self::uses_srcset_or_picture(self.upcast()) {
-                FromPictureOrSrcSet::Yes
-            } else {
-                FromPictureOrSrcSet::No
-            },
-        );
+            None,
+            document.global().get_referrer(),
+            document.insecure_requests_policy(),
+        )
+        .origin(document.origin().immutable().clone())
+        .pipeline_id(Some(document.global().pipeline_id()))
+        .referrer_policy(referrer_policy_for_element(self.upcast()));
+
+        if Self::uses_srcset_or_picture(self.upcast()) {
+            request = request.initiator(Initiator::ImageSet);
+        }
 
         // This is a background load because the load blocker already fulfills the
         // purpose of delaying the document's load event.
-        document
-            .loader_mut()
-            .fetch_async_background(request, action_sender);
+        document.fetch_background(request, context);
     }
 
     // Steps common to when an image has been loaded.
-    fn handle_loaded_image(&self, image: Arc<Image>, url: ServoUrl) {
+    fn handle_loaded_image(&self, image: Arc<Image>, url: ServoUrl, can_gc: CanGc) {
         self.current_request.borrow_mut().metadata = Some(ImageMetadata {
             height: image.height,
             width: image.width,
@@ -420,33 +447,34 @@ impl HTMLImageElement {
         self.current_request.borrow_mut().final_url = Some(url);
         self.current_request.borrow_mut().image = Some(image);
         self.current_request.borrow_mut().state = State::CompletelyAvailable;
-        LoadBlocker::terminate(&mut self.current_request.borrow_mut().blocker);
+        LoadBlocker::terminate(&self.current_request.borrow().blocker, can_gc);
         // Mark the node dirty
         self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
+        self.resolve_image_decode_promises();
     }
 
     /// Step 24 of <https://html.spec.whatwg.org/multipage/#update-the-image-data>
-    fn process_image_response(&self, image: ImageResponse) {
+    fn process_image_response(&self, image: ImageResponse, can_gc: CanGc) {
         // TODO: Handle multipart/x-mixed-replace
         let (trigger_image_load, trigger_image_error) = match (image, self.image_request.get()) {
             (ImageResponse::Loaded(image, url), ImageRequestPhase::Current) => {
-                self.handle_loaded_image(image, url);
+                self.handle_loaded_image(image, url, can_gc);
                 (true, false)
             },
             (ImageResponse::PlaceholderLoaded(image, url), ImageRequestPhase::Current) => {
-                self.handle_loaded_image(image, url);
+                self.handle_loaded_image(image, url, can_gc);
                 (false, true)
             },
             (ImageResponse::Loaded(image, url), ImageRequestPhase::Pending) => {
-                self.abort_request(State::Unavailable, ImageRequestPhase::Pending);
+                self.abort_request(State::Unavailable, ImageRequestPhase::Pending, can_gc);
                 self.image_request.set(ImageRequestPhase::Current);
-                self.handle_loaded_image(image, url);
+                self.handle_loaded_image(image, url, can_gc);
                 (true, false)
             },
             (ImageResponse::PlaceholderLoaded(image, url), ImageRequestPhase::Pending) => {
-                self.abort_request(State::Unavailable, ImageRequestPhase::Pending);
+                self.abort_request(State::Unavailable, ImageRequestPhase::Pending, can_gc);
                 self.image_request.set(ImageRequestPhase::Current);
-                self.handle_loaded_image(image, url);
+                self.handle_loaded_image(image, url, can_gc);
                 (false, true)
             },
             (ImageResponse::MetadataLoaded(meta), ImageRequestPhase::Current) => {
@@ -459,12 +487,12 @@ impl HTMLImageElement {
                 (false, false)
             },
             (ImageResponse::None, ImageRequestPhase::Current) => {
-                self.abort_request(State::Broken, ImageRequestPhase::Current);
+                self.abort_request(State::Broken, ImageRequestPhase::Current, can_gc);
                 (false, true)
             },
             (ImageResponse::None, ImageRequestPhase::Pending) => {
-                self.abort_request(State::Broken, ImageRequestPhase::Current);
-                self.abort_request(State::Broken, ImageRequestPhase::Pending);
+                self.abort_request(State::Broken, ImageRequestPhase::Current, can_gc);
+                self.abort_request(State::Broken, ImageRequestPhase::Pending, can_gc);
                 self.image_request.set(ImageRequestPhase::Current);
                 (false, true)
             },
@@ -473,19 +501,21 @@ impl HTMLImageElement {
         // Fire image.onload and loadend
         if trigger_image_load {
             // TODO: https://html.spec.whatwg.org/multipage/#fire-a-progress-event-or-event
-            self.upcast::<EventTarget>().fire_event(atom!("load"));
-            self.upcast::<EventTarget>().fire_event(atom!("loadend"));
+            self.upcast::<EventTarget>()
+                .fire_event(atom!("load"), can_gc);
+            self.upcast::<EventTarget>()
+                .fire_event(atom!("loadend"), can_gc);
         }
 
         // Fire image.onerror
         if trigger_image_error {
-            self.upcast::<EventTarget>().fire_event(atom!("error"));
-            self.upcast::<EventTarget>().fire_event(atom!("loadend"));
+            self.upcast::<EventTarget>()
+                .fire_event(atom!("error"), can_gc);
+            self.upcast::<EventTarget>()
+                .fire_event(atom!("loadend"), can_gc);
         }
 
-        // Trigger reflow
-        let window = window_from_node(self);
-        window.add_pending_reflow();
+        self.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
     }
 
     fn process_image_response_for_environment_change(
@@ -494,6 +524,7 @@ impl HTMLImageElement {
         src: USVString,
         generation: u32,
         selected_pixel_density: f64,
+        can_gc: CanGc,
     ) {
         match image {
             ImageResponse::Loaded(image, url) | ImageResponse::PlaceholderLoaded(image, url) => {
@@ -509,21 +540,27 @@ impl HTMLImageElement {
                 self.pending_request.borrow_mut().metadata = Some(meta);
             },
             ImageResponse::None => {
-                self.abort_request(State::Unavailable, ImageRequestPhase::Pending);
+                self.abort_request(State::Unavailable, ImageRequestPhase::Pending, can_gc);
             },
         };
     }
 
     /// <https://html.spec.whatwg.org/multipage/#abort-the-image-request>
-    fn abort_request(&self, state: State, request: ImageRequestPhase) {
+    fn abort_request(&self, state: State, request: ImageRequestPhase, can_gc: CanGc) {
         let mut request = match request {
             ImageRequestPhase::Current => self.current_request.borrow_mut(),
             ImageRequestPhase::Pending => self.pending_request.borrow_mut(),
         };
-        LoadBlocker::terminate(&mut request.blocker);
+        LoadBlocker::terminate(&request.blocker, can_gc);
         request.state = state;
         request.image = None;
         request.metadata = None;
+
+        if matches!(state, State::Broken) {
+            self.reject_image_decode_promises();
+        } else if matches!(state, State::CompletelyAvailable) {
+            self.resolve_image_decode_promises();
+        }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#update-the-source-set>
@@ -544,10 +581,10 @@ impl HTMLImageElement {
                         .map(|n| DomRoot::from_ref(&*n))
                         .collect()
                 } else {
-                    vec![DomRoot::from_ref(&*elem)]
+                    vec![DomRoot::from_ref(elem)]
                 }
             },
-            None => vec![DomRoot::from_ref(&*elem)],
+            None => vec![DomRoot::from_ref(elem)],
         };
 
         // Step 3
@@ -565,7 +602,7 @@ impl HTMLImageElement {
         // Step 4
         for element in &elements {
             // Step 4.1
-            if *element == DomRoot::from_ref(&*elem) {
+            if *element == DomRoot::from_ref(elem) {
                 let mut source_set = SourceSet::new();
                 // Step 4.1.1
                 if let Some(x) = element.get_attribute(&ns!(), &local_name!("srcset")) {
@@ -584,17 +621,17 @@ impl HTMLImageElement {
                 let no_density_source_of_1 = source_set
                     .image_sources
                     .iter()
-                    .all(|source| source.descriptor.den != Some(1.));
+                    .all(|source| source.descriptor.density != Some(1.));
                 let no_width_descriptor = source_set
                     .image_sources
                     .iter()
-                    .all(|source| source.descriptor.wid.is_none());
+                    .all(|source| source.descriptor.width.is_none());
                 if !is_src_empty && no_density_source_of_1 && no_width_descriptor {
                     source_set.image_sources.push(ImageSource {
                         url: src_attribute.to_string(),
                         descriptor: Descriptor {
-                            wid: None,
-                            den: None,
+                            width: None,
+                            density: None,
                         },
                     })
                 }
@@ -667,18 +704,17 @@ impl HTMLImageElement {
         source_size_list: &mut SourceSizeList,
         _width: Option<Length>,
     ) -> Au {
-        let document = document_from_node(self);
-        let device = document.device();
+        let document = self.owner_document();
         let quirks_mode = document.quirks_mode();
-        //FIXME https://github.com/whatwg/html/issues/3832
-        source_size_list.evaluate(&device, quirks_mode)
+        let result = source_size_list.evaluate(document.window().layout().device(), quirks_mode);
+        result
     }
 
     /// <https://html.spec.whatwg.org/multipage/#matches-the-environment>
     fn matches_environment(&self, media_query: String) -> bool {
-        let document = document_from_node(self);
+        let document = self.owner_document();
         let quirks_mode = document.quirks_mode();
-        let document_url = &document.url();
+        let document_url_data = UrlExtraData(document.url().get_arc());
         // FIXME(emilio): This should do the same that we do for other media
         // lists regarding the rule type and such, though it doesn't really
         // matter right now...
@@ -686,7 +722,7 @@ impl HTMLImageElement {
         // Also, ParsingMode::all() is wrong, and should be DEFAULT.
         let context = ParserContext::new(
             Origin::Author,
-            document_url,
+            &document_url_data,
             Some(CssRuleType::Style),
             ParsingMode::all(),
             quirks_mode,
@@ -697,30 +733,31 @@ impl HTMLImageElement {
         let mut parserInput = ParserInput::new(&media_query);
         let mut parser = Parser::new(&mut parserInput);
         let media_list = MediaList::parse(&context, &mut parser);
-        media_list.evaluate(&document.device(), quirks_mode)
+        let result = media_list.evaluate(document.window().layout().device(), quirks_mode);
+        result
     }
 
     /// <https://html.spec.whatwg.org/multipage/#normalise-the-source-densities>
     fn normalise_source_densities(&self, source_set: &mut SourceSet, width: Option<Length>) {
         // Step 1
-        let mut source_size = &mut source_set.source_size;
+        let source_size = &mut source_set.source_size;
 
         // Find source_size_length for Step 2.2
-        let source_size_length = self.evaluate_source_size_list(&mut source_size, width);
+        let source_size_length = self.evaluate_source_size_list(source_size, width);
 
         // Step 2
         for imgsource in &mut source_set.image_sources {
             // Step 2.1
-            if imgsource.descriptor.den.is_some() {
+            if imgsource.descriptor.density.is_some() {
                 continue;
             }
             // Step 2.2
-            if imgsource.descriptor.wid.is_some() {
-                let wid = imgsource.descriptor.wid.unwrap();
-                imgsource.descriptor.den = Some(wid as f64 / source_size_length.to_f64_px());
+            if imgsource.descriptor.width.is_some() {
+                let wid = imgsource.descriptor.width.unwrap();
+                imgsource.descriptor.density = Some(wid as f64 / source_size_length.to_f64_px());
             } else {
                 //Step 2.3
-                imgsource.descriptor.den = Some(1 as f64);
+                imgsource.descriptor.density = Some(1_f64);
             }
         }
     }
@@ -744,10 +781,10 @@ impl HTMLImageElement {
                 continue;
             }
             let imgsource = &source_set.image_sources[outer_index];
-            let pixel_density = imgsource.descriptor.den.unwrap();
+            let pixel_density = imgsource.descriptor.density.unwrap();
             for inner_index in (outer_index + 1)..len {
                 let imgsource2 = &source_set.image_sources[inner_index];
-                if pixel_density == imgsource2.descriptor.den.unwrap() {
+                if pixel_density == imgsource2.descriptor.density.unwrap() {
                     repeat_indices.insert(inner_index);
                 }
             }
@@ -759,7 +796,7 @@ impl HTMLImageElement {
             if repeat_indices.contains(&index) {
                 continue;
             }
-            let den = image_source.descriptor.den.unwrap();
+            let den = image_source.descriptor.density.unwrap();
             if max.0 < den {
                 max = (den, img_sources.len());
             }
@@ -768,18 +805,22 @@ impl HTMLImageElement {
 
         // Step 5
         let mut best_candidate = max;
-        let device = document_from_node(self).device();
-        let device_den = device.device_pixel_ratio().get() as f64;
+        let device_pixel_ratio = self
+            .owner_document()
+            .window()
+            .window_size()
+            .device_pixel_ratio
+            .get() as f64;
         for (index, image_source) in img_sources.iter().enumerate() {
-            let current_den = image_source.descriptor.den.unwrap();
-            if current_den < best_candidate.0 && current_den >= device_den {
+            let current_den = image_source.descriptor.density.unwrap();
+            if current_den < best_candidate.0 && current_den >= device_pixel_ratio {
                 best_candidate = (current_den, index);
             }
         }
         let selected_source = img_sources.remove(best_candidate.1).clone();
         Some((
             USVString(selected_source.url),
-            selected_source.descriptor.den.unwrap() as f64,
+            selected_source.descriptor.density.unwrap(),
         ))
     }
 
@@ -788,18 +829,26 @@ impl HTMLImageElement {
         request: &mut RefMut<ImageRequest>,
         url: &ServoUrl,
         src: &USVString,
+        can_gc: CanGc,
     ) {
         request.parsed_url = Some(url.clone());
         request.source_url = Some(src.clone());
         request.image = None;
         request.metadata = None;
-        let document = document_from_node(self);
-        LoadBlocker::terminate(&mut request.blocker);
-        request.blocker = Some(LoadBlocker::new(&*document, LoadType::Image(url.clone())));
+        let document = self.owner_document();
+        LoadBlocker::terminate(&request.blocker, can_gc);
+        *request.blocker.borrow_mut() =
+            Some(LoadBlocker::new(&document, LoadType::Image(url.clone())));
     }
 
     /// Step 13-17 of html.spec.whatwg.org/multipage/#update-the-image-data
-    fn prepare_image_request(&self, url: &ServoUrl, src: &USVString, selected_pixel_density: f64) {
+    fn prepare_image_request(
+        &self,
+        url: &ServoUrl,
+        src: &USVString,
+        selected_pixel_density: f64,
+        can_gc: CanGc,
+    ) {
         match self.image_request.get() {
             ImageRequestPhase::Pending => {
                 if let Some(pending_url) = self.pending_request.borrow().parsed_url.clone() {
@@ -820,63 +869,60 @@ impl HTMLImageElement {
                             // Step 15 abort pending request
                             pending_request.image = None;
                             pending_request.parsed_url = None;
-                            LoadBlocker::terminate(&mut pending_request.blocker);
+                            LoadBlocker::terminate(&pending_request.blocker, can_gc);
                             // TODO: queue a task to restart animation, if restart-animation is set
                             return;
                         }
                         pending_request.current_pixel_density = Some(selected_pixel_density);
                         self.image_request.set(ImageRequestPhase::Pending);
-                        self.init_image_request(&mut pending_request, &url, &src);
+                        self.init_image_request(&mut pending_request, url, src, can_gc);
                     },
                     (_, State::Broken) | (_, State::Unavailable) => {
                         // Step 17
                         current_request.current_pixel_density = Some(selected_pixel_density);
-                        self.init_image_request(&mut current_request, &url, &src);
+                        self.init_image_request(&mut current_request, url, src, can_gc);
                     },
                     (_, _) => {
                         // step 17
                         pending_request.current_pixel_density = Some(selected_pixel_density);
                         self.image_request.set(ImageRequestPhase::Pending);
-                        self.init_image_request(&mut pending_request, &url, &src);
+                        self.init_image_request(&mut pending_request, url, src, can_gc);
                     },
                 }
             },
         }
-        self.fetch_image(&url);
+        self.fetch_image(url, can_gc);
     }
 
     /// Step 8-12 of html.spec.whatwg.org/multipage/#update-the-image-data
-    fn update_the_image_data_sync_steps(&self) {
-        let document = document_from_node(self);
-        let window = document.window();
-        let task_source = window.task_manager().dom_manipulation_task_source();
+    fn update_the_image_data_sync_steps(&self, can_gc: CanGc) {
+        let document = self.owner_document();
+        let global = self.owner_global();
+        let task_manager = global.task_manager();
+        let task_source = task_manager.dom_manipulation_task_source();
         let this = Trusted::new(self);
         let (src, pixel_density) = match self.select_image_source() {
             // Step 8
             Some(data) => data,
             None => {
-                self.abort_request(State::Broken, ImageRequestPhase::Current);
-                self.abort_request(State::Broken, ImageRequestPhase::Pending);
+                self.abort_request(State::Broken, ImageRequestPhase::Current, can_gc);
+                self.abort_request(State::Broken, ImageRequestPhase::Pending, can_gc);
                 // Step 9.
-                // FIXME(nox): Why are errors silenced here?
-                let _ = task_source.queue(
-                    task!(image_null_source_error: move || {
-                        let this = this.root();
-                        {
-                            let mut current_request =
-                                this.current_request.borrow_mut();
-                            current_request.source_url = None;
-                            current_request.parsed_url = None;
-                        }
-                        let elem = this.upcast::<Element>();
-                        let src_present = elem.has_attribute(&local_name!("src"));
+                task_source.queue(task!(image_null_source_error: move || {
+                    let this = this.root();
+                    {
+                        let mut current_request =
+                            this.current_request.borrow_mut();
+                        current_request.source_url = None;
+                        current_request.parsed_url = None;
+                    }
+                    let elem = this.upcast::<Element>();
+                    let src_present = elem.has_attribute(&local_name!("src"));
 
-                        if src_present || Self::uses_srcset_or_picture(elem) {
-                            this.upcast::<EventTarget>().fire_event(atom!("error"));
-                        }
-                    }),
-                    window.upcast(),
-                );
+                    if src_present || Self::uses_srcset_or_picture(elem) {
+                        this.upcast::<EventTarget>().fire_event(atom!("error"), CanGc::note());
+                    }
+                }));
                 return;
             },
         };
@@ -887,34 +933,30 @@ impl HTMLImageElement {
         match parsed_url {
             Ok(url) => {
                 // Step 13-17
-                self.prepare_image_request(&url, &src, pixel_density);
+                self.prepare_image_request(&url, &src, pixel_density, can_gc);
             },
             Err(_) => {
-                self.abort_request(State::Broken, ImageRequestPhase::Current);
-                self.abort_request(State::Broken, ImageRequestPhase::Pending);
+                self.abort_request(State::Broken, ImageRequestPhase::Current, can_gc);
+                self.abort_request(State::Broken, ImageRequestPhase::Pending, can_gc);
                 // Step 12.1-12.5.
                 let src = src.0;
-                // FIXME(nox): Why are errors silenced here?
-                let _ = task_source.queue(
-                    task!(image_selected_source_error: move || {
-                        let this = this.root();
-                        {
-                            let mut current_request =
-                                this.current_request.borrow_mut();
-                            current_request.source_url = Some(USVString(src))
-                        }
-                        this.upcast::<EventTarget>().fire_event(atom!("error"));
+                task_source.queue(task!(image_selected_source_error: move || {
+                    let this = this.root();
+                    {
+                        let mut current_request =
+                            this.current_request.borrow_mut();
+                        current_request.source_url = Some(USVString(src))
+                    }
+                    this.upcast::<EventTarget>().fire_event(atom!("error"), CanGc::note());
 
-                    }),
-                    window.upcast(),
-                );
+                }));
             },
         }
     }
 
     /// <https://html.spec.whatwg.org/multipage/#update-the-image-data>
-    pub fn update_the_image_data(&self) {
-        let document = document_from_node(self);
+    pub(crate) fn update_the_image_data(&self, can_gc: CanGc) {
+        let document = self.owner_document();
         let window = document.window();
         let elem = self.upcast::<Element>();
         let src = elem.get_url_attribute(&local_name!("src"));
@@ -943,14 +985,16 @@ impl HTMLImageElement {
         let is_parent_picture = elem
             .upcast::<Node>()
             .GetParentElement()
-            .map_or(false, |p| p.is::<HTMLPictureElement>());
+            .is_some_and(|p| p.is::<HTMLPictureElement>());
         if src_set.is_empty() && !is_parent_picture && !src.is_empty() {
             selected_source = Some(src.clone());
-            pixel_density = Some(1 as f64);
+            pixel_density = Some(1_f64);
         };
 
         // Step 5
-        *self.last_selected_source.borrow_mut() = selected_source.clone();
+        self.last_selected_source
+            .borrow_mut()
+            .clone_from(&selected_source);
 
         // Step 6, check the list of available images
         if let Some(src) = selected_source {
@@ -972,8 +1016,12 @@ impl HTMLImageElement {
                         width: image.width,
                     };
                     // Step 6.3.2 abort requests
-                    self.abort_request(State::CompletelyAvailable, ImageRequestPhase::Current);
-                    self.abort_request(State::Unavailable, ImageRequestPhase::Pending);
+                    self.abort_request(
+                        State::CompletelyAvailable,
+                        ImageRequestPhase::Current,
+                        can_gc,
+                    );
+                    self.abort_request(State::Unavailable, ImageRequestPhase::Pending, can_gc);
                     let mut current_request = self.current_request.borrow_mut();
                     current_request.final_url = Some(img_url.clone());
                     current_request.image = Some(image.clone());
@@ -982,8 +1030,11 @@ impl HTMLImageElement {
                     current_request.current_pixel_density = pixel_density;
                     let this = Trusted::new(self);
                     let src = src.0;
-                    let _ = window.task_manager().dom_manipulation_task_source().queue(
-                        task!(image_load_event: move || {
+
+                    self.owner_global()
+                        .task_manager()
+                        .dom_manipulation_task_source()
+                        .queue(task!(image_load_event: move || {
                             let this = this.root();
                             {
                                 let mut current_request =
@@ -992,17 +1043,15 @@ impl HTMLImageElement {
                                 current_request.source_url = Some(USVString(src));
                             }
                             // TODO: restart animation, if set.
-                            this.upcast::<EventTarget>().fire_event(atom!("load"));
-                        }),
-                        window.upcast(),
-                    );
+                            this.upcast::<EventTarget>().fire_event(atom!("load"), CanGc::note());
+                        }));
                     return;
                 }
             }
         }
         // step 7, await a stable state.
         self.generation.set(self.generation.get() + 1);
-        let task = ImageElementMicrotask::StableStateUpdateImageDataTask {
+        let task = ImageElementMicrotask::StableStateUpdateImageData {
             elem: DomRoot::from_ref(self),
             generation: self.generation.get(),
         };
@@ -1010,9 +1059,9 @@ impl HTMLImageElement {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#img-environment-changes>
-    pub fn react_to_environment_changes(&self) {
+    pub(crate) fn react_to_environment_changes(&self) {
         // Step 1
-        let task = ImageElementMicrotask::EnvironmentChangesTask {
+        let task = ImageElementMicrotask::EnvironmentChanges {
             elem: DomRoot::from_ref(self),
             generation: self.generation.get(),
         };
@@ -1020,54 +1069,10 @@ impl HTMLImageElement {
     }
 
     /// Step 2-12 of <https://html.spec.whatwg.org/multipage/#img-environment-changes>
-    fn react_to_environment_changes_sync_steps(&self, generation: u32) {
-        // TODO reduce duplicacy of this code
-
-        fn generate_cache_listener_for_element(
-            elem: &HTMLImageElement,
-            selected_source: String,
-            selected_pixel_density: f64,
-        ) -> IpcSender<PendingImageResponse> {
-            let trusted_node = Trusted::new(elem);
-            let (responder_sender, responder_receiver) = ipc::channel().unwrap();
-
-            let window = window_from_node(elem);
-            let (task_source, canceller) = window
-                .task_manager()
-                .networking_task_source_with_canceller();
-            let generation = elem.generation.get();
-            ROUTER.add_route(
-                responder_receiver.to_opaque(),
-                Box::new(move |message| {
-                    debug!("Got image {:?}", message);
-                    // Return the image via a message to the script thread, which marks
-                    // the element as dirty and triggers a reflow.
-                    let element = trusted_node.clone();
-                    let image = message.to().unwrap();
-                    let selected_source_clone = selected_source.clone();
-                    let _ = task_source.queue_with_canceller(
-                        task!(process_image_response_for_environment_change: move || {
-                            let element = element.root();
-                            // Ignore any image response for a previous request that has been discarded.
-                            if generation == element.generation.get() {
-                                element.process_image_response_for_environment_change(image,
-                                    USVString::from(selected_source_clone), generation, selected_pixel_density);
-                            }
-                        }),
-                        &canceller,
-                    );
-                }),
-            );
-
-            responder_sender
-        }
-
+    fn react_to_environment_changes_sync_steps(&self, generation: u32, can_gc: CanGc) {
         let elem = self.upcast::<Element>();
-        let document = document_from_node(elem);
-        let has_pending_request = match self.image_request.get() {
-            ImageRequestPhase::Pending => true,
-            _ => false,
-        };
+        let document = elem.owner_document();
+        let has_pending_request = matches!(self.image_request.get(), ImageRequestPhase::Pending);
 
         // Step 2
         if !document.is_active() || !Self::uses_srcset_or_picture(elem) || has_pending_request {
@@ -1109,24 +1114,22 @@ impl HTMLImageElement {
             &mut self.pending_request.borrow_mut(),
             &img_url,
             &selected_source,
+            can_gc,
         );
-
-        let window = window_from_node(self);
-        let image_cache = window.image_cache();
 
         // Step 14
-        let sender = generate_cache_listener_for_element(
-            self,
-            selected_source.0.clone(),
-            selected_pixel_density,
-        );
-        let cache_result = image_cache.track_image(
+        let window = self.owner_window();
+        let cache_result = window.image_cache().get_cached_image_status(
             img_url.clone(),
             window.origin().immutable().clone(),
             cors_setting_for_element(self.upcast()),
-            sender,
             UsePlaceholder::No,
         );
+
+        let change_type = ChangeType::Environment {
+            selected_source: selected_source.clone(),
+            selected_pixel_density,
+        };
 
         match cache_result {
             ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable { .. }) => {
@@ -1137,13 +1140,15 @@ impl HTMLImageElement {
                     selected_pixel_density,
                 )
             },
-            ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(m)) => {
+            ImageCacheResult::Available(ImageOrMetadataAvailable::MetadataAvailable(m, id)) => {
                 self.process_image_response_for_environment_change(
                     ImageResponse::MetadataLoaded(m),
                     selected_source,
                     generation,
                     selected_pixel_density,
+                    can_gc,
                 );
+                self.register_image_cache_callback(id, change_type);
             },
             ImageCacheResult::LoadError => {
                 self.process_image_response_for_environment_change(
@@ -1151,11 +1156,59 @@ impl HTMLImageElement {
                     selected_source,
                     generation,
                     selected_pixel_density,
+                    can_gc,
                 );
             },
-            ImageCacheResult::ReadyForRequest(id) => self.fetch_request(&img_url, id),
-            ImageCacheResult::Pending(_) => (),
+            ImageCacheResult::ReadyForRequest(id) => {
+                self.fetch_request(&img_url, id);
+                self.register_image_cache_callback(id, change_type);
+            },
+            ImageCacheResult::Pending(id) => {
+                self.register_image_cache_callback(id, change_type);
+            },
         }
+    }
+
+    // Step 2 for <https://html.spec.whatwg.org/multipage/#dom-img-decode>
+    fn react_to_decode_image_sync_steps(&self, promise: Rc<Promise>) {
+        let document = self.owner_document();
+        // Step 2.1 of <https://html.spec.whatwg.org/multipage/#dom-img-decode>
+        if !document.is_fully_active() ||
+            matches!(self.current_request.borrow().state, State::Broken)
+        {
+            promise.reject_native(&DOMException::new(
+                &document.global(),
+                DOMErrorName::EncodingError,
+            ));
+        } else if matches!(
+            self.current_request.borrow().state,
+            State::CompletelyAvailable
+        ) {
+            // this doesn't follow the spec, but it's been discussed in <https://github.com/whatwg/html/issues/4217>
+            promise.resolve_native(&());
+        } else {
+            self.image_decode_promises
+                .borrow_mut()
+                .push(promise.clone());
+        }
+    }
+
+    fn resolve_image_decode_promises(&self) {
+        for promise in self.image_decode_promises.borrow().iter() {
+            promise.resolve_native(&());
+        }
+        self.image_decode_promises.borrow_mut().clear();
+    }
+
+    fn reject_image_decode_promises(&self) {
+        let document = self.owner_document();
+        for promise in self.image_decode_promises.borrow().iter() {
+            promise.reject_native(&DOMException::new(
+                &document.global(),
+                DOMErrorName::EncodingError,
+            ));
+        }
+        self.image_decode_promises.borrow_mut().clear();
     }
 
     /// Step 15 for <https://html.spec.whatwg.org/multipage/#img-environment-changes>
@@ -1166,15 +1219,14 @@ impl HTMLImageElement {
         selected_pixel_density: f64,
     ) {
         let this = Trusted::new(self);
-        let window = window_from_node(self);
         let src = src.0;
-        let _ = window.task_manager().dom_manipulation_task_source().queue(
+        self.owner_global().task_manager().dom_manipulation_task_source().queue(
             task!(image_load_event: move || {
                 let this = this.root();
                 let relevant_mutation = this.generation.get() != generation;
                 // Step 15.1
                 if relevant_mutation {
-                    this.abort_request(State::Unavailable, ImageRequestPhase::Pending);
+                    this.abort_request(State::Unavailable, ImageRequestPhase::Pending, CanGc::note());
                     return;
                 }
                 // Step 15.2
@@ -1192,16 +1244,15 @@ impl HTMLImageElement {
 
                     // Step 15.5
                     mem::swap(&mut this.current_request.borrow_mut(), &mut pending_request);
-                    this.abort_request(State::Unavailable, ImageRequestPhase::Pending);
                 }
+                this.abort_request(State::Unavailable, ImageRequestPhase::Pending, CanGc::note());
 
                 // Step 15.6
                 this.upcast::<Node>().dirty(NodeDamage::OtherNodeDamage);
 
                 // Step 15.7
-                this.upcast::<EventTarget>().fire_event(atom!("load"));
-            }),
-            window.upcast(),
+                this.upcast::<EventTarget>().fire_event(atom!("load"), CanGc::note());
+            })
         );
     }
 
@@ -1210,7 +1261,7 @@ impl HTMLImageElement {
         let is_parent_picture = elem
             .upcast::<Node>()
             .GetParentElement()
-            .map_or(false, |p| p.is::<HTMLPictureElement>());
+            .is_some_and(|p| p.is::<HTMLPictureElement>());
         has_src || is_parent_picture
     }
 
@@ -1228,7 +1279,7 @@ impl HTMLImageElement {
                 source_url: None,
                 image: None,
                 metadata: None,
-                blocker: None,
+                blocker: DomRefCell::new(None),
                 final_url: None,
                 current_pixel_density: None,
             }),
@@ -1238,7 +1289,7 @@ impl HTMLImageElement {
                 source_url: None,
                 image: None,
                 metadata: None,
-                blocker: None,
+                blocker: DomRefCell::new(None),
                 final_url: None,
                 current_pixel_density: None,
             }),
@@ -1246,15 +1297,17 @@ impl HTMLImageElement {
             generation: Default::default(),
             source_set: DomRefCell::new(SourceSet::new()),
             last_selected_source: DomRefCell::new(None),
+            image_decode_promises: DomRefCell::new(vec![]),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLImageElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLImageElement::new_inherited(
@@ -1262,35 +1315,11 @@ impl HTMLImageElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    pub fn Image(
-        window: &Window,
-        proto: Option<HandleObject>,
-        width: Option<u32>,
-        height: Option<u32>,
-    ) -> Fallible<DomRoot<HTMLImageElement>> {
-        let element = Element::create(
-            QualName::new(None, ns!(html), local_name!("img")),
-            None,
-            &window.Document(),
-            ElementCreator::ScriptCreated,
-            CustomElementCreationMode::Synchronous,
-            proto,
-        );
-
-        let image = DomRoot::downcast::<HTMLImageElement>(element).unwrap();
-        if let Some(w) = width {
-            image.SetWidth(w);
-        }
-        if let Some(h) = height {
-            image.SetHeight(h);
-        }
-
-        Ok(image)
-    }
-    pub fn areas(&self) -> Option<Vec<DomRoot<HTMLAreaElement>>> {
+    pub(crate) fn areas(&self) -> Option<Vec<DomRoot<HTMLAreaElement>>> {
         let elem = self.upcast::<Element>();
         let usemap_attr = elem.get_attribute(&ns!(), &local_name!("usemap"))?;
 
@@ -1302,24 +1331,25 @@ impl HTMLImageElement {
 
         let (first, last) = value.split_at(1);
 
-        if first != "#" || last.len() == 0 {
+        if first != "#" || last.is_empty() {
             return None;
         }
 
-        let useMapElements = document_from_node(self)
+        let useMapElements = self
+            .owner_document()
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::No)
             .filter_map(DomRoot::downcast::<HTMLMapElement>)
             .find(|n| {
                 n.upcast::<Element>()
                     .get_name()
-                    .map_or(false, |n| *n == *last)
+                    .is_some_and(|n| *n == *last)
             });
 
         useMapElements.map(|mapElem| mapElem.get_area_elements())
     }
 
-    pub fn same_origin(&self, origin: &MutableOrigin) -> bool {
+    pub(crate) fn same_origin(&self, origin: &MutableOrigin) -> bool {
         if let Some(ref image) = self.current_request.borrow().image {
             return image.cors_status == CorsStatus::Safe;
         }
@@ -1328,56 +1358,69 @@ impl HTMLImageElement {
             .borrow()
             .final_url
             .as_ref()
-            .map_or(false, |url| {
-                url.scheme() == "data" || url.origin().same_origin(origin)
-            })
+            .is_some_and(|url| url.scheme() == "data" || url.origin().same_origin(origin))
+    }
+
+    fn generation_id(&self) -> u32 {
+        self.generation.get()
     }
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
-pub enum ImageElementMicrotask {
-    StableStateUpdateImageDataTask {
+pub(crate) enum ImageElementMicrotask {
+    StableStateUpdateImageData {
         elem: DomRoot<HTMLImageElement>,
         generation: u32,
     },
-    EnvironmentChangesTask {
+    EnvironmentChanges {
         elem: DomRoot<HTMLImageElement>,
         generation: u32,
+    },
+    Decode {
+        elem: DomRoot<HTMLImageElement>,
+        #[ignore_malloc_size_of = "promises are hard"]
+        promise: Rc<Promise>,
     },
 }
 
 impl MicrotaskRunnable for ImageElementMicrotask {
-    fn handler(&self) {
-        match self {
-            &ImageElementMicrotask::StableStateUpdateImageDataTask {
+    fn handler(&self, can_gc: CanGc) {
+        match *self {
+            ImageElementMicrotask::StableStateUpdateImageData {
                 ref elem,
                 ref generation,
             } => {
                 // Step 7 of https://html.spec.whatwg.org/multipage/#update-the-image-data,
                 // stop here if other instances of this algorithm have been scheduled
                 if elem.generation.get() == *generation {
-                    elem.update_the_image_data_sync_steps();
+                    elem.update_the_image_data_sync_steps(can_gc);
                 }
             },
-            &ImageElementMicrotask::EnvironmentChangesTask {
+            ImageElementMicrotask::EnvironmentChanges {
                 ref elem,
                 ref generation,
             } => {
-                elem.react_to_environment_changes_sync_steps(*generation);
+                elem.react_to_environment_changes_sync_steps(*generation, can_gc);
+            },
+            ImageElementMicrotask::Decode {
+                ref elem,
+                ref promise,
+            } => {
+                elem.react_to_decode_image_sync_steps(promise.clone());
             },
         }
     }
 
     fn enter_realm(&self) -> JSAutoRealm {
         match self {
-            &ImageElementMicrotask::StableStateUpdateImageDataTask { ref elem, .. } |
-            &ImageElementMicrotask::EnvironmentChangesTask { ref elem, .. } => enter_realm(&**elem),
+            &ImageElementMicrotask::StableStateUpdateImageData { ref elem, .. } |
+            &ImageElementMicrotask::EnvironmentChanges { ref elem, .. } |
+            &ImageElementMicrotask::Decode { ref elem, .. } => enter_realm(&**elem),
         }
     }
 }
 
-pub trait LayoutHTMLImageElementHelpers {
-    fn image(self) -> Option<Arc<Image>>;
+pub(crate) trait LayoutHTMLImageElementHelpers {
     fn image_url(self) -> Option<ServoUrl>;
     fn image_density(self) -> Option<f64>;
     fn image_data(self) -> (Option<Arc<Image>>, Option<ImageMetadata>);
@@ -1393,10 +1436,6 @@ impl<'dom> LayoutDom<'dom, HTMLImageElement> {
 }
 
 impl LayoutHTMLImageElementHelpers for LayoutDom<'_, HTMLImageElement> {
-    fn image(self) -> Option<Arc<Image>> {
-        self.current_request().image.clone()
-    }
-
     fn image_url(self) -> Option<ServoUrl> {
         self.current_request().parsed_url.clone()
     }
@@ -1410,7 +1449,7 @@ impl LayoutHTMLImageElementHelpers for LayoutDom<'_, HTMLImageElement> {
     }
 
     fn image_density(self) -> Option<f64> {
-        self.current_request().current_pixel_density.clone()
+        self.current_request().current_pixel_density
     }
 
     fn get_width(self) -> LengthOrPercentageOrAuto {
@@ -1431,13 +1470,13 @@ impl LayoutHTMLImageElementHelpers for LayoutDom<'_, HTMLImageElement> {
 }
 
 //https://html.spec.whatwg.org/multipage/#parse-a-sizes-attribute
-pub fn parse_a_sizes_attribute(value: DOMString) -> SourceSizeList {
+pub(crate) fn parse_a_sizes_attribute(value: DOMString) -> SourceSizeList {
     let mut input = ParserInput::new(&value);
     let mut parser = Parser::new(&mut input);
-    let url = ServoUrl::parse("about:blank").unwrap();
+    let url_data = Url::parse("about:blank").unwrap().into();
     let context = ParserContext::new(
         Origin::Author,
-        &url,
+        &url_data,
         Some(CssRuleType::Style),
         // FIXME(emilio): why ::empty() instead of ::DEFAULT? Also, what do
         // browsers do regarding quirks-mode in a media list?
@@ -1452,20 +1491,55 @@ pub fn parse_a_sizes_attribute(value: DOMString) -> SourceSizeList {
 
 fn get_correct_referrerpolicy_from_raw_token(token: &DOMString) -> DOMString {
     if token == "" {
-        // Empty token is treated as no-referrer inside determine_policy_for_token,
-        // while here it should be treated as the default value, so it should remain unchanged.
+        // Empty token is treated as the default referrer policy inside determine_policy_for_token,
+        // so it should remain unchanged.
         DOMString::new()
     } else {
-        match determine_policy_for_token(token) {
-            Some(policy) => DOMString::from_string(policy.to_string()),
-            // If the policy is set to an incorrect value, then it should be
-            // treated as an invalid value default (empty string).
-            None => DOMString::new(),
+        let policy = determine_policy_for_token(token);
+
+        if policy == ReferrerPolicy::EmptyString {
+            return DOMString::new();
         }
+
+        DOMString::from_string(policy.to_string())
     }
 }
 
-impl HTMLImageElementMethods for HTMLImageElement {
+#[allow(non_snake_case)]
+impl HTMLImageElementMethods<crate::DomTypeHolder> for HTMLImageElement {
+    // https://html.spec.whatwg.org/multipage/#dom-image
+    fn Image(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        width: Option<u32>,
+        height: Option<u32>,
+    ) -> Fallible<DomRoot<HTMLImageElement>> {
+        let element = Element::create(
+            QualName::new(None, ns!(html), local_name!("img")),
+            None,
+            &window.Document(),
+            ElementCreator::ScriptCreated,
+            CustomElementCreationMode::Synchronous,
+            proto,
+            can_gc,
+        );
+
+        let image = DomRoot::downcast::<HTMLImageElement>(element).unwrap();
+        if let Some(w) = width {
+            image.SetWidth(w, can_gc);
+        }
+        if let Some(h) = height {
+            image.SetHeight(h, can_gc);
+        }
+
+        // run update_the_image_data when the element is created.
+        // https://html.spec.whatwg.org/multipage/#when-to-obtain-images
+        image.update_the_image_data(can_gc);
+
+        Ok(image)
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-img-alt
     make_getter!(Alt, "alt");
     // https://html.spec.whatwg.org/multipage/#dom-img-alt
@@ -1488,8 +1562,8 @@ impl HTMLImageElementMethods for HTMLImageElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-crossOrigin
-    fn SetCrossOrigin(&self, value: Option<DOMString>) {
-        set_cross_origin_attribute(self.upcast::<Element>(), value);
+    fn SetCrossOrigin(&self, value: Option<DOMString>, can_gc: CanGc) {
+        set_cross_origin_attribute(self.upcast::<Element>(), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-usemap
@@ -1503,31 +1577,31 @@ impl HTMLImageElementMethods for HTMLImageElement {
     make_bool_setter!(SetIsMap, "ismap");
 
     // https://html.spec.whatwg.org/multipage/#dom-img-width
-    fn Width(&self) -> u32 {
+    fn Width(&self, can_gc: CanGc) -> u32 {
         let node = self.upcast::<Node>();
-        match node.bounding_content_box() {
+        match node.bounding_content_box(can_gc) {
             Some(rect) => rect.size.width.to_px() as u32,
             None => self.NaturalWidth(),
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-width
-    fn SetWidth(&self, value: u32) {
-        image_dimension_setter(self.upcast(), local_name!("width"), value);
+    fn SetWidth(&self, value: u32, can_gc: CanGc) {
+        image_dimension_setter(self.upcast(), local_name!("width"), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-height
-    fn Height(&self) -> u32 {
+    fn Height(&self, can_gc: CanGc) -> u32 {
         let node = self.upcast::<Node>();
-        match node.bounding_content_box() {
+        match node.bounding_content_box(can_gc) {
             Some(rect) => rect.size.height.to_px() as u32,
             None => self.NaturalHeight(),
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-height
-    fn SetHeight(&self, value: u32) {
-        image_dimension_setter(self.upcast(), local_name!("height"), value);
+    fn SetHeight(&self, value: u32, can_gc: CanGc) {
+        image_dimension_setter(self.upcast(), local_name!("height"), value, can_gc);
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-naturalwidth
@@ -1566,19 +1640,19 @@ impl HTMLImageElementMethods for HTMLImageElement {
         let request = self.current_request.borrow();
         let request_state = request.state;
         match request_state {
-            State::CompletelyAvailable | State::Broken => return true,
-            State::PartiallyAvailable | State::Unavailable => return false,
+            State::CompletelyAvailable | State::Broken => true,
+            State::PartiallyAvailable | State::Unavailable => false,
         }
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-currentsrc
     fn CurrentSrc(&self) -> USVString {
         let current_request = self.current_request.borrow();
-        let ref url = current_request.parsed_url;
+        let url = &current_request.parsed_url;
         match *url {
             Some(ref url) => USVString(url.clone().into_string()),
             None => {
-                let ref unparsed_url = current_request.source_url;
+                let unparsed_url = &current_request.source_url;
                 match *unparsed_url {
                     Some(ref url) => url.clone(),
                     None => USVString("".to_owned()),
@@ -1587,15 +1661,13 @@ impl HTMLImageElementMethods for HTMLImageElement {
         }
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-img-referrerpolicy
+    /// <https://html.spec.whatwg.org/multipage/#dom-img-referrerpolicy>
     fn ReferrerPolicy(&self) -> DOMString {
-        let element = self.upcast::<Element>();
-        let current_policy_value = element.get_string_attribute(&local_name!("referrerpolicy"));
-        get_correct_referrerpolicy_from_raw_token(&current_policy_value)
+        reflect_referrer_policy_attribute(self.upcast::<Element>())
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-referrerpolicy
-    fn SetReferrerPolicy(&self, value: DOMString) {
+    fn SetReferrerPolicy(&self, value: DOMString, can_gc: CanGc) {
         let referrerpolicy_attr_name = local_name!("referrerpolicy");
         let element = self.upcast::<Element>();
         let previous_correct_attribute_value = get_correct_referrerpolicy_from_raw_token(
@@ -1605,8 +1677,28 @@ impl HTMLImageElementMethods for HTMLImageElement {
         if previous_correct_attribute_value != correct_value_or_empty_string {
             // Setting the attribute to the same value will update the image.
             // We don't want to start an update if referrerpolicy is set to the same value.
-            element.set_string_attribute(&referrerpolicy_attr_name, correct_value_or_empty_string);
+            element.set_string_attribute(
+                &referrerpolicy_attr_name,
+                correct_value_or_empty_string,
+                can_gc,
+            );
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-img-decode>
+    fn Decode(&self, can_gc: CanGc) -> Rc<Promise> {
+        // Step 1
+        let promise = Promise::new(&self.global(), can_gc);
+
+        // Step 2
+        let task = ImageElementMicrotask::Decode {
+            elem: DomRoot::from_ref(self),
+            promise: promise.clone(),
+        };
+        ScriptThread::await_stable_state(Microtask::ImageElement(task));
+
+        // Step 3
+        promise
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-img-name
@@ -1653,7 +1745,7 @@ impl VirtualMethods for HTMLImageElement {
 
     fn adopting_steps(&self, old_doc: &Document) {
         self.super_type().unwrap().adopting_steps(old_doc);
-        self.update_the_image_data();
+        self.update_the_image_data(CanGc::note());
     }
 
     fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
@@ -1664,7 +1756,7 @@ impl VirtualMethods for HTMLImageElement {
             &local_name!("width") |
             &local_name!("crossorigin") |
             &local_name!("sizes") |
-            &local_name!("referrerpolicy") => self.update_the_image_data(),
+            &local_name!("referrerpolicy") => self.update_the_image_data(CanGc::note()),
             _ => {},
         }
     }
@@ -1703,7 +1795,9 @@ impl VirtualMethods for HTMLImageElement {
             mouse_event.ClientX().to_f32().unwrap(),
             mouse_event.ClientY().to_f32().unwrap(),
         );
-        let bcr = self.upcast::<Element>().GetBoundingClientRect();
+        let bcr = self
+            .upcast::<Element>()
+            .GetBoundingClientRect(CanGc::note());
         let bcr_p = Point2D::new(bcr.X() as f32, bcr.Y() as f32);
 
         // Walk HTMLAreaElements
@@ -1714,17 +1808,17 @@ impl VirtualMethods for HTMLImageElement {
                 None => return,
             };
             if shp.hit_test(&point) {
-                element.activation_behavior(event, self.upcast());
+                element.activation_behavior(event, self.upcast(), CanGc::note());
                 return;
             }
         }
     }
 
     fn bind_to_tree(&self, context: &BindContext) {
-        if let Some(ref s) = self.super_type() {
+        if let Some(s) = self.super_type() {
             s.bind_to_tree(context);
         }
-        let document = document_from_node(self);
+        let document = self.owner_document();
         if context.tree_connected {
             document.register_responsive_image(self);
         }
@@ -1733,20 +1827,20 @@ impl VirtualMethods for HTMLImageElement {
         // https://html.spec.whatwg.org/multipage/#relevant-mutations
         if let Some(parent) = self.upcast::<Node>().GetParentElement() {
             if parent.is::<HTMLPictureElement>() {
-                self.update_the_image_data();
+                self.update_the_image_data(CanGc::note());
             }
         }
     }
 
     fn unbind_from_tree(&self, context: &UnbindContext) {
         self.super_type().unwrap().unbind_from_tree(context);
-        let document = document_from_node(self);
+        let document = self.owner_document();
         document.unregister_responsive_image(self);
 
         // The element is removed from a picture parent element
         // https://html.spec.whatwg.org/multipage/#relevant-mutations
         if context.parent.is::<HTMLPictureElement>() {
-            self.update_the_image_data();
+            self.update_the_image_data(CanGc::note());
         }
     }
 }
@@ -1760,7 +1854,7 @@ impl FormControl for HTMLImageElement {
         self.form_owner.set(form);
     }
 
-    fn to_element<'a>(&'a self) -> &'a Element {
+    fn to_element(&self) -> &Element {
         self.upcast::<Element>()
     }
 
@@ -1769,17 +1863,7 @@ impl FormControl for HTMLImageElement {
     }
 }
 
-impl ImageCacheListener for HTMLImageElement {
-    fn generation_id(&self) -> u32 {
-        self.generation.get()
-    }
-
-    fn process_image_response(&self, response: ImageResponse) {
-        self.process_image_response(response);
-    }
-}
-
-fn image_dimension_setter(element: &Element, attr: LocalName, value: u32) {
+fn image_dimension_setter(element: &Element, attr: LocalName, value: u32, can_gc: CanGc) {
     // This setter is a bit weird: the IDL type is unsigned long, but it's parsed as
     // a dimension for rendering.
     let value = if value > UNSIGNED_LONG_MAX { 0 } else { value };
@@ -1797,186 +1881,288 @@ fn image_dimension_setter(element: &Element, attr: LocalName, value: u32) {
 
     let dim = LengthOrPercentageOrAuto::Length(Au::from_px(pixel_value as i32));
     let value = AttrValue::Dimension(value.to_string(), dim);
-    element.set_attribute(&attr, value);
+    element.set_attribute(&attr, value, can_gc);
 }
 
 /// Collect sequence of code points
-pub fn collect_sequence_characters<F>(s: &str, predicate: F) -> (&str, &str)
-where
-    F: Fn(&char) -> bool,
-{
-    for (i, ch) in s.chars().enumerate() {
-        if !predicate(&ch) {
-            return (&s[0..i], &s[i..]);
-        }
-    }
-
-    return (s, "");
+pub(crate) fn collect_sequence_characters(
+    s: &str,
+    mut predicate: impl FnMut(&char) -> bool,
+) -> (&str, &str) {
+    let i = s.find(|ch| !predicate(&ch)).unwrap_or(s.len());
+    (&s[0..i], &s[i..])
 }
 
 /// Parse an `srcset` attribute:
 /// <https://html.spec.whatwg.org/multipage/#parsing-a-srcset-attribute>.
 pub fn parse_a_srcset_attribute(input: &str) -> Vec<ImageSource> {
-    let mut url_len = 0;
-    let mut candidates: Vec<ImageSource> = vec![];
-    while url_len < input.len() {
-        let position = &input[url_len..];
-        let (spaces, position) =
-            collect_sequence_characters(position, |c| *c == ',' || char::is_whitespace(*c));
-        // add the length of the url that we parse to advance the start index
-        let space_len = spaces.char_indices().count();
-        url_len += space_len;
-        if position.is_empty() {
+    // > 1. Let input be the value passed to this algorithm.
+    // > 2. Let position be a pointer into input, initially pointing at the start of the string.
+    let mut current_index = 0;
+
+    // > 3. Let candidates be an initially empty source set.
+    let mut candidates = vec![];
+    while current_index < input.len() {
+        let remaining_string = &input[current_index..];
+
+        // > 4. Splitting loop: Collect a sequence of code points that are ASCII whitespace or
+        // > U+002C COMMA characters from input given position. If any U+002C COMMA
+        // > characters were collected, that is a parse error.
+        let mut collected_comma = false;
+        let (collected_characters, string_after_whitespace) =
+            collect_sequence_characters(remaining_string, |character| {
+                if *character == ',' {
+                    collected_comma = true;
+                }
+                *character == ',' || character.is_ascii_whitespace()
+            });
+        if collected_comma {
+            return Vec::new();
+        }
+
+        // Add the length of collected whitespace, to find the start of the URL we are going
+        // to parse.
+        current_index += collected_characters.len();
+
+        // > 5. If position is past the end of input, return candidates.
+        if string_after_whitespace.is_empty() {
             return candidates;
         }
-        let (url, spaces) = collect_sequence_characters(position, |c| !char::is_whitespace(*c));
-        // add the counts of urls that we parse to advance the start index
-        url_len += url.chars().count();
-        let comma_count = url.chars().rev().take_while(|c| *c == ',').count();
-        let url: String = url
-            .chars()
-            .take(url.chars().count() - comma_count)
-            .collect();
-        // add 1 to start index, for the comma
-        url_len += comma_count + 1;
-        let (space, position) = collect_sequence_characters(spaces, |c| char::is_whitespace(*c));
-        let space_len = space.len();
-        url_len += space_len;
+
+        // 6. Collect a sequence of code points that are not ASCII whitespace from input
+        // given position, and let that be url.
+        let (url, _) =
+            collect_sequence_characters(string_after_whitespace, |c| !char::is_ascii_whitespace(c));
+
+        // Add the length of `url` that we will parse to advance the index of the next part
+        // of the string to prase.
+        current_index += url.len();
+
+        // 7. Let descriptors be a new empty list.
         let mut descriptors = Vec::new();
+
+        // > 8. If url ends with U+002C (,), then:
+        // >    1. Remove all trailing U+002C COMMA characters from url. If this removed
+        // >       more than one character, that is a parse error.
+        if url.ends_with(',') {
+            let image_source = ImageSource {
+                url: url.trim_end_matches(',').into(),
+                descriptor: Descriptor {
+                    width: None,
+                    density: None,
+                },
+            };
+            candidates.push(image_source);
+            continue;
+        }
+
+        // Otherwise:
+        // > 8.1. Descriptor tokenizer: Skip ASCII whitespace within input given position.
+        let descriptors_string = &input[current_index..];
+        let (spaces, descriptors_string) =
+            collect_sequence_characters(descriptors_string, |character| {
+                character.is_ascii_whitespace()
+            });
+        current_index += spaces.len();
+
+        // > 8.2. Let current descriptor be the empty string.
         let mut current_descriptor = String::new();
+
+        // > 8.3. Let state be "in descriptor".
         let mut state = ParseState::InDescriptor;
-        let mut char_stream = position.chars().enumerate();
-        let mut buffered: Option<(usize, char)> = None;
+
+        // > 8.4. Let c be the character at position. Do the following depending on the value of
+        // > state. For the purpose of this step, "EOF" is a special character representing
+        // > that position is past the end of input.
+        let mut characters = descriptors_string.chars();
+        let mut character = characters.next();
+        if let Some(character) = character {
+            current_index += character.len_utf8();
+        }
+
         loop {
-            let next_char = buffered.take().or_else(|| char_stream.next());
-            if next_char.is_some() {
-                url_len += 1;
-            }
-            match state {
-                ParseState::InDescriptor => match next_char {
-                    Some((_, ' ')) => {
-                        if !current_descriptor.is_empty() {
-                            descriptors.push(current_descriptor.clone());
-                            current_descriptor = String::new();
-                            state = ParseState::AfterDescriptor;
-                        }
-                        continue;
-                    },
-                    Some((_, ',')) => {
-                        if !current_descriptor.is_empty() {
-                            descriptors.push(current_descriptor.clone());
-                        }
-                        break;
-                    },
-                    Some((_, c @ '(')) => {
-                        current_descriptor.push(c);
-                        state = ParseState::InParens;
-                        continue;
-                    },
-                    Some((_, c)) => {
-                        current_descriptor.push(c);
-                    },
-                    None => {
-                        if !current_descriptor.is_empty() {
-                            descriptors.push(current_descriptor.clone());
-                        }
-                        break;
-                    },
-                },
-                ParseState::InParens => match next_char {
-                    Some((_, c @ ')')) => {
-                        current_descriptor.push(c);
-                        state = ParseState::InDescriptor;
-                        continue;
-                    },
-                    Some((_, c)) => {
-                        current_descriptor.push(c);
-                        continue;
-                    },
-                    None => {
-                        if !current_descriptor.is_empty() {
-                            descriptors.push(current_descriptor.clone());
-                        }
-                        break;
-                    },
-                },
-                ParseState::AfterDescriptor => match next_char {
-                    Some((_, ' ')) => {
+            match (state, character) {
+                (ParseState::InDescriptor, Some(character)) if character.is_ascii_whitespace() => {
+                    // > If current descriptor is not empty, append current descriptor to
+                    // > descriptors and let current descriptor be the empty string. Set
+                    // > state to after descriptor.
+                    if !current_descriptor.is_empty() {
+                        descriptors.push(current_descriptor);
+                        current_descriptor = String::new();
                         state = ParseState::AfterDescriptor;
-                        continue;
-                    },
-                    Some((idx, c)) => {
-                        state = ParseState::InDescriptor;
-                        buffered = Some((idx, c));
-                        continue;
-                    },
-                    None => {
-                        if !current_descriptor.is_empty() {
-                            descriptors.push(current_descriptor.clone());
-                        }
-                        break;
-                    },
+                    }
                 },
+                (ParseState::InDescriptor, Some(',')) => {
+                    // > Advance position to the next character in input. If current descriptor
+                    // > is not empty, append current descriptor to descriptors. Jump to the
+                    // > step labeled descriptor parser.
+                    if !current_descriptor.is_empty() {
+                        descriptors.push(current_descriptor);
+                    }
+                    break;
+                },
+                (ParseState::InDescriptor, Some('(')) => {
+                    // > Append c to current descriptor. Set state to in parens.
+                    current_descriptor.push('(');
+                    state = ParseState::InParens;
+                },
+                (ParseState::InDescriptor, Some(character)) => {
+                    // > Append c to current descriptor.
+                    current_descriptor.push(character);
+                },
+                (ParseState::InDescriptor, None) => {
+                    // > If current descriptor is not empty, append current descriptor to
+                    // > descriptors. Jump to the step labeled descriptor parser.
+                    if !current_descriptor.is_empty() {
+                        descriptors.push(current_descriptor);
+                    }
+                    break;
+                },
+                (ParseState::InParens, Some(')')) => {
+                    // > Append c to current descriptor. Set state to in descriptor.
+                    current_descriptor.push(')');
+                    state = ParseState::InDescriptor;
+                },
+                (ParseState::InParens, Some(character)) => {
+                    // Append c to current descriptor.
+                    current_descriptor.push(character);
+                },
+                (ParseState::InParens, None) => {
+                    // > Append current descriptor to descriptors. Jump to the step
+                    // > labeled descriptor parser.
+                    descriptors.push(current_descriptor);
+                    break;
+                },
+                (ParseState::AfterDescriptor, Some(character))
+                    if character.is_ascii_whitespace() =>
+                {
+                    // > Stay in this state.
+                },
+                (ParseState::AfterDescriptor, Some(_)) => {
+                    // > Set state to in descriptor. Set position to the previous
+                    // > character in input.
+                    state = ParseState::InDescriptor;
+                    continue;
+                },
+                (ParseState::AfterDescriptor, None) => {
+                    // > Jump to the step labeled descriptor parser.
+                    break;
+                },
+            }
+
+            character = characters.next();
+            if let Some(character) = character {
+                current_index += character.len_utf8();
             }
         }
 
+        // > 9. Descriptor parser: Let error be no.
         let mut error = false;
+        // > 10. Let width be absent.
         let mut width: Option<u32> = None;
+        // > 11. Let density be absent.
         let mut density: Option<f64> = None;
+        // > 12. Let future-compat-h be absent.
         let mut future_compat_h: Option<u32> = None;
-        for descriptor in descriptors {
-            let (digits, remaining) =
-                collect_sequence_characters(&descriptor, |c| is_ascii_digit(c) || *c == '.');
-            let valid_non_negative_integer = parse_unsigned_integer(digits.chars());
-            let has_w = remaining == "w";
-            let valid_floating_point = parse_double(digits);
-            let has_x = remaining == "x";
-            let has_h = remaining == "h";
-            if valid_non_negative_integer.is_ok() && has_w {
-                let result = valid_non_negative_integer;
-                error = result.is_err();
-                if width.is_some() || density.is_some() {
-                    error = true;
-                }
-                if let Ok(w) = result {
-                    width = Some(w);
-                }
-            } else if valid_floating_point.is_ok() && has_x {
-                let result = valid_floating_point;
-                error = result.is_err();
-                if width.is_some() || density.is_some() || future_compat_h.is_some() {
-                    error = true;
-                }
-                if let Ok(x) = result {
-                    density = Some(x);
-                }
-            } else if valid_non_negative_integer.is_ok() && has_h {
-                let result = valid_non_negative_integer;
-                error = result.is_err();
-                if density.is_some() || future_compat_h.is_some() {
-                    error = true;
-                }
-                if let Ok(h) = result {
-                    future_compat_h = Some(h);
-                }
-            } else {
-                error = true;
+
+        // > 13. For each descriptor in descriptors, run the appropriate set of steps from
+        // > the following list:
+        for descriptor in descriptors.into_iter() {
+            let Some(last_character) = descriptor.chars().last() else {
+                break;
+            };
+
+            let first_part_of_string = &descriptor[0..descriptor.len() - last_character.len_utf8()];
+            match last_character {
+                // > If the descriptor consists of a valid non-negative integer followed by a
+                // > U+0077 LATIN SMALL LETTER W character
+                // > 1. If the user agent does not support the sizes attribute, let error be yes.
+                // > 2. If width and density are not both absent, then let error be yes.
+                // > 3. Apply the rules for parsing non-negative integers to the descriptor.
+                // >    If the result is 0, let error be yes. Otherwise, let width be the result.
+                'w' if density.is_none() && width.is_none() => {
+                    match parse_integer(first_part_of_string.chars()) {
+                        Ok(number) if number > 0 => {
+                            width = Some(number as u32);
+                            continue;
+                        },
+                        _ => error = true,
+                    }
+                },
+
+                // > If the descriptor consists of a valid floating-point number followed by a
+                // > U+0078 LATIN SMALL LETTER X character
+                // > 1. If width, density and future-compat-h are not all absent, then let
+                // >    error be yes.
+                // > 2. Apply the rules for parsing floating-point number values to the
+                // >    descriptor. If the result is less than 0, let error be yes. Otherwise, let
+                // >    density be the result.
+                //
+                // The HTML specification has a procedure for parsing floats that is different enough from
+                // the one that stylo uses, that it's better to use Rust's float parser here. This is
+                // what Gecko does, but it also checks to see if the number is a valid HTML-spec compliant
+                // number first. Not doing that means that we might be parsing numbers that otherwise
+                // wouldn't parse.
+                // TODO: Do what Gecko does and first validate the number passed to the Rust float parser.
+                'x' if width.is_none() && density.is_none() && future_compat_h.is_none() => {
+                    match first_part_of_string.parse::<f64>() {
+                        Ok(number) if number.is_normal() && number > 0. => {
+                            density = Some(number);
+                            continue;
+                        },
+                        _ => error = true,
+                    }
+                },
+
+                // > If the descriptor consists of a valid non-negative integer followed by a
+                // > U+0068 LATIN SMALL LETTER H character
+                // >   This is a parse error.
+                // > 1. If future-compat-h and density are not both absent, then let error be
+                // >    yes.
+                // > 2. Apply the rules for parsing non-negative integers to the descriptor.
+                // >    If the result is 0, let error be yes. Otherwise, let future-compat-h be the
+                // >    result.
+                'h' if future_compat_h.is_none() && density.is_none() => {
+                    match parse_integer(first_part_of_string.chars()) {
+                        Ok(number) if number > 0 => {
+                            future_compat_h = Some(number as u32);
+                            continue;
+                        },
+                        _ => error = true,
+                    }
+                },
+
+                // > Anything else
+                // >  Let error be yes.
+                _ => error = true,
+            }
+
+            if error {
+                break;
             }
         }
+
+        // > 14. If future-compat-h is not absent and width is absent, let error be yes.
         if future_compat_h.is_some() && width.is_none() {
             error = true;
         }
+
         if !error {
-            let descriptor = Descriptor {
-                wid: width,
-                den: density,
-            };
             let image_source = ImageSource {
-                url: url,
-                descriptor: descriptor,
+                url: url.into(),
+                descriptor: Descriptor { width, density },
             };
             candidates.push(image_source);
         }
     }
     candidates
+}
+
+#[derive(Clone)]
+enum ChangeType {
+    Environment {
+        selected_source: USVString,
+        selected_pixel_density: f64,
+    },
+    Element,
 }

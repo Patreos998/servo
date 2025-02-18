@@ -2,11 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use cssparser::RGBA;
 use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use js::rust::HandleObject;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
+use style::color::AbsoluteColor;
 use style::context::QuirksMode;
 
 use crate::dom::bindings::codegen::Bindings::HTMLTableCellElementBinding::HTMLTableCellElementMethods;
@@ -17,15 +17,18 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::{Element, LayoutElementHelpers};
 use crate::dom::htmlelement::HTMLElement;
+use crate::dom::htmltableelement::HTMLTableElement;
 use crate::dom::htmltablerowelement::HTMLTableRowElement;
-use crate::dom::node::Node;
+use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
+use crate::dom::node::{LayoutNodeHelpers, Node};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 const DEFAULT_COLSPAN: u32 = 1;
 const DEFAULT_ROWSPAN: u32 = 1;
 
 #[dom_struct]
-pub struct HTMLTableCellElement {
+pub(crate) struct HTMLTableCellElement {
     htmlelement: HTMLElement,
 }
 
@@ -40,12 +43,13 @@ impl HTMLTableCellElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableCellElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableCellElement::new_inherited(
@@ -53,6 +57,7 @@ impl HTMLTableCellElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -60,7 +65,7 @@ impl HTMLTableCellElement {
     }
 }
 
-impl HTMLTableCellElementMethods for HTMLTableCellElement {
+impl HTMLTableCellElementMethods<crate::DomTypeHolder> for HTMLTableCellElement {
     // https://html.spec.whatwg.org/multipage/#dom-tdth-colspan
     make_uint_getter!(ColSpan, "colspan", DEFAULT_COLSPAN);
 
@@ -103,15 +108,17 @@ impl HTMLTableCellElementMethods for HTMLTableCellElement {
     }
 }
 
-pub trait HTMLTableCellElementLayoutHelpers {
-    fn get_background_color(self) -> Option<RGBA>;
+pub(crate) trait HTMLTableCellElementLayoutHelpers<'dom> {
+    fn get_background_color(self) -> Option<AbsoluteColor>;
     fn get_colspan(self) -> Option<u32>;
     fn get_rowspan(self) -> Option<u32>;
+    fn get_table(self) -> Option<LayoutDom<'dom, HTMLTableElement>>;
     fn get_width(self) -> LengthOrPercentageOrAuto;
+    fn get_height(self) -> LengthOrPercentageOrAuto;
 }
 
-impl HTMLTableCellElementLayoutHelpers for LayoutDom<'_, HTMLTableCellElement> {
-    fn get_background_color(self) -> Option<RGBA> {
+impl<'dom> HTMLTableCellElementLayoutHelpers<'dom> for LayoutDom<'dom, HTMLTableCellElement> {
+    fn get_background_color(self) -> Option<AbsoluteColor> {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
             .and_then(AttrValue::as_color)
@@ -130,9 +137,28 @@ impl HTMLTableCellElementLayoutHelpers for LayoutDom<'_, HTMLTableCellElement> {
             .map(AttrValue::as_uint)
     }
 
+    fn get_table(self) -> Option<LayoutDom<'dom, HTMLTableElement>> {
+        let row = self.upcast::<Node>().composed_parent_node_ref()?;
+        row.downcast::<HTMLTableRowElement>()?;
+        let section = row.composed_parent_node_ref()?;
+        section.downcast::<HTMLTableElement>().or_else(|| {
+            section.downcast::<HTMLTableSectionElement>()?;
+            let table = section.composed_parent_node_ref()?;
+            table.downcast::<HTMLTableElement>()
+        })
+    }
+
     fn get_width(self) -> LengthOrPercentageOrAuto {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("width"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
+    }
+
+    fn get_height(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"))
             .map(AttrValue::as_dimension)
             .cloned()
             .unwrap_or(LengthOrPercentageOrAuto::Auto)
@@ -148,24 +174,22 @@ impl VirtualMethods for HTMLTableCellElement {
         match *local_name {
             local_name!("colspan") => {
                 let mut attr = AttrValue::from_u32(value.into(), DEFAULT_COLSPAN);
-                if let AttrValue::UInt(ref mut s, ref mut val) = attr {
+                if let AttrValue::UInt(_, ref mut val) = attr {
                     if *val == 0 {
                         *val = 1;
-                        *s = "1".into();
                     }
                 }
                 attr
             },
             local_name!("rowspan") => {
                 let mut attr = AttrValue::from_u32(value.into(), DEFAULT_ROWSPAN);
-                if let AttrValue::UInt(ref mut s, ref mut val) = attr {
+                if let AttrValue::UInt(_, ref mut val) = attr {
                     if *val == 0 {
                         let node = self.upcast::<Node>();
                         let doc = node.owner_doc();
                         // rowspan = 0 is not supported in quirks mode
                         if doc.quirks_mode() != QuirksMode::NoQuirks {
                             *val = 1;
-                            *s = "1".into();
                         }
                     }
                 }
@@ -173,6 +197,7 @@ impl VirtualMethods for HTMLTableCellElement {
             },
             local_name!("bgcolor") => AttrValue::from_legacy_color(value.into()),
             local_name!("width") => AttrValue::from_nonzero_dimension(value.into()),
+            local_name!("height") => AttrValue::from_nonzero_dimension(value.into()),
             _ => self
                 .super_type()
                 .unwrap()

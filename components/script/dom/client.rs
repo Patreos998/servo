@@ -14,9 +14,10 @@ use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::serviceworker::ServiceWorker;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct Client {
+pub(crate) struct Client {
     reflector_: Reflector,
     active_worker: MutNullableDom<ServiceWorker>,
     #[no_trace]
@@ -32,31 +33,35 @@ impl Client {
         Client {
             reflector_: Reflector::new(),
             active_worker: Default::default(),
-            url: url,
+            url,
             frame_type: FrameType::None,
             id: Uuid::new_v4(),
         }
     }
 
-    pub fn new(window: &Window) -> DomRoot<Client> {
-        reflect_dom_object(Box::new(Client::new_inherited(window.get_url())), window)
+    pub(crate) fn new(window: &Window) -> DomRoot<Client> {
+        reflect_dom_object(
+            Box::new(Client::new_inherited(window.get_url())),
+            window,
+            CanGc::note(),
+        )
     }
 
-    pub fn creation_url(&self) -> ServoUrl {
+    pub(crate) fn creation_url(&self) -> ServoUrl {
         self.url.clone()
     }
 
-    pub fn get_controller(&self) -> Option<DomRoot<ServiceWorker>> {
+    pub(crate) fn get_controller(&self) -> Option<DomRoot<ServiceWorker>> {
         self.active_worker.get()
     }
 
     #[allow(dead_code)]
-    pub fn set_controller(&self, worker: &ServiceWorker) {
+    pub(crate) fn set_controller(&self, worker: &ServiceWorker) {
         self.active_worker.set(Some(worker));
     }
 }
 
-impl ClientMethods for Client {
+impl ClientMethods<crate::DomTypeHolder> for Client {
     // https://w3c.github.io/ServiceWorker/#client-url-attribute
     fn Url(&self) -> USVString {
         USVString(self.url.as_str().to_owned())

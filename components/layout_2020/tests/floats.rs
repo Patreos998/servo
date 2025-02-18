@@ -6,24 +6,20 @@
 
 use std::f32::INFINITY;
 use std::ops::Range;
-use std::panic::{self, PanicInfo};
+use std::panic::{self, PanicHookInfo};
 use std::sync::{Mutex, MutexGuard};
 use std::{thread, u32};
 
 use app_units::Au;
 use euclid::num::Zero;
 use layout_2020::flow::float::{
-    ContainingBlockPositionInfo, FloatBand, FloatBandNode, FloatBandTree, FloatContext, FloatSide,
-    PlacementInfo,
+    Clear, ContainingBlockPositionInfo, FloatBand, FloatBandNode, FloatBandTree, FloatContext,
+    FloatSide, PlacementInfo,
 };
 use layout_2020::geom::{LogicalRect, LogicalVec2};
-use lazy_static::lazy_static;
 use quickcheck::{Arbitrary, Gen};
-use style::values::computed::Clear;
 
-lazy_static! {
-    static ref PANIC_HOOK_MUTEX: Mutex<()> = Mutex::new(());
-}
+static PANIC_HOOK_MUTEX: Mutex<()> = Mutex::new(());
 
 // Suppresses panic messages. Some tests need to fail and we don't want them to spam the console.
 // Note that, because the panic hook is process-wide, tests that are expected to fail might
@@ -32,7 +28,7 @@ lazy_static! {
 struct PanicMsgSuppressor<'a> {
     #[allow(dead_code)]
     mutex_guard: MutexGuard<'a, ()>,
-    prev_hook: Option<Box<dyn Fn(&PanicInfo<'_>) + 'static + Sync + Send>>,
+    prev_hook: Option<Box<dyn Fn(&PanicHookInfo<'_>) + 'static + Sync + Send>>,
 }
 
 impl<'a> PanicMsgSuppressor<'a> {
@@ -60,13 +56,13 @@ struct FloatBandWrapper(FloatBand);
 impl Arbitrary for FloatBandWrapper {
     fn arbitrary(generator: &mut Gen) -> FloatBandWrapper {
         let top: u32 = u32::arbitrary(generator);
-        let left: Option<u32> = Some(u32::arbitrary(generator));
-        let right: Option<u32> = Some(u32::arbitrary(generator));
+        let inline_start: Option<u32> = Some(u32::arbitrary(generator));
+        let inline_end: Option<u32> = Some(u32::arbitrary(generator));
 
         FloatBandWrapper(FloatBand {
             top: Au::from_f32_px(top as f32),
-            left: left.map(|value| Au::from_f32_px(value as f32)),
-            right: right.map(|value| Au::from_f32_px(value as f32)),
+            inline_start: inline_start.map(|value| Au::from_f32_px(value as f32)),
+            inline_end: inline_end.map(|value| Au::from_f32_px(value as f32)),
         })
     }
 }
@@ -86,9 +82,9 @@ impl Arbitrary for FloatRangeInput {
         FloatRangeInput {
             start_index,
             side: if is_left {
-                FloatSide::Left
+                FloatSide::InlineStart
             } else {
-                FloatSide::Right
+                FloatSide::InlineEnd
             },
             length,
         }
@@ -162,8 +158,8 @@ fn check_tree_find(tree: &FloatBandTree, block_position: Au, sorted_bands: &[Flo
         1;
     let reference_band = &sorted_bands[reference_band_index];
     assert_eq!(found_band.top, reference_band.top);
-    assert_eq!(found_band.left, reference_band.left);
-    assert_eq!(found_band.right, reference_band.right);
+    assert_eq!(found_band.inline_start, reference_band.inline_start);
+    assert_eq!(found_band.inline_end, reference_band.inline_end);
 }
 
 fn check_tree_find_next(tree: &FloatBandTree, block_position: Au, sorted_bands: &[FloatBand]) {
@@ -176,8 +172,8 @@ fn check_tree_find_next(tree: &FloatBandTree, block_position: Au, sorted_bands: 
         .expect("Couldn't find the reference band!");
     let reference_band = &sorted_bands[reference_band_index];
     assert_eq!(found_band.top, reference_band.top);
-    assert_eq!(found_band.left, reference_band.left);
-    assert_eq!(found_band.right, reference_band.right);
+    assert_eq!(found_band.inline_start, reference_band.inline_start);
+    assert_eq!(found_band.inline_end, reference_band.inline_end);
 }
 
 fn check_node_range_setting(
@@ -188,8 +184,8 @@ fn check_node_range_setting(
 ) {
     if node.band.top >= block_range.start && node.band.top < block_range.end {
         match side {
-            FloatSide::Left => assert!(node.band.left.unwrap() >= value),
-            FloatSide::Right => assert!(node.band.right.unwrap() <= value),
+            FloatSide::InlineStart => assert!(node.band.inline_start.unwrap() >= value),
+            FloatSide::InlineEnd => assert!(node.band.inline_end.unwrap() <= value),
         }
     }
 
@@ -251,17 +247,17 @@ fn test_tree_find() {
         let mut bands: Vec<FloatBand> = bands.into_iter().map(|band| band.0).collect();
         bands.push(FloatBand {
             top: Au::zero(),
-            left: None,
-            right: None,
+            inline_start: None,
+            inline_end: None,
         });
         bands.push(FloatBand {
             top: Au::from_f32_px(INFINITY),
-            left: None,
-            right: None,
+            inline_start: None,
+            inline_end: None,
         });
         let mut tree = FloatBandTree::new();
-        for ref band in &bands {
-            tree = tree.insert((*band).clone());
+        for band in &bands {
+            tree = tree.insert(*band);
         }
         bands.sort_by(|a, b| a.top.partial_cmp(&b.top).unwrap());
         for lookup in lookups {
@@ -279,19 +275,19 @@ fn test_tree_find_next() {
         let mut bands: Vec<FloatBand> = bands.into_iter().map(|band| band.0).collect();
         bands.push(FloatBand {
             top: Au::zero(),
-            left: None,
-            right: None,
+            inline_start: None,
+            inline_end: None,
         });
         bands.push(FloatBand {
             top: Au::from_f32_px(INFINITY),
-            left: None,
-            right: None,
+            inline_start: None,
+            inline_end: None,
         });
         bands.sort_by(|a, b| a.top.partial_cmp(&b.top).unwrap());
         bands.dedup_by(|a, b| a.top == b.top);
         let mut tree = FloatBandTree::new();
-        for ref band in &bands {
-            tree = tree.insert((*band).clone());
+        for band in &bands {
+            tree = tree.insert(*band);
         }
         for lookup in lookups {
             check_tree_find_next(&tree, Au::from_f32_px(lookup as f32), &bands);
@@ -307,7 +303,7 @@ fn test_tree_range_setting() {
     fn check(bands: Vec<FloatBandWrapper>, ranges: Vec<FloatRangeInput>) {
         let mut tree = FloatBandTree::new();
         for FloatBandWrapper(ref band) in &bands {
-            tree = tree.insert((*band).clone());
+            tree = tree.insert(*band);
         }
 
         let mut tops: Vec<Au> = bands.iter().map(|band| band.0.top).collect();
@@ -360,9 +356,9 @@ impl Arbitrary for FloatInput {
                     block: Au::from_f32_px(height as f32),
                 },
                 side: if is_left {
-                    FloatSide::Left
+                    FloatSide::InlineStart
                 } else {
-                    FloatSide::Right
+                    FloatSide::InlineEnd
                 },
                 clear: new_clear(clear),
             },
@@ -424,8 +420,8 @@ impl Arbitrary for FloatInput {
 fn new_clear(value: u8) -> Clear {
     match value & 3 {
         0 => Clear::None,
-        1 => Clear::Left,
-        2 => Clear::Right,
+        1 => Clear::InlineStart,
+        2 => Clear::InlineEnd,
         _ => Clear::Both,
     }
 }
@@ -470,8 +466,8 @@ impl Drop for FloatPlacement {
 impl PlacedFloat {
     fn rect(&self) -> LogicalRect<Au> {
         LogicalRect {
-            start_corner: self.origin.clone(),
-            size: self.info.size.clone(),
+            start_corner: self.origin,
+            size: self.info.size,
         }
     }
 }
@@ -507,10 +503,10 @@ impl FloatPlacement {
 fn check_floats_rule_1(placement: &FloatPlacement) {
     for placed_float in &placement.placed_floats {
         match placed_float.info.side {
-            FloatSide::Left => assert!(
+            FloatSide::InlineStart => assert!(
                 placed_float.origin.inline >= placed_float.containing_block_info.inline_start
             ),
-            FloatSide::Right => {
+            FloatSide::InlineEnd => {
                 assert!(
                     placed_float.rect().max_inline_position() <=
                         placed_float.containing_block_info.inline_end
@@ -529,19 +525,20 @@ fn check_floats_rule_2(placement: &FloatPlacement) {
     for (this_float_index, this_float) in placement.placed_floats.iter().enumerate() {
         for prev_float in &placement.placed_floats[0..this_float_index] {
             match (this_float.info.side, prev_float.info.side) {
-                (FloatSide::Left, FloatSide::Left) => {
+                (FloatSide::InlineStart, FloatSide::InlineStart) => {
                     assert!(
                         this_float.origin.inline >= prev_float.rect().max_inline_position() ||
                             this_float.origin.block >= prev_float.rect().max_block_position()
                     );
                 },
-                (FloatSide::Right, FloatSide::Right) => {
+                (FloatSide::InlineEnd, FloatSide::InlineEnd) => {
                     assert!(
                         this_float.rect().max_inline_position() <= prev_float.origin.inline ||
                             this_float.origin.block >= prev_float.rect().max_block_position()
                     );
                 },
-                (FloatSide::Left, FloatSide::Right) | (FloatSide::Right, FloatSide::Left) => {},
+                (FloatSide::InlineStart, FloatSide::InlineEnd) |
+                (FloatSide::InlineEnd, FloatSide::InlineStart) => {},
             }
         }
     }
@@ -571,13 +568,14 @@ fn check_floats_rule_3(placement: &FloatPlacement) {
             }
 
             match (this_float.info.side, other_float.info.side) {
-                (FloatSide::Left, FloatSide::Right) => {
+                (FloatSide::InlineStart, FloatSide::InlineEnd) => {
                     assert!(this_float.rect().max_inline_position() <= other_float.origin.inline);
                 },
-                (FloatSide::Right, FloatSide::Left) => {
+                (FloatSide::InlineEnd, FloatSide::InlineStart) => {
                     assert!(this_float.origin.inline >= other_float.rect().max_inline_position());
                 },
-                (FloatSide::Left, FloatSide::Left) | (FloatSide::Right, FloatSide::Right) => {},
+                (FloatSide::InlineStart, FloatSide::InlineStart) |
+                (FloatSide::InlineEnd, FloatSide::InlineEnd) => {},
             }
         }
     }
@@ -619,14 +617,14 @@ fn check_floats_rule_7(placement: &FloatPlacement) {
     for (placed_float_index, placed_float) in placement.placed_floats.iter().enumerate() {
         // Only consider floats that stick out.
         match placed_float.info.side {
-            FloatSide::Left => {
+            FloatSide::InlineStart => {
                 if placed_float.rect().max_inline_position() <=
                     placed_float.containing_block_info.inline_end
                 {
                     continue;
                 }
             },
-            FloatSide::Right => {
+            FloatSide::InlineEnd => {
                 if placed_float.origin.inline >= placed_float.containing_block_info.inline_start {
                     continue;
                 }
@@ -648,7 +646,7 @@ fn check_floats_rule_7(placement: &FloatPlacement) {
 fn check_floats_rule_8(floats_and_perturbations: Vec<(FloatInput, u32)>) {
     let floats = floats_and_perturbations
         .iter()
-        .map(|&(ref float, _)| (*float).clone())
+        .map(|(float, _)| (*float).clone())
         .collect();
     let placement = FloatPlacement::place(floats);
 
@@ -658,9 +656,7 @@ fn check_floats_rule_8(floats_and_perturbations: Vec<(FloatInput, u32)>) {
         }
 
         let mut placement = placement.clone();
-        placement.placed_floats[float_index].origin.block =
-            placement.placed_floats[float_index].origin.block -
-                Au::from_f32_px(perturbation as f32);
+        placement.placed_floats[float_index].origin.block -= Au::from_f32_px(perturbation as f32);
 
         let result = {
             let mutex_guard = PANIC_HOOK_MUTEX.lock().unwrap();
@@ -677,7 +673,7 @@ fn check_floats_rule_8(floats_and_perturbations: Vec<(FloatInput, u32)>) {
 fn check_floats_rule_9(floats_and_perturbations: Vec<(FloatInput, u32)>) {
     let floats = floats_and_perturbations
         .iter()
-        .map(|&(ref float, _)| (*float).clone())
+        .map(|(float, _)| (*float).clone())
         .collect();
     let placement = FloatPlacement::place(floats);
 
@@ -691,12 +687,8 @@ fn check_floats_rule_9(floats_and_perturbations: Vec<(FloatInput, u32)>) {
             let placed_float = &mut placement.placed_floats[float_index];
             let perturbation = Au::from_f32_px(perturbation as f32);
             match placed_float.info.side {
-                FloatSide::Left => {
-                    placed_float.origin.inline = placed_float.origin.inline - perturbation
-                },
-                FloatSide::Right => {
-                    placed_float.origin.inline = placed_float.origin.inline + perturbation
-                },
+                FloatSide::InlineStart => placed_float.origin.inline -= perturbation,
+                FloatSide::InlineEnd => placed_float.origin.inline += perturbation,
             }
         }
 
@@ -746,8 +738,8 @@ fn check_floats_rule_10(placement: &FloatPlacement) {
             }
 
             match this_float.info.clear {
-                Clear::Left => assert_ne!(other_float.info.side, FloatSide::Left),
-                Clear::Right => assert_ne!(other_float.info.side, FloatSide::Right),
+                Clear::InlineStart => assert_ne!(other_float.info.side, FloatSide::InlineStart),
+                Clear::InlineEnd => assert_ne!(other_float.info.side, FloatSide::InlineEnd),
                 Clear::Both => assert!(false),
                 Clear::None => unreachable!(),
             }

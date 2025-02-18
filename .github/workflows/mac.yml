@@ -1,4 +1,4 @@
-name: Mac
+name: MacOS
 
 on:
   workflow_call:
@@ -7,7 +7,7 @@ on:
         required: false
         default: "release"
         type: string
-      wpt-tests-to-run:
+      wpt-args:
         default: ""
         required: false
         type: string
@@ -18,6 +18,10 @@ on:
         required: false
         default: false
         type: boolean
+      build-libservo:
+        required: false
+        default: false
+        type: boolean
       upload:
         required: false
         default: false
@@ -25,6 +29,14 @@ on:
       github-release-id:
         required: false
         type: string
+      force-github-hosted-runner:
+          required: false
+          type: boolean
+          default: false
+      bencher:
+        required: false
+        default: false
+        type: boolean
   workflow_dispatch:
     inputs:
       profile:
@@ -32,7 +44,7 @@ on:
         default: "release"
         type: choice
         options: ["release", "debug", "production"]
-      wpt-tests-to-run:
+      wpt-args:
         default: ""
         required: false
         type: string
@@ -44,7 +56,19 @@ on:
         required: false
         default: false
         type: boolean
+      build-libservo:
+        required: false
+        default: false
+        type: boolean
       upload:
+        required: false
+        default: false
+        type: boolean
+      force-github-hosted-runner:
+          required: false
+          type: boolean
+          default: false
+      bencher:
         required: false
         default: false
         type: boolean
@@ -52,14 +76,32 @@ on:
 env:
   RUST_BACKTRACE: 1
   SHELL: /bin/bash
-  SCCACHE_GHA_ENABLED: "true"
-  CCACHE: "sccache"
   CARGO_INCREMENTAL: 0
 
 jobs:
+  # Runs the underlying job (“workload”) on a self-hosted runner if available,
+  # with the help of a `runner-select` job and a `runner-timeout` job.
+  runner-select:
+    uses: ./.github/workflows/self-hosted-runner-select.yml
+    secrets: inherit
+    with:
+      github-hosted-runner-label: macos-13
+      self-hosted-image-name: servo-macos13
+      force-github-hosted-runner: ${{ inputs.force-github-hosted-runner }}
+  runner-timeout:
+    needs:
+      - runner-select
+    uses: ./.github/workflows/self-hosted-runner-timeout.yml
+    secrets: inherit
+    with:
+      unique-id: ${{ needs.runner-select.outputs.unique-id }}
+      is-self-hosted: ${{ fromJSON(needs.runner-select.outputs.is-self-hosted) }}
+
   build:
-    name: Mac Build
-    runs-on: macos-13
+    needs:
+      - runner-select
+    name: MacOS Build [${{ needs.runner-select.outputs.unique-id }}]
+    runs-on: ${{ needs.runner-select.outputs.selected-runner-label }}
     steps:
       # XProtect can cause random failures if it decides that the DMG we create
       # during the packaging phase is malware.
@@ -68,72 +110,83 @@ jobs:
       - name: Kill XProtectBehaviorService
         run: |
           echo Killing XProtect.; sudo pkill -9 XProtect >/dev/null || true;
-      - uses: actions/checkout@v3
-        if: github.event_name != 'pull_request_target'
-        with:
-          fetch-depth: 2
+      - uses: actions/checkout@v4
+        if: runner.environment != 'self-hosted' && github.event_name != 'pull_request_target'
       # This is necessary to checkout the pull request if this run was triggered via a
       # `pull_request_target` event.
-      - uses: actions/checkout@v3
-        if: github.event_name == 'pull_request_target'
+      - uses: actions/checkout@v4
+        if: runner.environment != 'self-hosted' && github.event_name == 'pull_request_target'
         with:
-          ref: refs/pull/${{ github.event.number }}/head
-          fetch-depth: 2
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-      - name: Install taplo
-        uses: baptiste0928/cargo-install@v2
-        with:
-          crate: taplo-cli
-          locked: true
-      - name: Bootstrap
+          ref: ${{ github.event.pull_request.head.sha }}
+      # Faster checkout for self-hosted runner that uses prebaked repo.
+      - if: ${{ runner.environment == 'self-hosted' && github.event_name != 'pull_request_target' }}
+        run: git fetch --depth=1 origin $GITHUB_SHA
+      - if: ${{ runner.environment == 'self-hosted' && github.event_name == 'pull_request_target' }}
+        run: git fetch --depth=1 origin ${{ github.event.pull_request.head.sha }}
+      - if: ${{ runner.environment == 'self-hosted' }}
+        # Same as `git switch --detach FETCH_HEAD`, but fixes up dirty working
+        # trees, in case the runner image was baked with a dirty working tree.
         run: |
-          python3 -m pip install --upgrade pip
-          python3 ./mach bootstrap
+          git switch --detach
+          git reset --hard FETCH_HEAD
+
+      - if: runner.environment != 'self-hosted'
+        name: Setup Python
+        uses: ./.github/actions/setup-python
+      - if: runner.environment != 'self-hosted'
+        name: Install crown
+        run: cargo install --path support/crown
+      - if: runner.environment != 'self-hosted'
+        name: Bootstrap
+        run: |
+          ./mach bootstrap --skip-lints
           brew install gnu-tar
       - name: Build (${{ inputs.profile }})
         run: |
-          python3 ./mach build --${{ inputs.profile }}
+          ./mach build --use-crown --locked --${{ inputs.profile }}
+          cp -r target/cargo-timings target/cargo-timings-macos
       - name: Smoketest
-        uses: nick-fields/retry@v2
+        uses: nick-fields/retry@v3
         with: # See https://github.com/servo/servo/issues/30757
           timeout_minutes: 5
           max_attempts: 2
-          command: python3 ./mach smoketest --${{ inputs.profile }}
+          command: ./mach smoketest --${{ inputs.profile }}
       - name: Script tests
         run: ./mach test-scripts
       - name: Unit tests
         if: ${{ inputs.unit-tests }}
-        uses: nick-fields/retry@v2
+        uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 20 # https://github.com/servo/servo/issues/30275
+          timeout_minutes: 40 # https://github.com/servo/servo/issues/30275
           max_attempts: 3 # https://github.com/servo/servo/issues/30683
-          command: python3 ./mach test-unit --${{ inputs.profile }}
+          command: ./mach test-unit --${{ inputs.profile }}
+      - name: Build libservo with examples
+        if: ${{ inputs.build-libservo }}
+        continue-on-error: true
+        run: cargo build -p libservo --all-targets
       - name: Build mach package
-        run: python3 ./mach package --${{ inputs.profile }}
+        run: ./mach package --${{ inputs.profile }}
       - name: Run DMG smoketest
-        uses: nick-fields/retry@v2
+        uses: nick-fields/retry@v3
         with: # See https://github.com/servo/servo/issues/30757
           timeout_minutes: 5
           max_attempts: 2
           command: ./etc/ci/macos_package_smoketest.sh target/${{ inputs.profile }}/servo-tech-demo.dmg
-      - name: Rename build timing
-        run: cp -r target/cargo-timings target/cargo-timings-macos
       - name: Archive build timing
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: cargo-timings
+          name: cargo-timings-macos-${{ inputs.profile }}
           # Using a wildcard here ensures that the archive includes the path.
           path: target/cargo-timings-*
       - name: Upload artifact for mach package
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: mac
+          name: ${{ inputs.profile }}-binary-mac
           path: target/${{ inputs.profile }}/servo-tech-demo.dmg
       - name: Upload nightly
         if: ${{ inputs.upload }}
         run: |
-          python3 ./mach upload-nightly mac --secret-from-environment \
+          ./mach upload-nightly mac --secret-from-environment \
             --github-release-id ${{ inputs.github-release-id }}
         env:
           S3_UPLOAD_CREDENTIALS: ${{ secrets.S3_UPLOAD_CREDENTIALS }}
@@ -143,47 +196,43 @@ jobs:
       - name: Build package for target
         run: gtar -czf target.tar.gz target/${{ inputs.profile }}/servo target/${{ inputs.profile }}/lib/*.dylib resources
       - name: Upload package for target
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: release-binary-macos
+          name: ${{ inputs.profile }}-binary-macos
           path: target.tar.gz
 
   wpt-2020:
     if: ${{ inputs.wpt-layout == '2020' || inputs.wpt-layout == 'all' }}
-    name: Mac WPT Tests 2020
+    name: MacOS WPT
     needs: ["build"]
     uses: ./.github/workflows/mac-wpt.yml
     with:
       profile: ${{ inputs.profile }}
       wpt-layout: "layout-2020"
-      wpt-tests-to-run: ${{ inputs.wpt-tests-to-run }}
+      wpt-args: ${{ inputs.wpt-args }}
     secrets: inherit
 
   wpt-2013:
     if: ${{ inputs.wpt-layout == '2013' || inputs.wpt-layout == 'all' }}
-    name: Mac WPT Tests 2013
+    name: MacOS WPT (Legacy)
     needs: ["build"]
     uses: ./.github/workflows/mac-wpt.yml
     with:
       profile: ${{ inputs.profile }}
       wpt-layout: "layout-2013"
-      wpt-tests-to-run: ${{ inputs.wpt-tests-to-run }}
+      wpt-args: ${{ inputs.wpt-args }}
     secrets: inherit
 
-  result:
-    name: Result
-    runs-on: ubuntu-latest
-    if: always()
-    # needs all build to detect cancellation
-    needs:
-      - "build"
-      - "wpt-2020"
-      - "wpt-2013"
-
-    steps:
-      - name: Mark the job as successful
-        run: exit 0
-        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }}
-      - name: Mark the job as unsuccessful
-        run: exit 1
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+  bencher:
+    needs: ["build"]
+    if: ${{ inputs.bencher && inputs.profile != 'debug' && github.event_name != 'workflow_dispatch' && github.event_name != 'merge_group' }}
+    uses: ./.github/workflows/bencher.yml
+    with:
+      target: 'macos'
+      profile: ${{ inputs.profile }}
+      compressed-file-path: ${{ inputs.profile }}-binary-macos/target.tar.gz
+      binary-path: target/${{ inputs.profile }}/servo
+      file-size: true
+      speedometer: false
+      dromaeo: false
+    secrets: inherit

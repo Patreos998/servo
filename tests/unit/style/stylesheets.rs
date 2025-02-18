@@ -6,16 +6,16 @@ use std::cell::RefCell;
 
 use cssparser::SourceLocation;
 use servo_arc::Arc;
-use servo_url::ServoUrl;
 use style::context::QuirksMode;
 use style::error_reporting::{ContextualParseError, ParseErrorReporter};
 use style::media_queries::MediaList;
 use style::shared_lock::SharedRwLock;
-use style::stylesheets::{AllowImportRules, Origin, Stylesheet};
+use style::stylesheets::{AllowImportRules, Origin, Stylesheet, UrlExtraData};
+use url::Url;
 
 #[derive(Debug)]
 struct CSSError {
-    pub url: ServoUrl,
+    pub url: Arc<Url>,
     pub line: u32,
     pub column: u32,
     pub message: String,
@@ -60,9 +60,14 @@ impl TestingErrorReporter {
 }
 
 impl ParseErrorReporter for TestingErrorReporter {
-    fn report_error(&self, url: &ServoUrl, location: SourceLocation, error: ContextualParseError) {
+    fn report_error(
+        &self,
+        url: &UrlExtraData,
+        location: SourceLocation,
+        error: ContextualParseError,
+    ) {
         self.errors.borrow_mut().push(CSSError {
-            url: url.clone(),
+            url: url.0.clone(),
             line: location.line,
             column: location.column,
             message: error.to_string(),
@@ -88,53 +93,52 @@ fn test_report_error_stylesheet() {
     @supports (color: green) and invalid and (margin: 0) {}
     @keyframes foo { from invalid {} to { margin: 0 invalid 0; } }
     ";
-    let url = ServoUrl::parse("about::test").unwrap();
+    let url = Url::parse("about::test").unwrap();
     let error_reporter = TestingErrorReporter::new();
 
     let lock = SharedRwLock::new();
     let media = Arc::new(lock.wrap(MediaList::empty()));
     Stylesheet::from_str(
         css,
-        url.clone(),
+        url.clone().into(),
         Origin::UserAgent,
         media,
         lock,
         None,
         Some(&error_reporter),
         QuirksMode::NoQuirks,
-        5,
         AllowImportRules::Yes,
     );
 
     error_reporter.assert_messages_contain(&[
         (
-            8,
+            3,
             18,
             "Unsupported property declaration: 'display: invalid;'",
         ),
         (
-            9,
+            4,
             43,
             "Unsupported property declaration: 'background-image:",
         ), // FIXME: column should be around 56
-        (10, 17, "Unsupported property declaration: 'invalid: true;'"),
-        (12, 28, "Invalid media rule"),
+        (5, 17, "Unsupported property declaration: 'invalid: true;'"),
+        (7, 28, "Invalid media rule"),
         // When @counter-style is supported, this should be replaced with two errors
-        (14, 19, "Invalid rule: '@counter-style "),
+        (9, 19, "Invalid rule: '@counter-style "),
         // When @font-feature-values is supported, this should be replaced with two errors
-        (15, 25, "Invalid rule: '@font-feature-values "),
-        (16, 13, "Invalid rule: '@invalid'"),
-        (17, 29, "Invalid rule: '@invalid'"),
-        (18, 34, "Invalid rule: '@supports "),
-        (19, 26, "Invalid keyframe rule: 'from invalid '"),
+        (10, 25, "Invalid rule: '@font-feature-values "),
+        (11, 13, "Invalid rule: '@invalid'"),
+        (12, 29, "Invalid rule: '@invalid'"),
+        (13, 34, "Invalid rule: '@supports "),
+        (14, 26, "Invalid keyframe rule: 'from invalid '"),
         (
-            19,
+            14,
             52,
-            "Unsupported keyframe property declaration: 'margin: 0 invalid 0;'",
+            "Unsupported property declaration: 'margin: 0 invalid 0;'",
         ),
     ]);
 
-    assert_eq!(error_reporter.errors.borrow()[0].url, url);
+    assert_eq!(*error_reporter.errors.borrow()[0].url, url);
 }
 
 #[test]
@@ -146,21 +150,20 @@ fn test_no_report_unrecognized_vendor_properties() {
         -moz-background-color: red;
     }
     ";
-    let url = ServoUrl::parse("about::test").unwrap();
+    let url = Url::parse("about::test").unwrap();
     let error_reporter = TestingErrorReporter::new();
 
     let lock = SharedRwLock::new();
     let media = Arc::new(lock.wrap(MediaList::empty()));
     Stylesheet::from_str(
         css,
-        url,
+        url.into(),
         Origin::UserAgent,
         media,
         lock,
         None,
         Some(&error_reporter),
         QuirksMode::NoQuirks,
-        0,
         AllowImportRules::Yes,
     );
 
@@ -182,19 +185,18 @@ fn test_source_map_url() {
     ];
 
     for test in tests {
-        let url = ServoUrl::parse("about::test").unwrap();
+        let url = Url::parse("about::test").unwrap();
         let lock = SharedRwLock::new();
         let media = Arc::new(lock.wrap(MediaList::empty()));
         let stylesheet = Stylesheet::from_str(
             test.0,
-            url.clone(),
+            url.into(),
             Origin::UserAgent,
             media,
             lock,
             None,
             None,
             QuirksMode::NoQuirks,
-            0,
             AllowImportRules::Yes,
         );
         let url_opt = stylesheet.contents.source_map_url.read();
@@ -210,19 +212,18 @@ fn test_source_url() {
     ];
 
     for test in tests {
-        let url = ServoUrl::parse("about::test").unwrap();
+        let url = Url::parse("about::test").unwrap();
         let lock = SharedRwLock::new();
         let media = Arc::new(lock.wrap(MediaList::empty()));
         let stylesheet = Stylesheet::from_str(
             test.0,
-            url.clone(),
+            url.into(),
             Origin::UserAgent,
             media,
             lock,
             None,
             None,
             QuirksMode::NoQuirks,
-            0,
             AllowImportRules::Yes,
         );
         let url_opt = stylesheet.contents.source_url.read();

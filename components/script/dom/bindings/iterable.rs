@@ -21,16 +21,16 @@ use crate::dom::bindings::codegen::Bindings::IterableIteratorBinding::{
 };
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::reflector::{
-    reflect_dom_object, DomObjectIteratorWrap, DomObjectWrap, Reflector,
+    reflect_dom_object, DomGlobal, DomObjectIteratorWrap, DomObjectWrap, Reflector,
 };
 use crate::dom::bindings::root::{Dom, DomRoot, Root};
 use crate::dom::bindings::trace::{JSTraceable, RootedTraceableBox};
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::{CanGc, JSContext};
 
 /// The values that an iterator will iterate over.
 #[derive(JSTraceable, MallocSizeOf)]
-pub enum IteratorType {
+pub(crate) enum IteratorType {
     /// The keys of the iterable object.
     Keys,
     /// The values of the iterable object.
@@ -40,7 +40,7 @@ pub enum IteratorType {
 }
 
 /// A DOM object that can be iterated over using a pair value iterator.
-pub trait Iterable {
+pub(crate) trait Iterable {
     /// The type of the key of the iterator pair.
     type Key: ToJSValConvertible;
     /// The type of the value of the iterator pair.
@@ -54,9 +54,8 @@ pub trait Iterable {
 }
 
 /// An iterator over the iterable entries of a given DOM interface.
-//FIXME: #12811 prevents dom_struct with type parameters
 #[dom_struct]
-pub struct IterableIterator<T: DomObjectIteratorWrap + JSTraceable + Iterable> {
+pub(crate) struct IterableIterator<T: DomObjectIteratorWrap + JSTraceable + Iterable> {
     reflector: Reflector,
     iterable: Dom<T>,
     type_: IteratorType,
@@ -65,19 +64,19 @@ pub struct IterableIterator<T: DomObjectIteratorWrap + JSTraceable + Iterable> {
 
 impl<T: DomObjectIteratorWrap + JSTraceable + Iterable> IterableIterator<T> {
     /// Create a new iterator instance for the provided iterable DOM interface.
-    pub fn new(iterable: &T, type_: IteratorType) -> DomRoot<Self> {
+    pub(crate) fn new(iterable: &T, type_: IteratorType) -> DomRoot<Self> {
         let iterator = Box::new(IterableIterator {
             reflector: Reflector::new(),
-            type_: type_,
+            type_,
             iterable: Dom::from_ref(iterable),
             index: Cell::new(0),
         });
-        reflect_dom_object(iterator, &*iterable.global())
+        reflect_dom_object(iterator, &*iterable.global(), CanGc::note())
     }
 
     /// Return the next value from the iterable object.
     #[allow(non_snake_case)]
-    pub fn Next(&self, cx: JSContext) -> Fallible<NonNull<JSObject>> {
+    pub(crate) fn Next(&self, cx: JSContext) -> Fallible<NonNull<JSObject>> {
         let index = self.index.get();
         rooted!(in(*cx) let mut value = UndefinedValue());
         rooted!(in(*cx) let mut rval = ptr::null_mut::<JSObject>());
@@ -126,6 +125,7 @@ impl<T: DomObjectIteratorWrap + JSTraceable + Iterable> DomObjectWrap for Iterab
         &GlobalScope,
         Option<HandleObject>,
         Box<Self>,
+        CanGc,
     ) -> Root<Dom<Self>> = T::ITER_WRAP;
 }
 

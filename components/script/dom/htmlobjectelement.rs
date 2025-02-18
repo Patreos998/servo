@@ -7,7 +7,7 @@ use std::default::Default;
 use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use js::rust::HandleObject;
-use net_traits::image::base::Image;
+use pixels::Image;
 use servo_arc::Arc;
 
 use crate::dom::attr::Attr;
@@ -20,13 +20,14 @@ use crate::dom::document::Document;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidityState;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLObjectElement {
+pub(crate) struct HTMLObjectElement {
     htmlelement: HTMLElement,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -49,12 +50,13 @@ impl HTMLObjectElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLObjectElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLObjectElement::new_inherited(
@@ -62,6 +64,7 @@ impl HTMLObjectElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 }
@@ -70,26 +73,23 @@ trait ProcessDataURL {
     fn process_data_url(&self);
 }
 
-impl<'a> ProcessDataURL for &'a HTMLObjectElement {
+impl ProcessDataURL for &HTMLObjectElement {
     // Makes the local `data` member match the status of the `data` attribute and starts
     /// prefetching the image. This method must be called after `data` is changed.
     fn process_data_url(&self) {
-        let elem = self.upcast::<Element>();
+        let element = self.upcast::<Element>();
 
         // TODO: support other values
-        match (
-            elem.get_attribute(&ns!(), &local_name!("type")),
-            elem.get_attribute(&ns!(), &local_name!("data")),
+        if let (None, Some(_uri)) = (
+            element.get_attribute(&ns!(), &local_name!("type")),
+            element.get_attribute(&ns!(), &local_name!("data")),
         ) {
-            (None, Some(_uri)) => {
-                // TODO(gw): Prefetch the image here.
-            },
-            _ => {},
+            // TODO(gw): Prefetch the image here.
         }
     }
 }
 
-impl HTMLObjectElementMethods for HTMLObjectElement {
+impl HTMLObjectElementMethods<crate::DomTypeHolder> for HTMLObjectElement {
     // https://html.spec.whatwg.org/multipage/#dom-object-type
     make_getter!(Type, "type");
 
@@ -112,13 +112,13 @@ impl HTMLObjectElementMethods for HTMLObjectElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -139,7 +139,7 @@ impl Validatable for HTMLObjectElement {
 
     fn validity_state(&self) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&window_from_node(self), self.upcast()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast()))
     }
 
     fn is_instance_validatable(&self) -> bool {
@@ -155,13 +155,13 @@ impl VirtualMethods for HTMLObjectElement {
 
     fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
         self.super_type().unwrap().attribute_mutated(attr, mutation);
-        match attr.local_name() {
-            &local_name!("data") => {
+        match *attr.local_name() {
+            local_name!("data") => {
                 if let AttributeMutation::Set(_) = mutation {
                     self.process_data_url();
                 }
             },
-            &local_name!("form") => {
+            local_name!("form") => {
                 self.form_attribute_mutated(mutation);
             },
             _ => {},
@@ -178,7 +178,7 @@ impl FormControl for HTMLObjectElement {
         self.form_owner.set(form);
     }
 
-    fn to_element<'a>(&'a self) -> &'a Element {
+    fn to_element(&self) -> &Element {
         self.upcast::<Element>()
     }
 }

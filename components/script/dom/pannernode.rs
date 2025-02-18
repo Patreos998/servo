@@ -7,12 +7,13 @@ use std::f32;
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
-use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage};
+use servo_media::audio::node::{AudioNodeInit, AudioNodeMessage, AudioNodeType};
 use servo_media::audio::panner_node::{
     DistanceModel, PannerNodeMessage, PannerNodeOptions, PanningModel,
 };
 use servo_media::audio::param::{ParamDir, ParamType};
 
+use crate::conversions::Convert;
 use crate::dom::audionode::AudioNode;
 use crate::dom::audioparam::AudioParam;
 use crate::dom::baseaudiocontext::BaseAudioContext;
@@ -31,9 +32,10 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct PannerNode {
+pub(crate) struct PannerNode {
     node: AudioNode,
     position_x: Dom<AudioParam>,
     position_y: Dom<AudioParam>,
@@ -56,8 +58,8 @@ pub struct PannerNode {
 }
 
 impl PannerNode {
-    #[allow(crown::unrooted_must_root)]
-    pub fn new_inherited(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new_inherited(
         window: &Window,
         context: &BaseAudioContext,
         options: &PannerOptions,
@@ -85,7 +87,7 @@ impl PannerNode {
         if *options.coneOuterGain < 0. || *options.coneOuterGain > 1. {
             return Err(Error::InvalidState);
         }
-        let options = options.into();
+        let options = options.convert();
         let node = AudioNode::new_inherited(
             AudioNodeInit::PannerNode(options),
             context,
@@ -98,6 +100,7 @@ impl PannerNode {
             window,
             context,
             id,
+            AudioNodeType::PannerNode,
             ParamType::Position(ParamDir::X),
             AutomationRate::A_rate,
             options.position_x, // default value
@@ -108,6 +111,7 @@ impl PannerNode {
             window,
             context,
             id,
+            AudioNodeType::PannerNode,
             ParamType::Position(ParamDir::Y),
             AutomationRate::A_rate,
             options.position_y, // default value
@@ -118,6 +122,7 @@ impl PannerNode {
             window,
             context,
             id,
+            AudioNodeType::PannerNode,
             ParamType::Position(ParamDir::Z),
             AutomationRate::A_rate,
             options.position_z, // default value
@@ -128,6 +133,7 @@ impl PannerNode {
             window,
             context,
             id,
+            AudioNodeType::PannerNode,
             ParamType::Orientation(ParamDir::X),
             AutomationRate::A_rate,
             options.orientation_x, // default value
@@ -138,6 +144,7 @@ impl PannerNode {
             window,
             context,
             id,
+            AudioNodeType::PannerNode,
             ParamType::Orientation(ParamDir::Y),
             AutomationRate::A_rate,
             options.orientation_y, // default value
@@ -148,6 +155,7 @@ impl PannerNode {
             window,
             context,
             id,
+            AudioNodeType::PannerNode,
             ParamType::Orientation(ParamDir::Z),
             AutomationRate::A_rate,
             options.orientation_z, // default value
@@ -173,37 +181,45 @@ impl PannerNode {
         })
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         context: &BaseAudioContext,
         options: &PannerOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<PannerNode>> {
-        Self::new_with_proto(window, None, context, options)
+        Self::new_with_proto(window, None, context, options, can_gc)
     }
 
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
         context: &BaseAudioContext,
         options: &PannerOptions,
+        can_gc: CanGc,
     ) -> Fallible<DomRoot<PannerNode>> {
         let node = PannerNode::new_inherited(window, context, options)?;
-        Ok(reflect_dom_object_with_proto(Box::new(node), window, proto))
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
-        context: &BaseAudioContext,
-        options: &PannerOptions,
-    ) -> Fallible<DomRoot<PannerNode>> {
-        PannerNode::new_with_proto(window, proto, context, options)
+        Ok(reflect_dom_object_with_proto(
+            Box::new(node),
+            window,
+            proto,
+            can_gc,
+        ))
     }
 }
 
-impl PannerNodeMethods for PannerNode {
+impl PannerNodeMethods<crate::DomTypeHolder> for PannerNode {
+    // https://webaudio.github.io/web-audio-api/#dom-pannernode-pannernode
+    fn Constructor(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        context: &BaseAudioContext,
+        options: &PannerOptions,
+    ) -> Fallible<DomRoot<PannerNode>> {
+        PannerNode::new_with_proto(window, proto, context, options, can_gc)
+    }
+
     // https://webaudio.github.io/web-audio-api/#dom-pannernode-positionx
     fn PositionX(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.position_x)
@@ -240,7 +256,7 @@ impl PannerNodeMethods for PannerNode {
     }
     // https://webaudio.github.io/web-audio-api/#dom-pannernode-distancemodel
     fn SetDistanceModel(&self, model: DistanceModelType) {
-        self.distance_model.set(model.into());
+        self.distance_model.set(model.convert());
         let msg = PannerNodeMessage::SetDistanceModel(self.distance_model.get());
         self.upcast::<AudioNode>()
             .message(AudioNodeMessage::PannerNode(msg));
@@ -254,7 +270,7 @@ impl PannerNodeMethods for PannerNode {
     }
     // https://webaudio.github.io/web-audio-api/#dom-pannernode-panningmodel
     fn SetPanningModel(&self, model: PanningModelType) {
-        self.panning_model.set(model.into());
+        self.panning_model.set(model.convert());
         let msg = PannerNodeMessage::SetPanningModel(self.panning_model.get());
         self.upcast::<AudioNode>()
             .message(AudioNodeMessage::PannerNode(msg));
@@ -357,30 +373,30 @@ impl PannerNodeMethods for PannerNode {
     }
 }
 
-impl<'a> From<&'a PannerOptions> for PannerNodeOptions {
-    fn from(options: &'a PannerOptions) -> Self {
-        Self {
-            panning_model: options.panningModel.into(),
-            distance_model: options.distanceModel.into(),
-            position_x: *options.positionX,
-            position_y: *options.positionY,
-            position_z: *options.positionZ,
-            orientation_x: *options.orientationX,
-            orientation_y: *options.orientationY,
-            orientation_z: *options.orientationZ,
-            ref_distance: *options.refDistance,
-            max_distance: *options.maxDistance,
-            rolloff_factor: *options.rolloffFactor,
-            cone_inner_angle: *options.coneInnerAngle,
-            cone_outer_angle: *options.coneOuterAngle,
-            cone_outer_gain: *options.coneOuterGain,
+impl Convert<PannerNodeOptions> for &PannerOptions {
+    fn convert(self) -> PannerNodeOptions {
+        PannerNodeOptions {
+            panning_model: self.panningModel.convert(),
+            distance_model: self.distanceModel.convert(),
+            position_x: *self.positionX,
+            position_y: *self.positionY,
+            position_z: *self.positionZ,
+            orientation_x: *self.orientationX,
+            orientation_y: *self.orientationY,
+            orientation_z: *self.orientationZ,
+            ref_distance: *self.refDistance,
+            max_distance: *self.maxDistance,
+            rolloff_factor: *self.rolloffFactor,
+            cone_inner_angle: *self.coneInnerAngle,
+            cone_outer_angle: *self.coneOuterAngle,
+            cone_outer_gain: *self.coneOuterGain,
         }
     }
 }
 
-impl From<DistanceModelType> for DistanceModel {
-    fn from(model: DistanceModelType) -> Self {
-        match model {
+impl Convert<DistanceModel> for DistanceModelType {
+    fn convert(self) -> DistanceModel {
+        match self {
             DistanceModelType::Linear => DistanceModel::Linear,
             DistanceModelType::Inverse => DistanceModel::Inverse,
             DistanceModelType::Exponential => DistanceModel::Exponential,
@@ -388,9 +404,9 @@ impl From<DistanceModelType> for DistanceModel {
     }
 }
 
-impl From<PanningModelType> for PanningModel {
-    fn from(model: PanningModelType) -> Self {
-        match model {
+impl Convert<PanningModel> for PanningModelType {
+    fn convert(self) -> PanningModel {
+        match self {
             PanningModelType::Equalpower => PanningModel::EqualPower,
             PanningModelType::HRTF => PanningModel::HRTF,
         }

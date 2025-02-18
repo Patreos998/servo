@@ -16,13 +16,11 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::{f32, fmt};
 
+use base::id::PipelineId;
+use base::print_tree::PrintTree;
 use embedder_traits::Cursor;
 use euclid::{SideOffsets2D, Vector2D};
-use gfx_traits::print_tree::PrintTree;
-use gfx_traits::{self, StackingContextId};
-use msg::constellation_msg::PipelineId;
-use net_traits::image::base::Image;
-use script_traits::compositor::ScrollTreeNodeId;
+use pixels::Image;
 use serde::Serialize;
 use servo_geometry::MaxRect;
 use style::computed_values::_servo_top_layer::T as InTopLayer;
@@ -30,10 +28,13 @@ pub use style::dom::OpaqueNode;
 use webrender_api as wr;
 use webrender_api::units::{LayoutPixel, LayoutRect, LayoutTransform};
 use webrender_api::{
-    BorderRadius, ClipChainId, ClipId, ClipMode, CommonItemProperties, ComplexClipRegion,
-    ExternalScrollId, FilterOp, GlyphInstance, GradientStop, ImageKey, MixBlendMode,
-    PrimitiveFlags, ScrollSensitivity, Shadow, SpatialId, StickyOffsetBounds, TransformStyle,
+    BorderRadius, ClipChainId, ClipMode, CommonItemProperties, ComplexClipRegion, ExternalScrollId,
+    FilterOp, GlyphInstance, GradientStop, ImageKey, MixBlendMode, PrimitiveFlags, Shadow,
+    SpatialId, StickyOffsetBounds, TransformStyle,
 };
+use webrender_traits::display_list::{AxesScrollSensitivity, ScrollTreeNodeId};
+
+use super::StackingContextId;
 
 /// The factor that we multiply the blur radius by in order to inflate the boundaries of display
 /// items that involve a blur. This ensures that the display item boundaries include all the ink.
@@ -108,8 +109,8 @@ impl DisplayList {
     /// Return the bounds of this display list based on the dimensions of the root
     /// stacking context.
     pub fn bounds(&self) -> LayoutRect {
-        match self.list.get(0) {
-            Some(&DisplayItem::PushStackingContext(ref item)) => item.stacking_context.bounds,
+        match self.list.first() {
+            Some(DisplayItem::PushStackingContext(item)) => item.stacking_context.bounds,
             Some(_) => unreachable!("Root element of display list not stacking context."),
             None => LayoutRect::zero(),
         }
@@ -204,6 +205,7 @@ pub struct StackingContext {
 impl StackingContext {
     /// Creates a new stacking context.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: StackingContextId,
         context_type: StackingContextType,
@@ -351,7 +353,7 @@ pub enum ClipType {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub enum ClipScrollNodeType {
     Placeholder,
-    ScrollFrame(ScrollSensitivity, ExternalScrollId),
+    ScrollFrame(AxesScrollSensitivity, ExternalScrollId),
     StickyFrame(StickyFrameData),
     Clip(ClipType),
 }
@@ -477,6 +479,7 @@ impl BaseDisplayItem {
         BaseDisplayItem {
             metadata: DisplayItemMetadata {
                 node: OpaqueNode(0),
+                unique_id: 0,
                 cursor: None,
             },
             // Create a rectangle of maximal size.
@@ -493,7 +496,7 @@ impl BaseDisplayItem {
 pub fn empty_common_item_properties() -> CommonItemProperties {
     CommonItemProperties {
         clip_rect: LayoutRect::max_rect(),
-        clip_id: ClipId::root(wr::PipelineId::dummy()),
+        clip_chain_id: ClipChainId::INVALID,
         spatial_id: SpatialId::root_scroll_node(wr::PipelineId::dummy()),
         flags: PrimitiveFlags::empty(),
     }
@@ -551,6 +554,8 @@ impl fmt::Debug for ClippingRegion {
 pub struct DisplayItemMetadata {
     /// The DOM node from which this display item originated.
     pub node: OpaqueNode,
+    /// The unique fragment id of the fragment of this item.
+    pub unique_id: u64,
     /// The value of the `cursor` property when the mouse hovers over this display item. If `None`,
     /// this display item is ineligible for pointer events (`pointer-events: none`).
     pub cursor: Option<Cursor>,

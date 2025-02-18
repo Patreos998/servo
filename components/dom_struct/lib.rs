@@ -13,20 +13,20 @@ pub fn dom_struct(args: TokenStream, input: TokenStream) -> TokenStream {
     }
     let attributes = quote! {
         #[derive(deny_public_fields::DenyPublicFields, domobject_derive::DomObject, JSTraceable, MallocSizeOf)]
-        #[crown::unrooted_must_root_lint::must_root]
+        #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
         #[repr(C)]
     };
 
     // Work around https://github.com/rust-lang/rust/issues/46489
     let attributes: TokenStream = attributes.to_string().parse().unwrap();
 
-    let output: TokenStream = attributes.into_iter().chain(input.into_iter()).collect();
+    let output: TokenStream = attributes.into_iter().chain(input).collect();
 
     let item: Item = syn::parse(output).unwrap();
 
     if let Item::Struct(s) = item {
         let s2 = s.clone();
-        if s.generics.params.len() > 0 {
+        if !s.generics.params.is_empty() {
             return quote!(#s2).into();
         }
         if let Fields::Named(ref f) = s.fields {
@@ -38,7 +38,7 @@ pub fn dom_struct(args: TokenStream, input: TokenStream) -> TokenStream {
             quote! (
                 #s2
 
-                impl crate::dom::bindings::inheritance::HasParent for #name {
+                impl crate::HasParent for #name {
                     type Parent = #ty;
                     /// This is used in a type assertion to ensure that
                     /// the source and webidls agree as to what the parent type is

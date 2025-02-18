@@ -9,10 +9,10 @@ use std::fmt::Debug;
 use std::sync::Arc as StdArc;
 
 use atomic_refcell::AtomicRef;
-use gfx_traits::{combine_id_with_fragment_type, ByteIndex, FragmentType};
+use base::id::{BrowsingContextId, PipelineId};
+use fonts_traits::ByteIndex;
 use html5ever::{local_name, namespace_url, ns, LocalName, Namespace};
-use msg::constellation_msg::{BrowsingContextId, PipelineId};
-use net_traits::image::base::{Image, ImageMetadata};
+use pixels::{Image, ImageMetadata};
 use range::Range;
 use servo_arc::Arc;
 use servo_url::ServoUrl;
@@ -23,9 +23,11 @@ use style::dom::{LayoutIterator, NodeInfo, OpaqueNode, TElement, TNode};
 use style::properties::ComputedValues;
 use style::selector_parser::{PseudoElement, PseudoElementCascadeType, SelectorImpl};
 use style::stylist::RuleInclusion;
-use webrender_api::ExternalScrollId;
 
-use crate::{HTMLCanvasData, HTMLMediaData, LayoutNodeType, SVGSVGData, StyleAndOpaqueLayoutData};
+use crate::{
+    FragmentType, GenericLayoutData, HTMLCanvasData, HTMLMediaData, LayoutNodeType, SVGSVGData,
+    StyleData,
+};
 
 pub trait LayoutDataTrait: Default + Send + Sync + 'static {}
 
@@ -50,17 +52,11 @@ impl PseudoElementType {
     }
 
     pub fn is_before(&self) -> bool {
-        match *self {
-            PseudoElementType::Before => true,
-            _ => false,
-        }
+        matches!(*self, PseudoElementType::Before)
     }
 
     pub fn is_replaced_content(&self) -> bool {
-        match *self {
-            PseudoElementType::Before | PseudoElementType::After => true,
-            _ => false,
-        }
+        matches!(*self, PseudoElementType::Before | PseudoElementType::After)
     }
 
     pub fn style_pseudo_element(&self) -> PseudoElement {
@@ -76,28 +72,42 @@ impl PseudoElementType {
     }
 }
 
-/// Trait to abstract access to layout data across various data structures.
-pub trait GetStyleAndOpaqueLayoutData<'dom> {
-    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData>;
-}
-
 /// A wrapper so that layout can access only the methods that it should have access to. Layout must
 /// only ever see these and must never see instances of `LayoutDom`.
 /// FIXME(mrobinson): `Send + Sync` is required here for Layout 2020, but eventually it
 /// should stop sending LayoutNodes to other threads and rely on ThreadSafeLayoutNode
 /// or some other mechanism to ensure thread safety.
-pub trait LayoutNode<'dom>:
-    Copy + Debug + GetStyleAndOpaqueLayoutData<'dom> + TNode + Send + Sync
-{
+pub trait LayoutNode<'dom>: Copy + Debug + TNode + Send + Sync {
     type ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<'dom>;
     fn to_threadsafe(&self) -> Self::ConcreteThreadSafeLayoutNode;
 
     /// Returns the type ID of this node.
     fn type_id(&self) -> LayoutNodeType;
 
-    unsafe fn initialize_data(&self);
-    unsafe fn init_style_and_opaque_layout_data(&self, data: Box<StyleAndOpaqueLayoutData>);
-    unsafe fn take_style_and_opaque_layout_data(&self) -> Box<StyleAndOpaqueLayoutData>;
+    /// Initialize this node with empty style and opaque layout data.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it modifies the given node during
+    /// layout. Callers should ensure that no other layout thread is
+    /// attempting to read or modify the opaque layout data of this node.
+    unsafe fn initialize_style_and_layout_data<RequestedLayoutDataType: LayoutDataTrait>(&self);
+
+    /// Initialize this node with empty opaque layout data.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe because it modifies the given node during
+    /// layout. Callers should ensure that no other layout thread is
+    /// attempting to read or modify the opaque layout data of this node.
+    fn initialize_layout_data<RequestedLayoutDataType: LayoutDataTrait>(&self);
+
+    /// Get the [`StyleData`] for this node. Returns None if the node is unstyled.
+    fn style_data(&self) -> Option<&'dom StyleData>;
+
+    /// Get the layout data of this node, attempting to downcast it to the desired type.
+    /// Returns None if there is no layout data or it isn't of the desired type.
+    fn layout_data(&self) -> Option<&'dom GenericLayoutData>;
 
     fn rev_children(self) -> LayoutIterator<ReverseChildrenIterator<Self>> {
         LayoutIterator(ReverseChildrenIterator {
@@ -138,9 +148,8 @@ where
     ConcreteNode: LayoutNode<'dom>,
 {
     fn new(root: ConcreteNode) -> TreeIterator<ConcreteNode> {
-        let mut stack = vec![];
-        stack.push(root);
-        TreeIterator { stack: stack }
+        let stack = vec![root];
+        TreeIterator { stack }
     }
 
     pub fn next_skipping_children(&mut self) -> Option<ConcreteNode> {
@@ -155,16 +164,16 @@ where
     type Item = ConcreteNode;
     fn next(&mut self) -> Option<ConcreteNode> {
         let ret = self.stack.pop();
-        ret.map(|node| self.stack.extend(node.rev_children()));
+        if let Some(node) = ret {
+            self.stack.extend(node.rev_children())
+        }
         ret
     }
 }
 
 /// A thread-safe version of `LayoutNode`, used during flow construction. This type of layout
 /// node does not allow any parents or siblings of nodes to be accessed, to avoid races.
-pub trait ThreadSafeLayoutNode<'dom>:
-    Clone + Copy + Debug + GetStyleAndOpaqueLayoutData<'dom> + NodeInfo + PartialEq + Sized
-{
+pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialEq + Sized {
     type ConcreteNode: LayoutNode<'dom, ConcreteThreadSafeLayoutNode = Self>;
     type ConcreteElement: TElement;
 
@@ -221,13 +230,21 @@ pub trait ThreadSafeLayoutNode<'dom>:
     /// Returns a ThreadSafeLayoutElement if this is an element, None otherwise.
     fn as_element(&self) -> Option<Self::ConcreteThreadSafeLayoutElement>;
 
+    /// Returns a ThreadSafeLayoutElement if this is an element in an HTML namespace, None otherwise.
+    fn as_html_element(&self) -> Option<Self::ConcreteThreadSafeLayoutElement>;
+
     #[inline]
     fn get_pseudo_element_type(&self) -> PseudoElementType {
         self.as_element()
             .map_or(PseudoElementType::Normal, |el| el.get_pseudo_element_type())
     }
 
-    fn get_style_and_opaque_layout_data(self) -> Option<&'dom StyleAndOpaqueLayoutData>;
+    /// Get the [`StyleData`] for this node. Returns None if the node is unstyled.
+    fn style_data(&self) -> Option<&'dom StyleData>;
+
+    /// Get the layout data of this node, attempting to downcast it to the desired type.
+    /// Returns None if there is no layout data or it isn't of the desired type.
+    fn layout_data(&self) -> Option<&'dom GenericLayoutData>;
 
     fn style(&self, context: &SharedStyleContext) -> Arc<ComputedValues> {
         if let Some(el) = self.as_element() {
@@ -264,7 +281,7 @@ pub trait ThreadSafeLayoutNode<'dom>:
     ///
     /// We need this because the implementation of some methods need to access the layout
     /// data flags, and we have this annoying trait separation between script and layout :-(
-    unsafe fn unsafe_get(self) -> Self::ConcreteNode;
+    fn unsafe_get(self) -> Self::ConcreteNode;
 
     fn node_text_content(self) -> Cow<'dom, str>;
 
@@ -294,27 +311,17 @@ pub trait ThreadSafeLayoutNode<'dom>:
     /// not an iframe element, fails. Returns None if there is no nested browsing context.
     fn iframe_pipeline_id(&self) -> Option<PipelineId>;
 
-    fn get_colspan(&self) -> u32;
-
-    fn get_rowspan(&self) -> u32;
+    fn get_span(&self) -> Option<u32>;
+    fn get_colspan(&self) -> Option<u32>;
+    fn get_rowspan(&self) -> Option<u32>;
 
     fn fragment_type(&self) -> FragmentType {
         self.get_pseudo_element_type().fragment_type()
     }
-
-    fn generate_scroll_id(&self, pipeline_id: PipelineId) -> ExternalScrollId {
-        let id = combine_id_with_fragment_type(self.opaque().id(), self.fragment_type());
-        ExternalScrollId(id as u64, pipeline_id.to_webrender())
-    }
 }
 
 pub trait ThreadSafeLayoutElement<'dom>:
-    Clone
-    + Copy
-    + Sized
-    + Debug
-    + ::selectors::Element<Impl = SelectorImpl>
-    + GetStyleAndOpaqueLayoutData<'dom>
+    Clone + Copy + Sized + Debug + ::selectors::Element<Impl = SelectorImpl>
 {
     type ConcreteThreadSafeLayoutNode: ThreadSafeLayoutNode<
         'dom,
@@ -343,7 +350,11 @@ pub trait ThreadSafeLayoutElement<'dom>:
     ///
     /// We need this so that the functions defined on this trait can call
     /// lazily_compute_pseudo_element_style, which operates on TElement.
-    unsafe fn unsafe_get(self) -> Self::ConcreteElement;
+    fn unsafe_get(self) -> Self::ConcreteElement;
+
+    /// Get the local name of this element. See
+    /// <https://dom.spec.whatwg.org/#concept-element-local-name>.
+    fn get_local_name(&self) -> &LocalName;
 
     fn get_attr(&self, namespace: &Namespace, name: &LocalName) -> Option<&str>;
 
@@ -438,10 +449,9 @@ pub trait ThreadSafeLayoutElement<'dom>:
                             .stylist
                             .lazily_compute_pseudo_element_style(
                                 &context.guards,
-                                unsafe { self.unsafe_get() },
+                                self.unsafe_get(),
                                 &style_pseudo,
                                 RuleInclusion::All,
-                                data.styles.primary(),
                                 data.styles.primary(),
                                 /* is_probe = */ false,
                                 /* matching_func = */ None,

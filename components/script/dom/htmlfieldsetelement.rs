@@ -7,26 +7,29 @@ use std::default::Default;
 use dom_struct::dom_struct;
 use html5ever::{local_name, LocalName, Prefix};
 use js::rust::HandleObject;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::HTMLFieldSetElementBinding::HTMLFieldSetElementMethods;
 use crate::dom::bindings::inheritance::{Castable, ElementTypeId, HTMLElementTypeId, NodeTypeId};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
+use crate::dom::customelementregistry::CallbackReaction;
 use crate::dom::document::Document;
 use crate::dom::element::{AttributeMutation, Element};
-use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmlformelement::{FormControl, HTMLFormElement};
 use crate::dom::htmllegendelement::HTMLLegendElement;
-use crate::dom::node::{window_from_node, Node, ShadowIncluding};
+use crate::dom::node::{Node, NodeTraits, ShadowIncluding};
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidityState;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
+use crate::script_thread::ScriptThread;
 
 #[dom_struct]
-pub struct HTMLFieldSetElement {
+pub(crate) struct HTMLFieldSetElement {
     htmlelement: HTMLElement,
     form_owner: MutNullableDom<HTMLFormElement>,
     validity_state: MutNullableDom<ValidityState>,
@@ -50,12 +53,13 @@ impl HTMLFieldSetElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLFieldSetElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLFieldSetElement::new_inherited(
@@ -63,22 +67,16 @@ impl HTMLFieldSetElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    pub fn update_validity(&self) {
+    pub(crate) fn update_validity(&self) {
         let has_invalid_child = self
             .upcast::<Node>()
             .traverse_preorder(ShadowIncluding::No)
             .flat_map(DomRoot::downcast::<Element>)
-            .any(|element| {
-                if let Some(validatable) = element.as_maybe_validatable() {
-                    validatable.is_instance_validatable() &&
-                        !validatable.validity_state().invalid_flags().is_empty()
-                } else {
-                    false
-                }
-            });
+            .any(|element| element.is_invalid(false));
 
         self.upcast::<Element>()
             .set_state(ElementState::VALID, !has_invalid_child);
@@ -87,20 +85,14 @@ impl HTMLFieldSetElement {
     }
 }
 
-impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
+impl HTMLFieldSetElementMethods<crate::DomTypeHolder> for HTMLFieldSetElement {
     // https://html.spec.whatwg.org/multipage/#dom-fieldset-elements
     fn Elements(&self) -> DomRoot<HTMLCollection> {
-        #[derive(JSTraceable, MallocSizeOf)]
-        struct ElementsFilter;
-        impl CollectionFilter for ElementsFilter {
-            fn filter<'a>(&self, elem: &'a Element, _root: &'a Node) -> bool {
-                elem.downcast::<HTMLElement>()
-                    .map_or(false, HTMLElement::is_listed_element)
-            }
-        }
-        let filter = Box::new(ElementsFilter);
-        let window = window_from_node(self);
-        HTMLCollection::create(&window, self.upcast(), filter)
+        HTMLCollection::new_with_filter_fn(&self.owner_window(), self.upcast(), |element, _| {
+            element
+                .downcast::<HTMLElement>()
+                .is_some_and(HTMLElement::is_listed_element)
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-fieldset-disabled
@@ -131,13 +123,13 @@ impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-checkvalidity
-    fn CheckValidity(&self) -> bool {
-        self.check_validity()
+    fn CheckValidity(&self, can_gc: CanGc) -> bool {
+        self.check_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-reportvalidity
-    fn ReportValidity(&self) -> bool {
-        self.report_validity()
+    fn ReportValidity(&self, can_gc: CanGc) -> bool {
+        self.report_validity(can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage
@@ -149,6 +141,11 @@ impl HTMLFieldSetElementMethods for HTMLFieldSetElement {
     fn SetCustomValidity(&self, error: DOMString) {
         self.validity_state().set_custom_error_message(error);
     }
+
+    /// <https://html.spec.whatwg.org/multipage/#dom-fieldset-type>
+    fn Type(&self) -> DOMString {
+        DOMString::from_string(String::from("fieldset"))
+    }
 }
 
 impl VirtualMethods for HTMLFieldSetElement {
@@ -158,8 +155,8 @@ impl VirtualMethods for HTMLFieldSetElement {
 
     fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
         self.super_type().unwrap().attribute_mutated(attr, mutation);
-        match attr.local_name() {
-            &local_name!("disabled") => {
+        match *attr.local_name() {
+            local_name!("disabled") => {
                 let disabled_state = match mutation {
                     AttributeMutation::Set(None) => true,
                     AttributeMutation::Set(Some(_)) => {
@@ -169,9 +166,9 @@ impl VirtualMethods for HTMLFieldSetElement {
                     AttributeMutation::Removed => false,
                 };
                 let node = self.upcast::<Node>();
-                let el = self.upcast::<Element>();
-                el.set_disabled_state(disabled_state);
-                el.set_enabled_state(!disabled_state);
+                let element = self.upcast::<Element>();
+                element.set_disabled_state(disabled_state);
+                element.set_enabled_state(!disabled_state);
                 let mut found_legend = false;
                 let children = node.children().filter(|node| {
                     if found_legend {
@@ -188,38 +185,64 @@ impl VirtualMethods for HTMLFieldSetElement {
                         .traverse_preorder(ShadowIncluding::No)
                         .filter(|descendant| match descendant.type_id() {
                             NodeTypeId::Element(ElementTypeId::HTMLElement(
-                                HTMLElementTypeId::HTMLButtonElement,
-                            )) |
-                            NodeTypeId::Element(ElementTypeId::HTMLElement(
-                                HTMLElementTypeId::HTMLInputElement,
-                            )) |
-                            NodeTypeId::Element(ElementTypeId::HTMLElement(
-                                HTMLElementTypeId::HTMLSelectElement,
-                            )) |
-                            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                                HTMLElementTypeId::HTMLButtonElement |
+                                HTMLElementTypeId::HTMLInputElement |
+                                HTMLElementTypeId::HTMLSelectElement |
                                 HTMLElementTypeId::HTMLTextAreaElement,
                             )) => true,
+                            NodeTypeId::Element(ElementTypeId::HTMLElement(
+                                HTMLElementTypeId::HTMLElement,
+                            )) => descendant
+                                .downcast::<HTMLElement>()
+                                .unwrap()
+                                .is_form_associated_custom_element(),
                             _ => false,
                         })
                 });
                 if disabled_state {
                     for field in fields {
-                        let el = field.downcast::<Element>().unwrap();
-                        el.set_disabled_state(true);
-                        el.set_enabled_state(false);
-                        el.update_sequentially_focusable_status();
+                        let element = field.downcast::<Element>().unwrap();
+                        if element.enabled_state() {
+                            element.set_disabled_state(true);
+                            element.set_enabled_state(false);
+                            if element
+                                .downcast::<HTMLElement>()
+                                .is_some_and(|h| h.is_form_associated_custom_element())
+                            {
+                                ScriptThread::enqueue_callback_reaction(
+                                    element,
+                                    CallbackReaction::FormDisabled(true),
+                                    None,
+                                );
+                            }
+                        }
+                        element.update_sequentially_focusable_status(CanGc::note());
                     }
                 } else {
                     for field in fields {
-                        let el = field.downcast::<Element>().unwrap();
-                        el.check_disabled_attribute();
-                        el.check_ancestors_disabled_state_for_form_control();
-                        el.update_sequentially_focusable_status();
+                        let element = field.downcast::<Element>().unwrap();
+                        if element.disabled_state() {
+                            element.check_disabled_attribute();
+                            element.check_ancestors_disabled_state_for_form_control();
+                            // Fire callback only if this has actually enabled the custom element
+                            if element.enabled_state() &&
+                                element
+                                    .downcast::<HTMLElement>()
+                                    .is_some_and(|h| h.is_form_associated_custom_element())
+                            {
+                                ScriptThread::enqueue_callback_reaction(
+                                    element,
+                                    CallbackReaction::FormDisabled(false),
+                                    None,
+                                );
+                            }
+                        }
+                        element.update_sequentially_focusable_status(CanGc::note());
                     }
                 }
-                el.update_sequentially_focusable_status();
+                element.update_sequentially_focusable_status(CanGc::note());
             },
-            &local_name!("form") => {
+            local_name!("form") => {
                 self.form_attribute_mutated(mutation);
             },
             _ => {},
@@ -236,7 +259,7 @@ impl FormControl for HTMLFieldSetElement {
         self.form_owner.set(form);
     }
 
-    fn to_element<'a>(&'a self) -> &'a Element {
+    fn to_element(&self) -> &Element {
         self.upcast::<Element>()
     }
 }
@@ -248,7 +271,7 @@ impl Validatable for HTMLFieldSetElement {
 
     fn validity_state(&self) -> DomRoot<ValidityState> {
         self.validity_state
-            .or_init(|| ValidityState::new(&window_from_node(self), self.upcast()))
+            .or_init(|| ValidityState::new(&self.owner_window(), self.upcast()))
     }
 
     fn is_instance_validatable(&self) -> bool {

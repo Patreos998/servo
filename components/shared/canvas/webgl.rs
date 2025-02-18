@@ -7,12 +7,21 @@ use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Deref;
 
+/// Receiver type used in WebGLCommands.
+pub use base::generic_channel::GenericReceiver as WebGLReceiver;
+/// Sender type used in WebGLCommands.
+pub use base::generic_channel::GenericSender as WebGLSender;
+/// Result type for send()/recv() calls in in WebGLCommands.
+pub use base::generic_channel::SendResult as WebGLSendResult;
 use euclid::default::{Rect, Size2D};
-use ipc_channel::ipc::{IpcBytesReceiver, IpcBytesSender, IpcSharedMemory};
+use glow::{
+    self as gl, NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeQuery,
+    NativeRenderbuffer, NativeSampler, NativeShader, NativeTexture, NativeVertexArray,
+};
+use ipc_channel::ipc::{IpcBytesReceiver, IpcBytesSender, IpcSender, IpcSharedMemory};
 use malloc_size_of_derive::MallocSizeOf;
 use pixels::PixelFormat;
 use serde::{Deserialize, Serialize};
-use sparkle::gl;
 use webrender_api::ImageKey;
 use webxr_api::{
     ContextId as WebXRContextId, Error as WebXRError, LayerId as WebXRLayerId,
@@ -20,17 +29,33 @@ use webxr_api::{
 };
 
 /// Helper function that creates a WebGL channel (WebGLSender, WebGLReceiver) to be used in WebGLCommands.
-pub use crate::webgl_channel::webgl_channel;
+pub fn webgl_channel<T>() -> Option<(WebGLSender<T>, WebGLReceiver<T>)>
+where
+    T: for<'de> Deserialize<'de> + Serialize,
+{
+    base::generic_channel::channel(servo_config::opts::get().multiprocess)
+}
+
 /// Entry point channel type used for sending WebGLMsg messages to the WebGL renderer.
-pub use crate::webgl_channel::WebGLChan;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WebGLChan(pub WebGLSender<WebGLMsg>);
+
+impl WebGLChan {
+    #[inline]
+    pub fn send(&self, msg: WebGLMsg) -> WebGLSendResult {
+        self.0.send(msg)
+    }
+}
+
 /// Entry point type used in a Script Pipeline to get the WebGLChan to be used in that thread.
-pub use crate::webgl_channel::WebGLPipeline;
-/// Receiver type used in WebGLCommands.
-pub use crate::webgl_channel::WebGLReceiver;
-/// Result type for send()/recv() calls in in WebGLCommands.
-pub use crate::webgl_channel::WebGLSendResult;
-/// Sender type used in WebGLCommands.
-pub use crate::webgl_channel::WebGLSender;
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WebGLPipeline(pub WebGLChan);
+
+impl WebGLPipeline {
+    pub fn channel(&self) -> WebGLChan {
+        self.0.clone()
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WebGLCommandBacktrace {
@@ -51,9 +76,9 @@ impl WebGLThreads {
     }
 
     /// Sends a exit message to close the WebGLThreads and release all WebGLContexts.
-    pub fn exit(&self) -> Result<(), &'static str> {
+    pub fn exit(&self, sender: IpcSender<()>) -> Result<(), &'static str> {
         self.0
-            .send(WebGLMsg::Exit)
+            .send(WebGLMsg::Exit(sender))
             .map_err(|_| "Failed to send Exit message")
     }
 }
@@ -84,7 +109,7 @@ pub enum WebGLMsg {
     /// request is fulfilled
     SwapBuffers(Vec<WebGLContextId>, WebGLSender<u64>, u64),
     /// Frees all resources and closes the thread.
-    Exit,
+    Exit(IpcSender<()>),
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
@@ -140,10 +165,7 @@ pub struct WebGLMsgSender {
 
 impl WebGLMsgSender {
     pub fn new(id: WebGLContextId, sender: WebGLChan) -> Self {
-        WebGLMsgSender {
-            ctx_id: id,
-            sender: sender,
-        }
+        WebGLMsgSender { ctx_id: id, sender }
     }
 
     /// Returns the WebGLContextId associated to this sender
@@ -250,6 +272,7 @@ pub enum WebGLCommand {
     BindFramebuffer(u32, WebGLFramebufferBindingRequest),
     BindRenderbuffer(u32, Option<WebGLRenderbufferId>),
     BindTexture(u32, Option<WebGLTextureId>),
+    BlitFrameBuffer(i32, i32, i32, i32, i32, i32, i32, i32, u32, u32),
     DisableVertexAttribArray(u32),
     EnableVertexAttribArray(u32),
     FramebufferRenderbuffer(u32, u32, u32, Option<WebGLRenderbufferId>),
@@ -547,10 +570,9 @@ macro_rules! define_resource_id {
         pub struct $name(nonzero_type!($type));
 
         impl $name {
-            #[allow(unsafe_code)]
             #[inline]
-            pub unsafe fn new(id: $type) -> Self {
-                $name(<nonzero_type!($type)>::new_unchecked(id))
+            pub fn new(id: nonzero_type!($type)) -> Self {
+                Self(id)
             }
 
             #[inline]
@@ -571,10 +593,10 @@ macro_rules! define_resource_id {
                 D: ::serde::Deserializer<'de>,
             {
                 let id = <$type>::deserialize(deserializer)?;
-                if id == 0 {
-                    Err(::serde::de::Error::custom("expected a non-zero value"))
+                if let Some(id) = <nonzero_type!($type)>::new(id) {
+                    Ok($name(id))
                 } else {
-                    Ok(unsafe { $name::new(id) })
+                    Err(::serde::de::Error::custom("expected a non-zero value"))
                 }
             }
         }
@@ -608,18 +630,43 @@ macro_rules! define_resource_id {
             }
         }
     };
+    ($name:ident, $type:tt, $glow:tt) => {
+        impl $name {
+            #[inline]
+            pub fn glow(self) -> $glow {
+                $glow(self.0)
+            }
+
+            #[inline]
+            pub fn from_glow(glow: $glow) -> Self {
+                Self(glow.0)
+            }
+        }
+        define_resource_id!($name, $type);
+    };
 }
 
-define_resource_id!(WebGLBufferId, u32);
-define_resource_id!(WebGLFramebufferId, u32);
-define_resource_id!(WebGLRenderbufferId, u32);
-define_resource_id!(WebGLTextureId, u32);
-define_resource_id!(WebGLProgramId, u32);
-define_resource_id!(WebGLQueryId, u32);
-define_resource_id!(WebGLSamplerId, u32);
-define_resource_id!(WebGLShaderId, u32);
+define_resource_id!(WebGLBufferId, u32, NativeBuffer);
+define_resource_id!(WebGLFramebufferId, u32, NativeFramebuffer);
+define_resource_id!(WebGLRenderbufferId, u32, NativeRenderbuffer);
+define_resource_id!(WebGLTextureId, u32, NativeTexture);
+define_resource_id!(WebGLProgramId, u32, NativeProgram);
+define_resource_id!(WebGLQueryId, u32, NativeQuery);
+define_resource_id!(WebGLSamplerId, u32, NativeSampler);
+define_resource_id!(WebGLShaderId, u32, NativeShader);
 define_resource_id!(WebGLSyncId, u64);
-define_resource_id!(WebGLVertexArrayId, u32);
+impl WebGLSyncId {
+    #[inline]
+    pub fn glow(&self) -> NativeFence {
+        NativeFence(self.0.get() as _)
+    }
+
+    #[inline]
+    pub fn from_glow(glow: NativeFence) -> Self {
+        Self::maybe_new(glow.0 as _).expect("Glow should have valid fence")
+    }
+}
+define_resource_id!(WebGLVertexArrayId, u32, NativeVertexArray);
 define_resource_id!(WebXRLayerManagerId, u32);
 
 #[derive(
@@ -684,7 +731,7 @@ pub struct ActiveAttribInfo {
     /// The type of the attribute.
     pub type_: u32,
     /// The location of the attribute.
-    pub location: i32,
+    pub location: Option<u32>,
 }
 
 /// Description of a single active uniform.
@@ -912,23 +959,9 @@ macro_rules! gl_enums {
     }
 }
 
-// FIXME: These should come from sparkle
+// TODO(sagudev): These should come from glow
 mod gl_ext_constants {
-    use sparkle::gl::types::GLenum;
-
-    pub const COMPRESSED_RGB_S3TC_DXT1_EXT: GLenum = 0x83F0;
-    pub const COMPRESSED_RGBA_S3TC_DXT1_EXT: GLenum = 0x83F1;
-    pub const COMPRESSED_RGBA_S3TC_DXT3_EXT: GLenum = 0x83F2;
-    pub const COMPRESSED_RGBA_S3TC_DXT5_EXT: GLenum = 0x83F3;
-    pub const COMPRESSED_RGB_ETC1_WEBGL: GLenum = 0x8D64;
-
-    pub static COMPRESSIONS: &'static [GLenum] = &[
-        COMPRESSED_RGB_S3TC_DXT1_EXT,
-        COMPRESSED_RGBA_S3TC_DXT1_EXT,
-        COMPRESSED_RGBA_S3TC_DXT3_EXT,
-        COMPRESSED_RGBA_S3TC_DXT5_EXT,
-        COMPRESSED_RGB_ETC1_WEBGL,
-    ];
+    pub const COMPRESSED_RGB_ETC1_WEBGL: u32 = 0x8D64;
 
     pub const ALPHA16F_ARB: u32 = 0x881C;
     pub const ALPHA32F_ARB: u32 = 0x8816;
@@ -959,10 +992,10 @@ gl_enums! {
         Luminance16f = gl_ext_constants::LUMINANCE16F_ARB,
         LuminanceAlpha32f = gl_ext_constants::LUMINANCE_ALPHA32F_ARB,
         LuminanceAlpha16f = gl_ext_constants::LUMINANCE_ALPHA16F_ARB,
-        CompressedRgbS3tcDxt1 = gl_ext_constants::COMPRESSED_RGB_S3TC_DXT1_EXT,
-        CompressedRgbaS3tcDxt1 = gl_ext_constants::COMPRESSED_RGBA_S3TC_DXT1_EXT,
-        CompressedRgbaS3tcDxt3 = gl_ext_constants::COMPRESSED_RGBA_S3TC_DXT3_EXT,
-        CompressedRgbaS3tcDxt5 = gl_ext_constants::COMPRESSED_RGBA_S3TC_DXT5_EXT,
+        CompressedRgbS3tcDxt1 = gl::COMPRESSED_RGB_S3TC_DXT1_EXT,
+        CompressedRgbaS3tcDxt1 = gl::COMPRESSED_RGBA_S3TC_DXT1_EXT,
+        CompressedRgbaS3tcDxt3 = gl::COMPRESSED_RGBA_S3TC_DXT3_EXT,
+        CompressedRgbaS3tcDxt5 = gl::COMPRESSED_RGBA_S3TC_DXT5_EXT,
         CompressedRgbEtc1 = gl_ext_constants::COMPRESSED_RGB_ETC1_WEBGL,
         R8 = gl::R8,
         R8SNorm = gl::R8_SNORM,
@@ -1056,23 +1089,31 @@ impl TexFormat {
 
     /// Returns whether this format is a known texture compression format.
     pub fn is_compressed(&self) -> bool {
-        gl_ext_constants::COMPRESSIONS.contains(&self.as_gl_constant())
+        let gl_const = self.as_gl_constant();
+        matches!(
+            gl_const,
+            gl::COMPRESSED_RGB_S3TC_DXT1_EXT |
+                gl::COMPRESSED_RGBA_S3TC_DXT1_EXT |
+                gl::COMPRESSED_RGBA_S3TC_DXT3_EXT |
+                gl::COMPRESSED_RGBA_S3TC_DXT5_EXT |
+                gl_ext_constants::COMPRESSED_RGB_ETC1_WEBGL
+        )
     }
 
     /// Returns whether this format is a known sized or unsized format.
     pub fn is_sized(&self) -> bool {
-        match self {
+        !matches!(
+            self,
             TexFormat::DepthComponent |
-            TexFormat::DepthStencil |
-            TexFormat::Alpha |
-            TexFormat::Red |
-            TexFormat::RG |
-            TexFormat::RGB |
-            TexFormat::RGBA |
-            TexFormat::Luminance |
-            TexFormat::LuminanceAlpha => false,
-            _ => true,
-        }
+                TexFormat::DepthStencil |
+                TexFormat::Alpha |
+                TexFormat::Red |
+                TexFormat::RG |
+                TexFormat::RGB |
+                TexFormat::RGBA |
+                TexFormat::Luminance |
+                TexFormat::LuminanceAlpha
+        )
     }
 
     pub fn to_unsized(self) -> TexFormat {

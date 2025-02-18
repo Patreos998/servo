@@ -17,12 +17,13 @@ use crate::dom::element::{AttributeMutation, Element, LayoutElementHelpers};
 use crate::dom::node::Node;
 use crate::dom::svggraphicselement::SVGGraphicsElement;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 const DEFAULT_WIDTH: u32 = 300;
 const DEFAULT_HEIGHT: u32 = 150;
 
 #[dom_struct]
-pub struct SVGSVGElement {
+pub(crate) struct SVGSVGElement {
     svggraphicselement: SVGGraphicsElement,
 }
 
@@ -37,22 +38,24 @@ impl SVGSVGElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<SVGSVGElement> {
         Node::reflect_node_with_proto(
             Box::new(SVGSVGElement::new_inherited(local_name, prefix, document)),
             document,
             proto,
+            can_gc,
         )
     }
 }
 
-pub trait LayoutSVGSVGElementHelpers {
+pub(crate) trait LayoutSVGSVGElementHelpers {
     fn data(self) -> SVGSVGData;
 }
 
@@ -81,9 +84,9 @@ impl VirtualMethods for SVGSVGElement {
     }
 
     fn parse_plain_attribute(&self, name: &LocalName, value: DOMString) -> AttrValue {
-        match name {
-            &local_name!("width") => AttrValue::from_u32(value.into(), DEFAULT_WIDTH),
-            &local_name!("height") => AttrValue::from_u32(value.into(), DEFAULT_HEIGHT),
+        match *name {
+            local_name!("width") => AttrValue::from_u32(value.into(), DEFAULT_WIDTH),
+            local_name!("height") => AttrValue::from_u32(value.into(), DEFAULT_HEIGHT),
             _ => self
                 .super_type()
                 .unwrap()

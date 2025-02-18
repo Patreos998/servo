@@ -2,11 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use cssparser::RGBA;
 use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix};
 use js::rust::HandleObject;
-use style::attr::AttrValue;
+use style::attr::{AttrValue, LengthOrPercentageOrAuto};
+use style::color::AbsoluteColor;
 
 use crate::dom::bindings::codegen::Bindings::HTMLTableSectionElementBinding::HTMLTableSectionElementMethods;
 use crate::dom::bindings::codegen::Bindings::NodeBinding::NodeMethods;
@@ -16,14 +16,15 @@ use crate::dom::bindings::root::{DomRoot, LayoutDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::htmlcollection::{CollectionFilter, HTMLCollection};
+use crate::dom::htmlcollection::HTMLCollection;
 use crate::dom::htmlelement::HTMLElement;
 use crate::dom::htmltablerowelement::HTMLTableRowElement;
-use crate::dom::node::{window_from_node, Node};
+use crate::dom::node::{Node, NodeTraits};
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLTableSectionElement {
+pub(crate) struct HTMLTableSectionElement {
     htmlelement: HTMLElement,
 }
 
@@ -38,12 +39,13 @@ impl HTMLTableSectionElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLTableSectionElement> {
         let n = Node::reflect_node_with_proto(
             Box::new(HTMLTableSectionElement::new_inherited(
@@ -51,6 +53,7 @@ impl HTMLTableSectionElement {
             )),
             document,
             proto,
+            can_gc,
         );
 
         n.upcast::<Node>().set_weird_parser_insertion_mode();
@@ -58,28 +61,22 @@ impl HTMLTableSectionElement {
     }
 }
 
-#[derive(JSTraceable)]
-struct RowsFilter;
-impl CollectionFilter for RowsFilter {
-    fn filter(&self, elem: &Element, root: &Node) -> bool {
-        elem.is::<HTMLTableRowElement>() &&
-            elem.upcast::<Node>().GetParentNode().as_deref() == Some(root)
-    }
-}
-
-impl HTMLTableSectionElementMethods for HTMLTableSectionElement {
+impl HTMLTableSectionElementMethods<crate::DomTypeHolder> for HTMLTableSectionElement {
     // https://html.spec.whatwg.org/multipage/#dom-tbody-rows
     fn Rows(&self) -> DomRoot<HTMLCollection> {
-        HTMLCollection::create(&window_from_node(self), self.upcast(), Box::new(RowsFilter))
+        HTMLCollection::new_with_filter_fn(&self.owner_window(), self.upcast(), |element, root| {
+            element.is::<HTMLTableRowElement>() &&
+                element.upcast::<Node>().GetParentNode().as_deref() == Some(root)
+        })
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-tbody-insertrow
-    fn InsertRow(&self, index: i32) -> Fallible<DomRoot<HTMLElement>> {
+    fn InsertRow(&self, index: i32, can_gc: CanGc) -> Fallible<DomRoot<HTMLElement>> {
         let node = self.upcast::<Node>();
         node.insert_cell_or_row(
             index,
             || self.Rows(),
-            || HTMLTableRowElement::new(local_name!("tr"), None, &node.owner_doc(), None),
+            || HTMLTableRowElement::new(local_name!("tr"), None, &node.owner_doc(), None, can_gc),
         )
     }
 
@@ -90,16 +87,25 @@ impl HTMLTableSectionElementMethods for HTMLTableSectionElement {
     }
 }
 
-pub trait HTMLTableSectionElementLayoutHelpers {
-    fn get_background_color(self) -> Option<RGBA>;
+pub(crate) trait HTMLTableSectionElementLayoutHelpers {
+    fn get_background_color(self) -> Option<AbsoluteColor>;
+    fn get_height(self) -> LengthOrPercentageOrAuto;
 }
 
 impl HTMLTableSectionElementLayoutHelpers for LayoutDom<'_, HTMLTableSectionElement> {
-    fn get_background_color(self) -> Option<RGBA> {
+    fn get_background_color(self) -> Option<AbsoluteColor> {
         self.upcast::<Element>()
             .get_attr_for_layout(&ns!(), &local_name!("bgcolor"))
             .and_then(AttrValue::as_color)
             .cloned()
+    }
+
+    fn get_height(self) -> LengthOrPercentageOrAuto {
+        self.upcast::<Element>()
+            .get_attr_for_layout(&ns!(), &local_name!("height"))
+            .map(AttrValue::as_dimension)
+            .cloned()
+            .unwrap_or(LengthOrPercentageOrAuto::Auto)
     }
 }
 
@@ -111,6 +117,7 @@ impl VirtualMethods for HTMLTableSectionElement {
     fn parse_plain_attribute(&self, local_name: &LocalName, value: DOMString) -> AttrValue {
         match *local_name {
             local_name!("bgcolor") => AttrValue::from_legacy_color(value.into()),
+            local_name!("height") => AttrValue::from_dimension(value.into()),
             _ => self
                 .super_type()
                 .unwrap()

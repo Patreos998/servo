@@ -16,8 +16,8 @@ use std::fmt;
 use std::ops::Add;
 
 use app_units::Au;
+use base::print_tree::PrintTree;
 use euclid::default::Point2D;
-use gfx_traits::print_tree::PrintTree;
 use log::{debug, trace};
 use serde::Serialize;
 use style::computed_values::{position, table_layout};
@@ -80,9 +80,9 @@ impl TableWrapperFlow {
                 TableLayout::Auto
             };
         TableWrapperFlow {
-            block_flow: block_flow,
+            block_flow,
             column_intrinsic_inline_sizes: vec![],
-            table_layout: table_layout,
+            table_layout,
         }
     }
 
@@ -163,7 +163,7 @@ impl TableWrapperFlow {
         {
             intermediate_column_inline_size.size = guess.calculate(selection);
             // intermediate_column_inline_size.percentage = 0.0;
-            total_used_inline_size = total_used_inline_size + intermediate_column_inline_size.size
+            total_used_inline_size += intermediate_column_inline_size.size
         }
 
         // Distribute excess inline-size if necessary per INTRINSIC § 4.4.
@@ -269,8 +269,8 @@ impl TableWrapperFlow {
         // the constraint solutions in.
         if self.block_flow.base.flags.is_float() {
             let inline_size_computer = FloatedTable {
-                minimum_width_of_all_columns: minimum_width_of_all_columns,
-                preferred_width_of_all_columns: preferred_width_of_all_columns,
+                minimum_width_of_all_columns,
+                preferred_width_of_all_columns,
                 table_border_padding: border_padding,
             };
             let input = inline_size_computer.compute_inline_size_constraint_inputs(
@@ -295,8 +295,8 @@ impl TableWrapperFlow {
             .contains(FlowFlags::INLINE_POSITION_IS_STATIC)
         {
             let inline_size_computer = AbsoluteTable {
-                minimum_width_of_all_columns: minimum_width_of_all_columns,
-                preferred_width_of_all_columns: preferred_width_of_all_columns,
+                minimum_width_of_all_columns,
+                preferred_width_of_all_columns,
                 table_border_padding: border_padding,
             };
             let input = inline_size_computer.compute_inline_size_constraint_inputs(
@@ -315,8 +315,8 @@ impl TableWrapperFlow {
         }
 
         let inline_size_computer = Table {
-            minimum_width_of_all_columns: minimum_width_of_all_columns,
-            preferred_width_of_all_columns: preferred_width_of_all_columns,
+            minimum_width_of_all_columns,
+            preferred_width_of_all_columns,
             table_border_padding: border_padding,
         };
         let input = inline_size_computer.compute_inline_size_constraint_inputs(
@@ -360,7 +360,8 @@ impl Flow for TableWrapperFlow {
             debug_assert!(kid.is_table_caption() || kid.is_table());
             if kid.is_table() {
                 let table = kid.as_table();
-                self.column_intrinsic_inline_sizes = table.column_intrinsic_inline_sizes.clone();
+                self.column_intrinsic_inline_sizes
+                    .clone_from(&table.column_intrinsic_inline_sizes)
             }
         }
 
@@ -625,7 +626,7 @@ impl AutoLayoutCandidateGuess {
         );
         AutoLayoutCandidateGuess {
             minimum_guess: column_intrinsic_inline_size.minimum_length,
-            minimum_percentage_guess: minimum_percentage_guess,
+            minimum_percentage_guess,
             // FIXME(pcwalton): We need the notion of *constrainedness* per INTRINSIC § 4 to
             // implement this one correctly.
             minimum_specified_guess: if column_intrinsic_inline_size.percentage > 0.0 {
@@ -668,7 +669,7 @@ impl AutoLayoutCandidateGuess {
     }
 }
 
-impl<'a> Add for &'a AutoLayoutCandidateGuess {
+impl Add for &AutoLayoutCandidateGuess {
     type Output = AutoLayoutCandidateGuess;
     #[inline]
     fn add(self, other: &AutoLayoutCandidateGuess) -> AutoLayoutCandidateGuess {
@@ -765,16 +766,14 @@ impl ExcessInlineSizeDistributionInfo {
         if !column_intrinsic_inline_size.constrained &&
             column_intrinsic_inline_size.percentage == 0.0
         {
-            self.preferred_inline_size_of_nonconstrained_columns_with_no_percentage = self
-                .preferred_inline_size_of_nonconstrained_columns_with_no_percentage +
+            self.preferred_inline_size_of_nonconstrained_columns_with_no_percentage +=
                 column_intrinsic_inline_size.preferred;
             self.count_of_nonconstrained_columns_with_no_percentage += 1
         }
         if column_intrinsic_inline_size.constrained &&
             column_intrinsic_inline_size.percentage == 0.0
         {
-            self.preferred_inline_size_of_constrained_columns_with_no_percentage = self
-                .preferred_inline_size_of_constrained_columns_with_no_percentage +
+            self.preferred_inline_size_of_constrained_columns_with_no_percentage +=
                 column_intrinsic_inline_size.preferred
         }
         self.total_percentage += column_intrinsic_inline_size.percentage;
@@ -825,9 +824,8 @@ impl ExcessInlineSizeDistributionInfo {
             excess_inline_size.scale_by(proportion),
             excess_inline_size - *total_distributed_excess_size,
         );
-        *total_distributed_excess_size = *total_distributed_excess_size + amount_to_distribute;
-        intermediate_column_inline_size.size =
-            intermediate_column_inline_size.size + amount_to_distribute
+        *total_distributed_excess_size += amount_to_distribute;
+        intermediate_column_inline_size.size += amount_to_distribute
     }
 }
 
@@ -850,25 +848,30 @@ fn initial_computed_inline_size(
     preferred_width_of_all_columns: Au,
     table_border_padding: Au,
 ) -> MaybeAuto {
-    match block.fragment.style.content_inline_size() {
-        Size::Auto => {
-            if preferred_width_of_all_columns + table_border_padding <= containing_block_inline_size
-            {
-                MaybeAuto::Specified(preferred_width_of_all_columns + table_border_padding)
-            } else if minimum_width_of_all_columns > containing_block_inline_size {
-                MaybeAuto::Specified(minimum_width_of_all_columns)
-            } else {
-                MaybeAuto::Auto
-            }
-        },
-        Size::LengthPercentage(ref lp) => {
-            let used = lp.to_used_value(containing_block_inline_size);
-            MaybeAuto::Specified(max(
-                used - table_border_padding,
-                minimum_width_of_all_columns,
-            ))
-        },
-    }
+    block
+        .fragment
+        .style
+        .content_inline_size()
+        .to_used_value(containing_block_inline_size)
+        .map_or_else(
+            || {
+                if preferred_width_of_all_columns + table_border_padding <=
+                    containing_block_inline_size
+                {
+                    MaybeAuto::Specified(preferred_width_of_all_columns + table_border_padding)
+                } else if minimum_width_of_all_columns > containing_block_inline_size {
+                    MaybeAuto::Specified(minimum_width_of_all_columns)
+                } else {
+                    MaybeAuto::Auto
+                }
+            },
+            |used| {
+                MaybeAuto::Specified(max(
+                    used - table_border_padding,
+                    minimum_width_of_all_columns,
+                ))
+            },
+        )
 }
 
 struct Table {

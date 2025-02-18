@@ -9,10 +9,11 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::globalscope::GlobalScope;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
 #[allow(non_snake_case)]
-pub struct TextMetrics {
+pub(crate) struct TextMetrics {
     reflector_: Reflector,
     width: Finite<f64>,
     actualBoundingBoxLeft: Finite<f64>,
@@ -30,6 +31,7 @@ pub struct TextMetrics {
 
 #[allow(non_snake_case)]
 impl TextMetrics {
+    #[allow(clippy::too_many_arguments)]
     fn new_inherited(
         width: f64,
         actualBoundingBoxLeft: f64,
@@ -61,7 +63,8 @@ impl TextMetrics {
         }
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         global: &GlobalScope,
         width: f64,
         actualBoundingBoxLeft: f64,
@@ -92,11 +95,12 @@ impl TextMetrics {
                 ideographicBaseline,
             )),
             global,
+            CanGc::note(),
         )
     }
 }
 
-impl TextMetricsMethods for TextMetrics {
+impl TextMetricsMethods<crate::DomTypeHolder> for TextMetrics {
     /// <https://html.spec.whatwg.org/multipage/#dom-textmetrics-width>
     fn Width(&self) -> Finite<f64> {
         self.width

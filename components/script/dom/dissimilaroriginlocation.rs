@@ -10,6 +10,7 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::dissimilaroriginwindow::DissimilarOriginWindow;
+use crate::script_runtime::CanGc;
 
 /// Represents a dissimilar-origin `Location` that exists in another script thread.
 ///
@@ -18,7 +19,7 @@ use crate::dom::dissimilaroriginwindow::DissimilarOriginWindow;
 /// still need to function.
 
 #[dom_struct]
-pub struct DissimilarOriginLocation {
+pub(crate) struct DissimilarOriginLocation {
     /// The reflector. Once we have XOWs, this will have a cross-origin
     /// wrapper placed around it.
     reflector: Reflector,
@@ -28,7 +29,7 @@ pub struct DissimilarOriginLocation {
 }
 
 impl DissimilarOriginLocation {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(window: &DissimilarOriginWindow) -> DissimilarOriginLocation {
         DissimilarOriginLocation {
             reflector: Reflector::new(),
@@ -36,15 +37,16 @@ impl DissimilarOriginLocation {
         }
     }
 
-    pub fn new(window: &DissimilarOriginWindow) -> DomRoot<DissimilarOriginLocation> {
+    pub(crate) fn new(window: &DissimilarOriginWindow) -> DomRoot<DissimilarOriginLocation> {
         reflect_dom_object(
             Box::new(DissimilarOriginLocation::new_inherited(window)),
             window,
+            CanGc::note(),
         )
     }
 }
 
-impl DissimilarOriginLocationMethods for DissimilarOriginLocation {
+impl DissimilarOriginLocationMethods<crate::DomTypeHolder> for DissimilarOriginLocation {
     // https://html.spec.whatwg.org/multipage/#dom-location-href
     fn GetHref(&self) -> Fallible<USVString> {
         Err(Error::Security)

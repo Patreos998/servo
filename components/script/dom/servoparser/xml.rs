@@ -2,7 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(crown::unrooted_must_root)]
+#![cfg_attr(crown, allow(crown::unrooted_must_root))]
+
+use std::cell::Cell;
 
 use html5ever::tokenizer::TokenizerResult;
 use js::jsapi::JSTracer;
@@ -19,18 +21,18 @@ use crate::dom::node::Node;
 use crate::dom::servoparser::{ParsingAlgorithm, Sink};
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[crown::unrooted_must_root_lint::must_root]
-pub struct Tokenizer {
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+pub(crate) struct Tokenizer {
     #[ignore_malloc_size_of = "Defined in xml5ever"]
     inner: XmlTokenizer<XmlTreeBuilder<Dom<Node>, Sink>>,
 }
 
 impl Tokenizer {
-    pub fn new(document: &Document, url: ServoUrl) -> Self {
+    pub(crate) fn new(document: &Document, url: ServoUrl) -> Self {
         let sink = Sink {
             base_url: url,
             document: Dom::from_ref(document),
-            current_line: 1,
+            current_line: Cell::new(1),
             script: Default::default(),
             parsing_algorithm: ParsingAlgorithm::Normal,
         };
@@ -41,8 +43,7 @@ impl Tokenizer {
         Tokenizer { inner: tok }
     }
 
-    #[must_use]
-    pub fn feed(&mut self, input: &mut BufferQueue) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
+    pub(crate) fn feed(&self, input: &BufferQueue) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
         self.inner.run(input);
         match self.inner.sink.sink.script.take() {
             Some(script) => TokenizerResult::Script(script),
@@ -50,11 +51,11 @@ impl Tokenizer {
         }
     }
 
-    pub fn end(&mut self) {
+    pub(crate) fn end(&self) {
         self.inner.end()
     }
 
-    pub fn url(&self) -> &ServoUrl {
+    pub(crate) fn url(&self) -> &ServoUrl {
         &self.inner.sink.sink.base_url
     }
 }
@@ -67,7 +68,7 @@ unsafe impl CustomTraceable for XmlTokenizer<XmlTreeBuilder<Dom<Node>, Sink>> {
 
         impl XmlTracer for Tracer {
             type Handle = Dom<Node>;
-            #[allow(crown::unrooted_must_root)]
+            #[cfg_attr(crown, allow(crown::unrooted_must_root))]
             fn trace_handle(&self, node: &Dom<Node>) {
                 unsafe {
                     node.trace(self.0);

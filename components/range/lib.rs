@@ -193,6 +193,19 @@ impl<I: RangeIndex> Iterator for EachIndex<I> {
     }
 }
 
+impl<I: RangeIndex> DoubleEndedIterator for EachIndex<I> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start < self.stop {
+            let next = self.stop - I::one();
+            self.stop = next;
+            Some(next)
+        } else {
+            None
+        }
+    }
+}
+
 impl<I: RangeIndex> Range<I> {
     /// Create a new range from beginning and length offsets. This could be
     /// denoted as `[begin, begin + length)`.
@@ -204,10 +217,7 @@ impl<I: RangeIndex> Range<I> {
     /// ~~~
     #[inline]
     pub fn new(begin: I, length: I) -> Range<I> {
-        Range {
-            begin: begin,
-            length: length,
-        }
+        Range { begin, length }
     }
 
     #[inline]

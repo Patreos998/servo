@@ -7,12 +7,13 @@ use dom_struct::dom_struct;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, ToCssWithGuard};
 use style::stylesheets::keyframes_rule::{Keyframe, KeyframeSelector, KeyframesRule};
+use style::stylesheets::CssRuleType;
 use style::values::KeyframesName;
 
 use crate::dom::bindings::codegen::Bindings::CSSKeyframesRuleBinding::CSSKeyframesRuleMethods;
 use crate::dom::bindings::error::ErrorResult;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::{DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::csskeyframerule::CSSKeyframeRule;
@@ -20,9 +21,10 @@ use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssrulelist::{CSSRuleList, RulesSource};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CSSKeyframesRule {
+pub(crate) struct CSSKeyframesRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -37,13 +39,13 @@ impl CSSKeyframesRule {
     ) -> CSSKeyframesRule {
         CSSKeyframesRule {
             cssrule: CSSRule::new_inherited(parent_stylesheet),
-            keyframesrule: keyframesrule,
+            keyframesrule,
             rulelist: MutNullableDom::new(None),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         keyframesrule: Arc<Locked<KeyframesRule>>,
@@ -54,6 +56,7 @@ impl CSSKeyframesRule {
                 keyframesrule,
             )),
             window,
+            CanGc::note(),
         )
     }
 
@@ -87,7 +90,7 @@ impl CSSKeyframesRule {
     }
 }
 
-impl CSSKeyframesRuleMethods for CSSKeyframesRule {
+impl CSSKeyframesRuleMethods<crate::DomTypeHolder> for CSSKeyframesRule {
     // https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-cssrules
     fn CssRules(&self) -> DomRoot<CSSRuleList> {
         self.rulelist()
@@ -145,9 +148,8 @@ impl CSSKeyframesRuleMethods for CSSKeyframesRule {
 }
 
 impl SpecificCSSRule for CSSKeyframesRule {
-    fn ty(&self) -> u16 {
-        use crate::dom::bindings::codegen::Bindings::CSSRuleBinding::CSSRuleConstants;
-        CSSRuleConstants::KEYFRAMES_RULE
+    fn ty(&self) -> CssRuleType {
+        CssRuleType::Keyframes
     }
 
     fn get_css(&self) -> DOMString {
@@ -159,6 +161,8 @@ impl SpecificCSSRule for CSSKeyframesRule {
     }
 
     fn deparent_children(&self) {
-        self.rulelist.get().map(|list| list.deparent_all());
+        if let Some(list) = self.rulelist.get() {
+            list.deparent_all()
+        }
     }
 }

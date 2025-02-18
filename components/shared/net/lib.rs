@@ -4,51 +4,51 @@
 
 #![deny(unsafe_code)]
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::fmt::Display;
+use std::sync::{LazyLock, OnceLock};
+use std::thread;
 
+use base::cross_process_instant::CrossProcessInstant;
+use base::id::HistoryStateId;
 use cookie::Cookie;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader};
-use http::{Error as HttpError, HeaderMap, StatusCode};
-use hyper::Error as HyperError;
+use http::{header, Error as HttpError, HeaderMap, HeaderValue, StatusCode};
 use hyper_serde::Serde;
+use hyper_util::client::legacy::Error as HyperError;
 use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
 use ipc_channel::Error as IpcError;
-use lazy_static::lazy_static;
-use log::warn;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
-use msg::constellation_msg::HistoryStateId;
-use num_traits::Zero;
-use rustls::Certificate;
+use request::RequestId;
+use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use servo_rand::RngCore;
 use servo_url::{ImmutableOrigin, ServoUrl};
-use webrender_api::{ImageData, ImageDescriptor, ImageKey};
 
 use crate::filemanager_thread::FileManagerThreadMsg;
+use crate::http_status::HttpStatus;
 use crate::request::{Request, RequestBuilder};
 use crate::response::{HttpsState, Response, ResponseInit};
 use crate::storage_thread::StorageThreadMsg;
 
 pub mod blob_url_store;
 pub mod filemanager_thread;
+pub mod http_status;
 pub mod image_cache;
+pub mod policy_container;
 pub mod pub_domains;
 pub mod quality;
 pub mod request;
 pub mod response;
 pub mod storage_thread;
 
-/// Image handling.
-///
-/// It may be surprising that this goes in the network crate as opposed to the graphics crate.
-/// However, image handling is generally very integrated with the network stack (especially where
-/// caching is involved) and as a result it must live in here.
-pub mod image {
-    pub mod base;
-}
+/// <https://fetch.spec.whatwg.org/#document-accept-header-value>
+pub const DOCUMENT_ACCEPT_HEADER_VALUE: HeaderValue =
+    HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
 
 /// An implementation of the [Fetch specification](https://fetch.spec.whatwg.org/)
 pub mod fetch {
@@ -94,9 +94,9 @@ impl CustomResponse {
         body: Vec<u8>,
     ) -> CustomResponse {
         CustomResponse {
-            headers: headers,
-            raw_status: raw_status,
-            body: body,
+            headers,
+            raw_status,
+            body,
         }
     }
 }
@@ -109,8 +109,10 @@ pub struct CustomResponseMediator {
 
 /// [Policies](https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-states)
 /// for providing a referrer header for a request
-#[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum ReferrerPolicy {
+    /// ""
+    EmptyString,
     /// "no-referrer"
     NoReferrer,
     /// "no-referrer-when-downgrade"
@@ -126,12 +128,14 @@ pub enum ReferrerPolicy {
     /// "strict-origin"
     StrictOrigin,
     /// "strict-origin-when-cross-origin"
+    #[default]
     StrictOriginWhenCrossOrigin,
 }
 
-impl ToString for ReferrerPolicy {
-    fn to_string(&self) -> String {
-        match self {
+impl Display for ReferrerPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let string = match self {
+            ReferrerPolicy::EmptyString => "",
             ReferrerPolicy::NoReferrer => "no-referrer",
             ReferrerPolicy::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
             ReferrerPolicy::Origin => "origin",
@@ -140,14 +144,14 @@ impl ToString for ReferrerPolicy {
             ReferrerPolicy::UnsafeUrl => "unsafe-url",
             ReferrerPolicy::StrictOrigin => "strict-origin",
             ReferrerPolicy::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
-        }
-        .to_string()
+        };
+        write!(formatter, "{string}")
     }
 }
 
-impl From<ReferrerPolicyHeader> for ReferrerPolicy {
-    fn from(policy: ReferrerPolicyHeader) -> Self {
-        match policy {
+impl From<Option<ReferrerPolicyHeader>> for ReferrerPolicy {
+    fn from(header: Option<ReferrerPolicyHeader>) -> Self {
+        header.map_or(ReferrerPolicy::EmptyString, |policy| match policy {
             ReferrerPolicyHeader::NO_REFERRER => ReferrerPolicy::NoReferrer,
             ReferrerPolicyHeader::NO_REFERRER_WHEN_DOWNGRADE => {
                 ReferrerPolicy::NoReferrerWhenDowngrade
@@ -160,7 +164,7 @@ impl From<ReferrerPolicyHeader> for ReferrerPolicy {
             ReferrerPolicyHeader::STRICT_ORIGIN_WHEN_CROSS_ORIGIN => {
                 ReferrerPolicy::StrictOriginWhenCrossOrigin
             },
-        }
+        })
     }
 }
 
@@ -176,22 +180,36 @@ impl From<ReferrerPolicy> for ReferrerPolicyHeader {
             ReferrerPolicy::OriginWhenCrossOrigin => ReferrerPolicyHeader::ORIGIN_WHEN_CROSS_ORIGIN,
             ReferrerPolicy::UnsafeUrl => ReferrerPolicyHeader::UNSAFE_URL,
             ReferrerPolicy::StrictOrigin => ReferrerPolicyHeader::STRICT_ORIGIN,
-            ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+            ReferrerPolicy::EmptyString | ReferrerPolicy::StrictOriginWhenCrossOrigin => {
                 ReferrerPolicyHeader::STRICT_ORIGIN_WHEN_CROSS_ORIGIN
             },
         }
     }
 }
 
+// FIXME: https://github.com/servo/servo/issues/34591
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, Deserialize, Serialize)]
 pub enum FetchResponseMsg {
     // todo: should have fields for transmitted/total bytes
-    ProcessRequestBody,
-    ProcessRequestEOF,
+    ProcessRequestBody(RequestId),
+    ProcessRequestEOF(RequestId),
     // todo: send more info about the response (or perhaps the entire Response)
-    ProcessResponse(Result<FetchMetadata, NetworkError>),
-    ProcessResponseChunk(Vec<u8>),
-    ProcessResponseEOF(Result<ResourceFetchTiming, NetworkError>),
+    ProcessResponse(RequestId, Result<FetchMetadata, NetworkError>),
+    ProcessResponseChunk(RequestId, Vec<u8>),
+    ProcessResponseEOF(RequestId, Result<ResourceFetchTiming, NetworkError>),
+}
+
+impl FetchResponseMsg {
+    pub fn request_id(&self) -> RequestId {
+        match self {
+            FetchResponseMsg::ProcessRequestBody(id) |
+            FetchResponseMsg::ProcessRequestEOF(id) |
+            FetchResponseMsg::ProcessResponse(id, ..) |
+            FetchResponseMsg::ProcessResponseChunk(id, ..) |
+            FetchResponseMsg::ProcessResponseEOF(id, ..) => *id,
+        }
+    }
 }
 
 pub trait FetchTaskTarget {
@@ -208,15 +226,15 @@ pub trait FetchTaskTarget {
     /// <https://fetch.spec.whatwg.org/#process-response>
     ///
     /// Fired when headers are received
-    fn process_response(&mut self, response: &Response);
+    fn process_response(&mut self, request: &Request, response: &Response);
 
     /// Fired when a chunk of response content is received
-    fn process_response_chunk(&mut self, chunk: Vec<u8>);
+    fn process_response_chunk(&mut self, request: &Request, chunk: Vec<u8>);
 
     /// <https://fetch.spec.whatwg.org/#process-response-end-of-file>
     ///
     /// Fired when the response is fully fetched
-    fn process_response_eof(&mut self, response: &Response);
+    fn process_response_eof(&mut self, request: &Request, response: &Response);
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -227,6 +245,8 @@ pub enum FilteredMetadata {
     OpaqueRedirect(ServoUrl),
 }
 
+// FIXME: https://github.com/servo/servo/issues/34591
+#[expect(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum FetchMetadata {
     Unfiltered(Metadata),
@@ -236,44 +256,62 @@ pub enum FetchMetadata {
     },
 }
 
+impl FetchMetadata {
+    pub fn metadata(&self) -> &Metadata {
+        match self {
+            Self::Unfiltered(metadata) => metadata,
+            Self::Filtered { unsafe_, .. } => unsafe_,
+        }
+    }
+}
+
 pub trait FetchResponseListener {
-    fn process_request_body(&mut self);
-    fn process_request_eof(&mut self);
-    fn process_response(&mut self, metadata: Result<FetchMetadata, NetworkError>);
-    fn process_response_chunk(&mut self, chunk: Vec<u8>);
-    fn process_response_eof(&mut self, response: Result<ResourceFetchTiming, NetworkError>);
+    fn process_request_body(&mut self, request_id: RequestId);
+    fn process_request_eof(&mut self, request_id: RequestId);
+    fn process_response(
+        &mut self,
+        request_id: RequestId,
+        metadata: Result<FetchMetadata, NetworkError>,
+    );
+    fn process_response_chunk(&mut self, request_id: RequestId, chunk: Vec<u8>);
+    fn process_response_eof(
+        &mut self,
+        request_id: RequestId,
+        response: Result<ResourceFetchTiming, NetworkError>,
+    );
     fn resource_timing(&self) -> &ResourceFetchTiming;
     fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming;
     fn submit_resource_timing(&mut self);
 }
 
 impl FetchTaskTarget for IpcSender<FetchResponseMsg> {
-    fn process_request_body(&mut self, _: &Request) {
-        let _ = self.send(FetchResponseMsg::ProcessRequestBody);
+    fn process_request_body(&mut self, request: &Request) {
+        let _ = self.send(FetchResponseMsg::ProcessRequestBody(request.id));
     }
 
-    fn process_request_eof(&mut self, _: &Request) {
-        let _ = self.send(FetchResponseMsg::ProcessRequestEOF);
+    fn process_request_eof(&mut self, request: &Request) {
+        let _ = self.send(FetchResponseMsg::ProcessRequestEOF(request.id));
     }
 
-    fn process_response(&mut self, response: &Response) {
-        let _ = self.send(FetchResponseMsg::ProcessResponse(response.metadata()));
+    fn process_response(&mut self, request: &Request, response: &Response) {
+        let _ = self.send(FetchResponseMsg::ProcessResponse(
+            request.id,
+            response.metadata(),
+        ));
     }
 
-    fn process_response_chunk(&mut self, chunk: Vec<u8>) {
-        let _ = self.send(FetchResponseMsg::ProcessResponseChunk(chunk));
+    fn process_response_chunk(&mut self, request: &Request, chunk: Vec<u8>) {
+        let _ = self.send(FetchResponseMsg::ProcessResponseChunk(request.id, chunk));
     }
 
-    fn process_response_eof(&mut self, response: &Response) {
-        if let Some(e) = response.get_network_error() {
-            let _ = self.send(FetchResponseMsg::ProcessResponseEOF(Err(e.clone())));
+    fn process_response_eof(&mut self, request: &Request, response: &Response) {
+        let payload = if let Some(network_error) = response.get_network_error() {
+            Err(network_error.clone())
         } else {
-            let _ = self.send(FetchResponseMsg::ProcessResponseEOF(Ok(response
-                .get_resource_timing()
-                .lock()
-                .unwrap()
-                .clone())));
-        }
+            Ok(response.get_resource_timing().lock().unwrap().clone())
+        };
+
+        let _ = self.send(FetchResponseMsg::ProcessResponseEOF(request.id, payload));
     }
 }
 
@@ -284,14 +322,10 @@ pub struct DiscardFetch;
 
 impl FetchTaskTarget for DiscardFetch {
     fn process_request_body(&mut self, _: &Request) {}
-
     fn process_request_eof(&mut self, _: &Request) {}
-
-    fn process_response(&mut self, _: &Response) {}
-
-    fn process_response_chunk(&mut self, _: Vec<u8>) {}
-
-    fn process_response_eof(&mut self, _: &Response) {}
+    fn process_response(&mut self, _: &Request, _: &Response) {}
+    fn process_response_chunk(&mut self, _: &Request, _: Vec<u8>) {}
+    fn process_response_eof(&mut self, _: &Request, _: &Response) {}
 }
 
 pub trait Action<Listener> {
@@ -302,16 +336,25 @@ impl<T: FetchResponseListener> Action<T> for FetchResponseMsg {
     /// Execute the default action on a provided listener.
     fn process(self, listener: &mut T) {
         match self {
-            FetchResponseMsg::ProcessRequestBody => listener.process_request_body(),
-            FetchResponseMsg::ProcessRequestEOF => listener.process_request_eof(),
-            FetchResponseMsg::ProcessResponse(meta) => listener.process_response(meta),
-            FetchResponseMsg::ProcessResponseChunk(data) => listener.process_response_chunk(data),
-            FetchResponseMsg::ProcessResponseEOF(data) => {
+            FetchResponseMsg::ProcessRequestBody(request_id) => {
+                listener.process_request_body(request_id)
+            },
+            FetchResponseMsg::ProcessRequestEOF(request_id) => {
+                listener.process_request_eof(request_id)
+            },
+            FetchResponseMsg::ProcessResponse(request_id, meta) => {
+                listener.process_response(request_id, meta)
+            },
+            FetchResponseMsg::ProcessResponseChunk(request_id, data) => {
+                listener.process_response_chunk(request_id, data)
+            },
+            FetchResponseMsg::ProcessResponseEOF(request_id, data) => {
                 match data {
                     Ok(ref response_resource_timing) => {
                         // update listener with values from response
                         *listener.resource_timing_mut() = response_resource_timing.clone();
-                        listener.process_response_eof(Ok(response_resource_timing.clone()));
+                        listener
+                            .process_response_eof(request_id, Ok(response_resource_timing.clone()));
                         // TODO timing check https://w3c.github.io/resource-timing/#dfn-timing-allow-check
 
                         listener.submit_resource_timing();
@@ -320,7 +363,7 @@ impl<T: FetchResponseListener> Action<T> for FetchResponseMsg {
                     // (e.g. due to a network error) MAY be included as PerformanceResourceTiming
                     // objects in the Performance Timeline and MUST contain initialized attribute
                     // values for processed substeps of the processing model.
-                    Err(e) => listener.process_response_eof(Err(e)),
+                    Err(e) => listener.process_response_eof(request_id, Err(e)),
                 }
             },
         }
@@ -352,7 +395,7 @@ where
 // See also: https://github.com/servo/servo/blob/735480/components/script/script_thread.rs#L313
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResourceThreads {
-    core_thread: CoreResourceThread,
+    pub core_thread: CoreResourceThread,
     storage_thread: IpcSender<StorageThreadMsg>,
 }
 
@@ -421,10 +464,7 @@ pub enum WebSocketNetworkEvent {
 #[derive(Debug, Deserialize, Serialize)]
 /// IPC channels to communicate with the script thread about network or DOM events.
 pub enum FetchChannels {
-    ResponseMsg(
-        IpcSender<FetchResponseMsg>,
-        /* cancel_chan */ Option<IpcReceiver<()>>,
-    ),
+    ResponseMsg(IpcSender<FetchResponseMsg>),
     WebSocket {
         event_sender: IpcSender<WebSocketNetworkEvent>,
         action_receiver: IpcReceiver<WebSocketDomAction>,
@@ -437,13 +477,9 @@ pub enum FetchChannels {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CoreResourceMsg {
     Fetch(RequestBuilder, FetchChannels),
+    Cancel(Vec<RequestId>),
     /// Initiate a fetch in response to processing a redirection
-    FetchRedirect(
-        RequestBuilder,
-        ResponseInit,
-        IpcSender<FetchResponseMsg>,
-        /* cancel_chan */ Option<IpcReceiver<()>>,
-    ),
+    FetchRedirect(RequestBuilder, ResponseInit, IpcSender<FetchResponseMsg>),
     /// Store a cookie for a given originating URL
     SetCookieForUrl(ServoUrl, Serde<Cookie<'static>>, CookieSource),
     /// Store a set of cookies for a given originating URL
@@ -476,22 +512,142 @@ pub enum CoreResourceMsg {
     Exit(IpcSender<()>),
 }
 
-/// Instruct the resource thread to make a new request.
-pub fn fetch_async<F>(request: RequestBuilder, core_resource_thread: &CoreResourceThread, f: F)
-where
-    F: Fn(FetchResponseMsg) + Send + 'static,
-{
-    let (action_sender, action_receiver) = ipc::channel().unwrap();
-    ROUTER.add_route(
-        action_receiver.to_opaque(),
-        Box::new(move |message| f(message.to().unwrap())),
-    );
-    core_resource_thread
-        .send(CoreResourceMsg::Fetch(
+// FIXME: https://github.com/servo/servo/issues/34591
+#[expect(clippy::large_enum_variant)]
+enum ToFetchThreadMessage {
+    Cancel(Vec<RequestId>),
+    StartFetch(
+        /* request_builder */ RequestBuilder,
+        /* response_init */ Option<ResponseInit>,
+        /* callback  */ BoxedFetchCallback,
+    ),
+    FetchResponse(FetchResponseMsg),
+}
+
+pub type BoxedFetchCallback = Box<dyn Fn(FetchResponseMsg) + Send + 'static>;
+
+/// A thread to handle fetches in a Servo process. This thread is responsible for
+/// listening for new fetch requests as well as updates on those operations and forwarding
+/// them to crossbeam channels.
+struct FetchThread {
+    /// A list of active fetches. A fetch is no longer active once the
+    /// [`FetchResponseMsg::ProcessResponseEOF`] is received.
+    active_fetches: HashMap<RequestId, BoxedFetchCallback>,
+    /// A reference to the [`CoreResourceThread`] used to kick off fetch requests.
+    core_resource_thread: CoreResourceThread,
+    /// A crossbeam receiver attached to the router proxy which converts incoming fetch
+    /// updates from IPC messages to crossbeam messages as well as another sender which
+    /// handles requests from clients wanting to do fetches.
+    receiver: Receiver<ToFetchThreadMessage>,
+    /// An [`IpcSender`] that's sent with every fetch request and leads back to our
+    /// router proxy.
+    to_fetch_sender: IpcSender<FetchResponseMsg>,
+}
+
+impl FetchThread {
+    fn spawn(core_resource_thread: &CoreResourceThread) -> Sender<ToFetchThreadMessage> {
+        let (sender, receiver) = unbounded();
+        let (to_fetch_sender, from_fetch_sender) = ipc::channel().unwrap();
+
+        let sender_clone = sender.clone();
+        ROUTER.add_typed_route(
+            from_fetch_sender,
+            Box::new(move |message| {
+                let message: FetchResponseMsg = message.unwrap();
+                let _ = sender_clone.send(ToFetchThreadMessage::FetchResponse(message));
+            }),
+        );
+
+        let core_resource_thread = core_resource_thread.clone();
+        thread::Builder::new()
+            .name("FetchThread".to_owned())
+            .spawn(move || {
+                let mut fetch_thread = FetchThread {
+                    active_fetches: HashMap::new(),
+                    core_resource_thread,
+                    receiver,
+                    to_fetch_sender,
+                };
+                fetch_thread.run();
+            })
+            .expect("Thread spawning failed");
+        sender
+    }
+
+    fn run(&mut self) {
+        loop {
+            match self.receiver.recv().unwrap() {
+                ToFetchThreadMessage::StartFetch(request_builder, response_init, callback) => {
+                    self.active_fetches.insert(request_builder.id, callback);
+
+                    // Only redirects have a `response_init` field.
+                    let message = match response_init {
+                        Some(response_init) => CoreResourceMsg::FetchRedirect(
+                            request_builder,
+                            response_init,
+                            self.to_fetch_sender.clone(),
+                        ),
+                        None => CoreResourceMsg::Fetch(
+                            request_builder,
+                            FetchChannels::ResponseMsg(self.to_fetch_sender.clone()),
+                        ),
+                    };
+
+                    self.core_resource_thread.send(message).unwrap();
+                },
+                ToFetchThreadMessage::FetchResponse(fetch_response_msg) => {
+                    let request_id = fetch_response_msg.request_id();
+                    let fetch_finished =
+                        matches!(fetch_response_msg, FetchResponseMsg::ProcessResponseEOF(..));
+
+                    self.active_fetches
+                        .get(&request_id)
+                        .expect("Got fetch response for unknown fetch")(
+                        fetch_response_msg
+                    );
+
+                    if fetch_finished {
+                        self.active_fetches.remove(&request_id);
+                    }
+                },
+                ToFetchThreadMessage::Cancel(request_ids) => {
+                    // Errors are ignored here, because Servo sends many cancellation requests when shutting down.
+                    // At this point the networking task might be shut down completely, so just ignore errors
+                    // during this time.
+                    let _ = self
+                        .core_resource_thread
+                        .send(CoreResourceMsg::Cancel(request_ids));
+                },
+            }
+        }
+    }
+}
+
+static FETCH_THREAD: OnceLock<Sender<ToFetchThreadMessage>> = OnceLock::new();
+
+/// Instruct the resource thread to make a new fetch request.
+pub fn fetch_async(
+    core_resource_thread: &CoreResourceThread,
+    request: RequestBuilder,
+    response_init: Option<ResponseInit>,
+    callback: BoxedFetchCallback,
+) {
+    let _ = FETCH_THREAD
+        .get_or_init(|| FetchThread::spawn(core_resource_thread))
+        .send(ToFetchThreadMessage::StartFetch(
             request,
-            FetchChannels::ResponseMsg(action_sender, None),
-        ))
-        .unwrap();
+            response_init,
+            callback,
+        ));
+}
+
+/// Instruct the resource thread to cancel an existing request. Does nothing if the
+/// request has already completed or has not been fetched yet.
+pub fn cancel_async_fetch(request_ids: Vec<RequestId>) {
+    let _ = FETCH_THREAD
+        .get()
+        .expect("Tried to cancel request in process that hasn't started one.")
+        .send(ToFetchThreadMessage::Cancel(request_ids));
 }
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
@@ -504,21 +660,21 @@ pub struct ResourceCorsData {
 
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ResourceFetchTiming {
-    pub domain_lookup_start: u64,
+    pub domain_lookup_start: Option<CrossProcessInstant>,
     pub timing_check_passed: bool,
     pub timing_type: ResourceTimingType,
     /// Number of redirects until final resource (currently limited to 20)
     pub redirect_count: u16,
-    pub request_start: u64,
-    pub secure_connection_start: u64,
-    pub response_start: u64,
-    pub fetch_start: u64,
-    pub response_end: u64,
-    pub redirect_start: u64,
-    pub redirect_end: u64,
-    pub connect_start: u64,
-    pub connect_end: u64,
-    pub start_time: u64,
+    pub request_start: Option<CrossProcessInstant>,
+    pub secure_connection_start: Option<CrossProcessInstant>,
+    pub response_start: Option<CrossProcessInstant>,
+    pub fetch_start: Option<CrossProcessInstant>,
+    pub response_end: Option<CrossProcessInstant>,
+    pub redirect_start: Option<CrossProcessInstant>,
+    pub redirect_end: Option<CrossProcessInstant>,
+    pub connect_start: Option<CrossProcessInstant>,
+    pub connect_end: Option<CrossProcessInstant>,
+    pub start_time: Option<CrossProcessInstant>,
 }
 
 pub enum RedirectStartValue {
@@ -549,8 +705,8 @@ pub enum ResourceAttribute {
     RedirectStart(RedirectStartValue),
     RedirectEnd(RedirectEndValue),
     FetchStart,
-    ConnectStart(u64),
-    ConnectEnd(u64),
+    ConnectStart(CrossProcessInstant),
+    ConnectEnd(CrossProcessInstant),
     SecureConnectionStart,
     ResponseEnd,
     StartTime(ResourceTimeValue),
@@ -567,76 +723,70 @@ pub enum ResourceTimingType {
 impl ResourceFetchTiming {
     pub fn new(timing_type: ResourceTimingType) -> ResourceFetchTiming {
         ResourceFetchTiming {
-            timing_type: timing_type,
+            timing_type,
             timing_check_passed: true,
-            domain_lookup_start: 0,
+            domain_lookup_start: None,
             redirect_count: 0,
-            secure_connection_start: 0,
-            request_start: 0,
-            response_start: 0,
-            fetch_start: 0,
-            redirect_start: 0,
-            redirect_end: 0,
-            connect_start: 0,
-            connect_end: 0,
-            response_end: 0,
-            start_time: 0,
+            secure_connection_start: None,
+            request_start: None,
+            response_start: None,
+            fetch_start: None,
+            redirect_start: None,
+            redirect_end: None,
+            connect_start: None,
+            connect_end: None,
+            response_end: None,
+            start_time: None,
         }
     }
 
     // TODO currently this is being set with precise time ns when it should be time since
     // time origin (as described in Performance::now)
     pub fn set_attribute(&mut self, attribute: ResourceAttribute) {
-        let should_attribute_always_be_updated = match attribute {
+        let should_attribute_always_be_updated = matches!(
+            attribute,
             ResourceAttribute::FetchStart |
-            ResourceAttribute::ResponseEnd |
-            ResourceAttribute::StartTime(_) => true,
-            _ => false,
-        };
+                ResourceAttribute::ResponseEnd |
+                ResourceAttribute::StartTime(_)
+        );
         if !self.timing_check_passed && !should_attribute_always_be_updated {
             return;
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        let now = Some(CrossProcessInstant::now());
         match attribute {
             ResourceAttribute::DomainLookupStart => self.domain_lookup_start = now,
             ResourceAttribute::RedirectCount(count) => self.redirect_count = count,
             ResourceAttribute::RequestStart => self.request_start = now,
             ResourceAttribute::ResponseStart => self.response_start = now,
             ResourceAttribute::RedirectStart(val) => match val {
-                RedirectStartValue::Zero => self.redirect_start = 0,
+                RedirectStartValue::Zero => self.redirect_start = None,
                 RedirectStartValue::FetchStart => {
-                    if self.redirect_start.is_zero() {
+                    if self.redirect_start.is_none() {
                         self.redirect_start = self.fetch_start
                     }
                 },
             },
             ResourceAttribute::RedirectEnd(val) => match val {
-                RedirectEndValue::Zero => self.redirect_end = 0,
+                RedirectEndValue::Zero => self.redirect_end = None,
                 RedirectEndValue::ResponseEnd => self.redirect_end = self.response_end,
             },
             ResourceAttribute::FetchStart => self.fetch_start = now,
-            ResourceAttribute::ConnectStart(val) => self.connect_start = val,
-            ResourceAttribute::ConnectEnd(val) => self.connect_end = val,
+            ResourceAttribute::ConnectStart(instant) => self.connect_start = Some(instant),
+            ResourceAttribute::ConnectEnd(instant) => self.connect_end = Some(instant),
             ResourceAttribute::SecureConnectionStart => self.secure_connection_start = now,
             ResourceAttribute::ResponseEnd => self.response_end = now,
             ResourceAttribute::StartTime(val) => match val {
                 ResourceTimeValue::RedirectStart
-                    if self.redirect_start.is_zero() || !self.timing_check_passed => {},
+                    if self.redirect_start.is_none() || !self.timing_check_passed => {},
                 _ => self.start_time = self.get_time_value(val),
             },
         }
     }
 
-    fn get_time_value(&self, time: ResourceTimeValue) -> u64 {
+    fn get_time_value(&self, time: ResourceTimeValue) -> Option<CrossProcessInstant> {
         match time {
-            ResourceTimeValue::Zero => 0,
-            ResourceTimeValue::Now => SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64,
+            ResourceTimeValue::Zero => None,
+            ResourceTimeValue::Now => Some(CrossProcessInstant::now()),
             ResourceTimeValue::FetchStart => self.fetch_start,
             ResourceTimeValue::RedirectStart => self.redirect_start,
         }
@@ -644,13 +794,13 @@ impl ResourceFetchTiming {
 
     pub fn mark_timing_check_failed(&mut self) {
         self.timing_check_passed = false;
-        self.domain_lookup_start = 0;
+        self.domain_lookup_start = None;
         self.redirect_count = 0;
-        self.request_start = 0;
-        self.response_start = 0;
-        self.redirect_start = 0;
-        self.connect_start = 0;
-        self.connect_end = 0;
+        self.request_start = None;
+        self.response_start = None;
+        self.redirect_start = None;
+        self.connect_start = None;
+        self.connect_end = None;
     }
 }
 
@@ -675,7 +825,7 @@ pub struct Metadata {
     pub headers: Option<Serde<HeaderMap>>,
 
     /// HTTP Status
-    pub status: Option<(u16, Vec<u8>)>,
+    pub status: HttpStatus,
 
     /// Is successful HTTPS connection
     pub https_state: HttpsState,
@@ -684,7 +834,7 @@ pub struct Metadata {
     pub referrer: Option<ServoUrl>,
 
     /// Referrer Policy of the Request used to obtain Response
-    pub referrer_policy: Option<ReferrerPolicy>,
+    pub referrer_policy: ReferrerPolicy,
     /// Performance information for navigation events
     pub timing: Option<ResourceFetchTiming>,
     /// True if the request comes from a redirection
@@ -700,11 +850,10 @@ impl Metadata {
             content_type: None,
             charset: None,
             headers: None,
-            // https://fetch.spec.whatwg.org/#concept-response-status-message
-            status: Some((200, b"".to_vec())),
+            status: HttpStatus::default(),
             https_state: HttpsState::None,
             referrer: None,
-            referrer_policy: None,
+            referrer_policy: ReferrerPolicy::EmptyString,
             timing: None,
             redirected: false,
         }
@@ -729,18 +878,21 @@ impl Metadata {
     }
 
     /// Set the referrer policy associated with the loaded resource.
-    pub fn set_referrer_policy(&mut self, referrer_policy: Option<ReferrerPolicy>) {
+    pub fn set_referrer_policy(&mut self, referrer_policy: ReferrerPolicy) {
+        if referrer_policy == ReferrerPolicy::EmptyString {
+            return;
+        }
+
         if self.headers.is_none() {
             self.headers = Some(Serde(HeaderMap::new()));
         }
 
         self.referrer_policy = referrer_policy;
-        if let Some(referrer_policy) = referrer_policy {
-            self.headers
-                .as_mut()
-                .unwrap()
-                .typed_insert::<ReferrerPolicyHeader>(referrer_policy.into());
-        }
+
+        self.headers
+            .as_mut()
+            .unwrap()
+            .typed_insert::<ReferrerPolicyHeader>(referrer_policy.into());
     }
 }
 
@@ -766,10 +918,10 @@ pub enum NetworkError {
 }
 
 impl NetworkError {
-    pub fn from_hyper_error(error: &HyperError, certificate: Option<Certificate>) -> Self {
+    pub fn from_hyper_error(error: &HyperError, certificate: Option<CertificateDer>) -> Self {
         let error_string = error.to_string();
         match certificate {
-            Some(certificate) => NetworkError::SslValidation(error_string, certificate.0),
+            Some(certificate) => NetworkError::SslValidation(error_string, certificate.to_vec()),
             _ => NetworkError::Internal(error_string),
         }
     }
@@ -782,7 +934,7 @@ impl NetworkError {
 /// Normalize `slice`, as defined by
 /// [the Fetch Spec](https://fetch.spec.whatwg.org/#concept-header-value-normalize).
 pub fn trim_http_whitespace(mut slice: &[u8]) -> &[u8] {
-    const HTTP_WS_BYTES: &'static [u8] = b"\x09\x0A\x0D\x20";
+    const HTTP_WS_BYTES: &[u8] = b"\x09\x0A\x0D\x20";
 
     loop {
         match slice.split_first() {
@@ -829,38 +981,17 @@ pub fn http_percent_encode(bytes: &[u8]) -> String {
     percent_encoding::percent_encode(bytes, HTTP_VALUE).to_string()
 }
 
-#[derive(Deserialize, Serialize)]
-pub enum NetToCompositorMsg {
-    AddImage(ImageKey, ImageDescriptor, ImageData),
-    GenerateImageKey(IpcSender<ImageKey>),
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct WebrenderIpcSender(IpcSender<NetToCompositorMsg>);
-
-impl WebrenderIpcSender {
-    pub fn new(sender: IpcSender<NetToCompositorMsg>) -> Self {
-        Self(sender)
+pub fn set_default_accept_language(headers: &mut HeaderMap) {
+    if headers.contains_key(header::ACCEPT_LANGUAGE) {
+        return;
     }
 
-    pub fn generate_image_key(&self) -> ImageKey {
-        let (sender, receiver) = ipc::channel().unwrap();
-        self.0
-            .send(NetToCompositorMsg::GenerateImageKey(sender))
-            .expect("error sending image key generation");
-        receiver.recv().expect("error receiving image key result")
-    }
-
-    pub fn add_image(&self, key: ImageKey, descriptor: ImageDescriptor, data: ImageData) {
-        if let Err(e) = self
-            .0
-            .send(NetToCompositorMsg::AddImage(key, descriptor, data))
-        {
-            warn!("Error sending image update: {}", e);
-        }
-    }
+    // TODO(eijebong): Change this once typed headers are done
+    headers.insert(
+        header::ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.5"),
+    );
 }
 
-lazy_static! {
-    pub static ref PRIVILEGED_SECRET: u32 = servo_rand::ServoRng::new().next_u32();
-}
+pub static PRIVILEGED_SECRET: LazyLock<u32> =
+    LazyLock::new(|| servo_rand::ServoRng::default().next_u32());

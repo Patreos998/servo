@@ -9,7 +9,7 @@ use dom_struct::dom_struct;
 use html5ever::{local_name, namespace_url, ns, LocalName, Prefix, QualName};
 use js::rust::HandleObject;
 use style::str::{split_html_space_chars, str_join};
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::CharacterDataBinding::CharacterDataMethods;
@@ -35,9 +35,10 @@ use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::virtualmethods::VirtualMethods;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLOptionElement {
+pub(crate) struct HTMLOptionElement {
     htmlelement: HTMLElement,
 
     /// <https://html.spec.whatwg.org/multipage/#attr-option-selected>
@@ -65,12 +66,13 @@ impl HTMLOptionElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLOptionElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLOptionElement::new_inherited(
@@ -78,49 +80,15 @@ impl HTMLOptionElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-option
-    #[allow(non_snake_case)]
-    pub fn Option(
-        window: &Window,
-        proto: Option<HandleObject>,
-        text: DOMString,
-        value: Option<DOMString>,
-        default_selected: bool,
-        selected: bool,
-    ) -> Fallible<DomRoot<HTMLOptionElement>> {
-        let element = Element::create(
-            QualName::new(None, ns!(html), local_name!("option")),
-            None,
-            &window.Document(),
-            ElementCreator::ScriptCreated,
-            CustomElementCreationMode::Synchronous,
-            proto,
-        );
-
-        let option = DomRoot::downcast::<HTMLOptionElement>(element).unwrap();
-
-        if !text.is_empty() {
-            option.upcast::<Node>().SetTextContent(Some(text))
-        }
-
-        if let Some(val) = value {
-            option.SetValue(val)
-        }
-
-        option.SetDefaultSelected(default_selected);
-        option.set_selectedness(selected);
-        option.update_select_validity();
-        Ok(option)
-    }
-
-    pub fn set_selectedness(&self, selected: bool) {
+    pub(crate) fn set_selectedness(&self, selected: bool) {
         self.selectedness.set(selected);
     }
 
-    pub fn set_dirtiness(&self, dirtiness: bool) {
+    pub(crate) fn set_dirtiness(&self, dirtiness: bool) {
         self.dirtiness.set(dirtiness);
     }
 
@@ -206,7 +174,43 @@ fn collect_text(element: &Element, value: &mut String) {
     }
 }
 
-impl HTMLOptionElementMethods for HTMLOptionElement {
+impl HTMLOptionElementMethods<crate::DomTypeHolder> for HTMLOptionElement {
+    // https://html.spec.whatwg.org/multipage/#dom-option
+    fn Option(
+        window: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+        text: DOMString,
+        value: Option<DOMString>,
+        default_selected: bool,
+        selected: bool,
+    ) -> Fallible<DomRoot<HTMLOptionElement>> {
+        let element = Element::create(
+            QualName::new(None, ns!(html), local_name!("option")),
+            None,
+            &window.Document(),
+            ElementCreator::ScriptCreated,
+            CustomElementCreationMode::Synchronous,
+            proto,
+            can_gc,
+        );
+
+        let option = DomRoot::downcast::<HTMLOptionElement>(element).unwrap();
+
+        if !text.is_empty() {
+            option.upcast::<Node>().SetTextContent(Some(text), can_gc)
+        }
+
+        if let Some(val) = value {
+            option.SetValue(val)
+        }
+
+        option.SetDefaultSelected(default_selected);
+        option.set_selectedness(selected);
+        option.update_select_validity();
+        Ok(option)
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-option-disabled
     make_bool_getter!(Disabled, "disabled");
 
@@ -221,8 +225,8 @@ impl HTMLOptionElementMethods for HTMLOptionElement {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-option-text
-    fn SetText(&self, value: DOMString) {
-        self.upcast::<Node>().SetTextContent(Some(value))
+    fn SetText(&self, value: DOMString, can_gc: CanGc) {
+        self.upcast::<Node>().SetTextContent(Some(value), can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-option-form
@@ -298,8 +302,8 @@ impl VirtualMethods for HTMLOptionElement {
 
     fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
         self.super_type().unwrap().attribute_mutated(attr, mutation);
-        match attr.local_name() {
-            &local_name!("disabled") => {
+        match *attr.local_name() {
+            local_name!("disabled") => {
                 let el = self.upcast::<Element>();
                 match mutation {
                     AttributeMutation::Set(_) => {
@@ -314,7 +318,7 @@ impl VirtualMethods for HTMLOptionElement {
                 }
                 self.update_select_validity();
             },
-            &local_name!("selected") => {
+            local_name!("selected") => {
                 match mutation {
                     AttributeMutation::Set(_) => {
                         // https://html.spec.whatwg.org/multipage/#concept-option-selectedness
@@ -336,7 +340,7 @@ impl VirtualMethods for HTMLOptionElement {
     }
 
     fn bind_to_tree(&self, context: &BindContext) {
-        if let Some(ref s) = self.super_type() {
+        if let Some(s) = self.super_type() {
             s.bind_to_tree(context);
         }
 

@@ -8,31 +8,31 @@ use std::convert::TryInto;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
+use base::id::{MessagePortId, MessagePortIndex, PipelineNamespaceId};
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject, MutableHandleObject};
 use js::rust::{CustomAutoRooter, CustomAutoRooterGuard, HandleValue};
-use msg::constellation_msg::{MessagePortId, MessagePortIndex, PipelineNamespaceId};
 use script_traits::PortMessageTask;
 
 use crate::dom::bindings::codegen::Bindings::EventHandlerBinding::EventHandlerNonNull;
 use crate::dom::bindings::codegen::Bindings::MessagePortBinding::{
-    MessagePortMethods, PostMessageOptions,
+    MessagePortMethods, StructuredSerializeOptions,
 };
 use crate::dom::bindings::conversions::root_from_object;
 use crate::dom::bindings::error::{Error, ErrorResult};
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal, DomObject};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::structuredclone::{self, StructuredDataHolder};
+use crate::dom::bindings::structuredclone::{self, StructuredDataReader, StructuredDataWriter};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::bindings::transferable::Transferable;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[dom_struct]
 /// The MessagePort used in the DOM.
-pub struct MessagePort {
+pub(crate) struct MessagePort {
     eventtarget: EventTarget,
     #[no_trace]
     message_port_id: MessagePortId,
@@ -52,9 +52,13 @@ impl MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#create-a-new-messageport-object>
-    pub fn new(owner: &GlobalScope) -> DomRoot<MessagePort> {
+    pub(crate) fn new(owner: &GlobalScope) -> DomRoot<MessagePort> {
         let port_id = MessagePortId::new();
-        reflect_dom_object(Box::new(MessagePort::new_inherited(port_id)), owner)
+        reflect_dom_object(
+            Box::new(MessagePort::new_inherited(port_id)),
+            owner,
+            CanGc::note(),
+        )
     }
 
     /// Create a new port for an incoming transfer-received one.
@@ -71,19 +75,20 @@ impl MessagePort {
                 entangled_port: RefCell::new(entangled_port),
             }),
             owner,
+            CanGc::note(),
         )
     }
 
     /// <https://html.spec.whatwg.org/multipage/#entangle>
-    pub fn entangle(&self, other_id: MessagePortId) {
+    pub(crate) fn entangle(&self, other_id: MessagePortId) {
         *self.entangled_port.borrow_mut() = Some(other_id);
     }
 
-    pub fn message_port_id(&self) -> &MessagePortId {
+    pub(crate) fn message_port_id(&self) -> &MessagePortId {
         &self.message_port_id
     }
 
-    pub fn detached(&self) -> bool {
+    pub(crate) fn detached(&self) -> bool {
         self.detached.get()
     }
 
@@ -151,22 +156,17 @@ impl MessagePort {
 
         // Have the global proxy this call to the corresponding MessagePortImpl.
         self.global()
-            .post_messageport_msg(self.message_port_id().clone(), task);
+            .post_messageport_msg(*self.message_port_id(), task);
         Ok(())
     }
 }
 
 impl Transferable for MessagePort {
     /// <https://html.spec.whatwg.org/multipage/#message-ports:transfer-steps>
-    fn transfer(&self, sc_holder: &mut StructuredDataHolder) -> Result<u64, ()> {
+    fn transfer(&self, sc_writer: &mut StructuredDataWriter) -> Result<u64, ()> {
         if self.detached.get() {
             return Err(());
         }
-
-        let port_impls = match sc_holder {
-            StructuredDataHolder::Write { ports, .. } => ports,
-            _ => panic!("Unexpected variant of StructuredDataHolder"),
-        };
 
         self.detached.set(true);
         let id = self.message_port_id();
@@ -175,16 +175,16 @@ impl Transferable for MessagePort {
         let transferred_port = self.global().mark_port_as_transferred(id);
 
         // 2. Store the transferred object at a given key.
-        if let Some(ports) = port_impls.as_mut() {
-            ports.insert(id.clone(), transferred_port);
+        if let Some(ports) = sc_writer.ports.as_mut() {
+            ports.insert(*id, transferred_port);
         } else {
             let mut ports = HashMap::new();
-            ports.insert(id.clone(), transferred_port);
-            *port_impls = Some(ports);
+            ports.insert(*id, transferred_port);
+            sc_writer.ports = Some(ports);
         }
 
-        let PipelineNamespaceId(name_space) = id.clone().namespace_id;
-        let MessagePortIndex(index) = id.clone().index;
+        let PipelineNamespaceId(name_space) = (id).namespace_id;
+        let MessagePortIndex(index) = (id).index;
         let index = index.get();
 
         let mut big: [u8; 8] = [0; 8];
@@ -202,19 +202,10 @@ impl Transferable for MessagePort {
     /// <https://html.spec.whatwg.org/multipage/#message-ports:transfer-receiving-steps>
     fn transfer_receive(
         owner: &GlobalScope,
-        sc_holder: &mut StructuredDataHolder,
+        sc_reader: &mut StructuredDataReader,
         extra_data: u64,
         return_object: MutableHandleObject,
     ) -> Result<(), ()> {
-        let (message_ports, port_impls) = match sc_holder {
-            StructuredDataHolder::Read {
-                message_ports,
-                port_impls,
-                ..
-            } => (message_ports, port_impls),
-            _ => panic!("Unexpected variant of StructuredDataHolder"),
-        };
-
         // 1. Re-build the key for the storage location
         // of the transferred object.
         let big: [u8; 8] = extra_data.to_ne_bytes();
@@ -239,11 +230,11 @@ impl Transferable for MessagePort {
 
         // 2. Get the transferred object from its storage, using the key.
         // Assign the transfer-received port-impl, and total number of transferred ports.
-        let (ports_len, port_impl) = if let Some(ports) = port_impls.as_mut() {
+        let (ports_len, port_impl) = if let Some(ports) = sc_reader.port_impls.as_mut() {
             let ports_len = ports.len();
             let port_impl = ports.remove(&id).expect("Transferred port to be stored");
             if ports.is_empty() {
-                *port_impls = None;
+                sc_reader.port_impls = None;
             }
             (ports_len, port_impl)
         } else {
@@ -251,25 +242,25 @@ impl Transferable for MessagePort {
         };
 
         let transferred_port =
-            MessagePort::new_transferred(&*owner, id.clone(), port_impl.entangled_port_id());
+            MessagePort::new_transferred(owner, id, port_impl.entangled_port_id());
         owner.track_message_port(&transferred_port, Some(port_impl));
 
         return_object.set(transferred_port.reflector().rootable().get());
 
         // Store the DOM port where it will be passed along to script in the message-event.
-        if let Some(ports) = message_ports.as_mut() {
+        if let Some(ports) = sc_reader.message_ports.as_mut() {
             ports.push(transferred_port);
         } else {
             let mut ports = Vec::with_capacity(ports_len);
             ports.push(transferred_port);
-            *message_ports = Some(ports);
+            sc_reader.message_ports = Some(ports);
         }
 
         Ok(())
     }
 }
 
-impl MessagePortMethods for MessagePort {
+impl MessagePortMethods<crate::DomTypeHolder> for MessagePort {
     /// <https://html.spec.whatwg.org/multipage/#dom-messageport-postmessage>
     fn PostMessage(
         &self,
@@ -288,7 +279,7 @@ impl MessagePortMethods for MessagePort {
         &self,
         cx: SafeJSContext,
         message: HandleValue,
-        options: RootedTraceableBox<PostMessageOptions>,
+        options: RootedTraceableBox<StructuredSerializeOptions>,
     ) -> ErrorResult {
         if self.detached.get() {
             return Ok(());
@@ -322,12 +313,12 @@ impl MessagePortMethods for MessagePort {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>
-    fn GetOnmessage(&self) -> Option<Rc<EventHandlerNonNull>> {
+    fn GetOnmessage(&self, can_gc: CanGc) -> Option<Rc<EventHandlerNonNull>> {
         if self.detached.get() {
             return None;
         }
         let eventtarget = self.upcast::<EventTarget>();
-        eventtarget.get_event_handler_common("message")
+        eventtarget.get_event_handler_common("message", can_gc)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#handler-messageport-onmessage>

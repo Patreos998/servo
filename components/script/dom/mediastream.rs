@@ -10,69 +10,95 @@ use servo_media::streams::MediaStreamType;
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::MediaStreamBinding::MediaStreamMethods;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::mediastreamtrack::MediaStreamTrack;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct MediaStream {
+pub(crate) struct MediaStream {
     eventtarget: EventTarget,
     tracks: DomRefCell<Vec<Dom<MediaStreamTrack>>>,
 }
 
-#[allow(non_snake_case)]
 impl MediaStream {
-    pub fn new_inherited() -> MediaStream {
+    pub(crate) fn new_inherited() -> MediaStream {
         MediaStream {
             eventtarget: EventTarget::new_inherited(),
             tracks: DomRefCell::new(vec![]),
         }
     }
 
-    pub fn new(global: &GlobalScope) -> DomRoot<MediaStream> {
-        Self::new_with_proto(global, None)
+    pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<MediaStream> {
+        Self::new_with_proto(global, None, can_gc)
     }
 
-    fn new_with_proto(global: &GlobalScope, proto: Option<HandleObject>) -> DomRoot<MediaStream> {
-        reflect_dom_object_with_proto(Box::new(MediaStream::new_inherited()), global, proto)
+    fn new_with_proto(
+        global: &GlobalScope,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> DomRoot<MediaStream> {
+        reflect_dom_object_with_proto(
+            Box::new(MediaStream::new_inherited()),
+            global,
+            proto,
+            can_gc,
+        )
     }
 
-    pub fn new_single(
+    pub(crate) fn new_single(
         global: &GlobalScope,
         id: MediaStreamId,
         ty: MediaStreamType,
+        can_gc: CanGc,
     ) -> DomRoot<MediaStream> {
-        let this = Self::new(global);
+        let this = Self::new(global, can_gc);
         let track = MediaStreamTrack::new(global, id, ty);
         this.AddTrack(&track);
         this
     }
 
-    pub fn Constructor(
-        global: &Window,
-        proto: Option<HandleObject>,
-    ) -> Fallible<DomRoot<MediaStream>> {
-        Ok(MediaStream::new_with_proto(&global.global(), proto))
+    pub(crate) fn get_tracks(&self) -> Ref<[Dom<MediaStreamTrack>]> {
+        Ref::map(self.tracks.borrow(), |tracks| &**tracks)
     }
 
-    pub fn Constructor_(
+    pub(crate) fn add_track(&self, track: &MediaStreamTrack) {
+        self.tracks.borrow_mut().push(Dom::from_ref(track))
+    }
+}
+
+impl MediaStreamMethods<crate::DomTypeHolder> for MediaStream {
+    /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-constructor>
+    fn Constructor(
+        global: &Window,
+        proto: Option<HandleObject>,
+        can_gc: CanGc,
+    ) -> Fallible<DomRoot<MediaStream>> {
+        Ok(MediaStream::new_with_proto(&global.global(), proto, can_gc))
+    }
+
+    /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-constructor>
+    fn Constructor_(
         _: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         stream: &MediaStream,
     ) -> Fallible<DomRoot<MediaStream>> {
-        Ok(stream.clone_with_proto(proto))
+        Ok(stream.clone_with_proto(proto, can_gc))
     }
 
-    pub fn Constructor__(
+    /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-constructor>
+    fn Constructor__(
         global: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         tracks: Vec<DomRoot<MediaStreamTrack>>,
     ) -> Fallible<DomRoot<MediaStream>> {
-        let new = MediaStream::new_with_proto(&global.global(), proto);
+        let new = MediaStream::new_with_proto(&global.global(), proto, can_gc);
         for track in tracks {
             // this is quadratic, but shouldn't matter much
             // if this becomes a problem we can use a hash map
@@ -81,16 +107,6 @@ impl MediaStream {
         Ok(new)
     }
 
-    pub fn get_tracks(&self) -> Ref<[Dom<MediaStreamTrack>]> {
-        Ref::map(self.tracks.borrow(), |tracks| &**tracks)
-    }
-
-    pub fn add_track(&self, track: &MediaStreamTrack) {
-        self.tracks.borrow_mut().push(Dom::from_ref(track))
-    }
-}
-
-impl MediaStreamMethods for MediaStream {
     /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-gettracks>
     fn GetTracks(&self) -> Vec<DomRoot<MediaStreamTrack>> {
         self.tracks
@@ -125,13 +141,13 @@ impl MediaStreamMethods for MediaStream {
         self.tracks
             .borrow()
             .iter()
-            .find(|x| x.id().id().to_string() == &*id)
+            .find(|x| x.id().id().to_string() == *id)
             .map(|x| DomRoot::from_ref(&**x))
     }
 
     /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-addtrack>
     fn AddTrack(&self, track: &MediaStreamTrack) {
-        let existing = self.tracks.borrow().iter().find(|x| *x == &track).is_some();
+        let existing = self.tracks.borrow().iter().any(|x| x == &track);
 
         if existing {
             return;
@@ -145,16 +161,16 @@ impl MediaStreamMethods for MediaStream {
     }
 
     /// <https://w3c.github.io/mediacapture-main/#dom-mediastream-clone>
-    fn Clone(&self) -> DomRoot<MediaStream> {
-        self.clone_with_proto(None)
+    fn Clone(&self, can_gc: CanGc) -> DomRoot<MediaStream> {
+        self.clone_with_proto(None, can_gc)
     }
 }
 
 impl MediaStream {
-    fn clone_with_proto(&self, proto: Option<HandleObject>) -> DomRoot<MediaStream> {
-        let new = MediaStream::new_with_proto(&self.global(), proto);
+    fn clone_with_proto(&self, proto: Option<HandleObject>, can_gc: CanGc) -> DomRoot<MediaStream> {
+        let new = MediaStream::new_with_proto(&self.global(), proto, can_gc);
         for track in &*self.tracks.borrow() {
-            new.add_track(&track)
+            new.add_track(track)
         }
         new
     }

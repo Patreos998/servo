@@ -17,69 +17,20 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct WebGLContextEvent {
+pub(crate) struct WebGLContextEvent {
     event: Event,
     status_message: DOMString,
 }
 
-impl WebGLContextEventMethods for WebGLContextEvent {
-    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15
-    fn StatusMessage(&self) -> DOMString {
-        self.status_message.clone()
-    }
-
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
-    fn IsTrusted(&self) -> bool {
-        self.event.IsTrusted()
-    }
-}
-
-impl WebGLContextEvent {
-    fn new_inherited(status_message: DOMString) -> WebGLContextEvent {
-        WebGLContextEvent {
-            event: Event::new_inherited(),
-            status_message: status_message,
-        }
-    }
-
-    pub fn new(
-        window: &Window,
-        type_: Atom,
-        bubbles: EventBubbles,
-        cancelable: EventCancelable,
-        status_message: DOMString,
-    ) -> DomRoot<WebGLContextEvent> {
-        Self::new_with_proto(window, None, type_, bubbles, cancelable, status_message)
-    }
-
-    fn new_with_proto(
+impl WebGLContextEventMethods<crate::DomTypeHolder> for WebGLContextEvent {
+    // https://registry.khronos.org/webgl/specs/latest/1.0/#5.15
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
-        type_: Atom,
-        bubbles: EventBubbles,
-        cancelable: EventCancelable,
-        status_message: DOMString,
-    ) -> DomRoot<WebGLContextEvent> {
-        let event = reflect_dom_object_with_proto(
-            Box::new(WebGLContextEvent::new_inherited(status_message)),
-            window,
-            proto,
-        );
-
-        {
-            let parent = event.upcast::<Event>();
-            parent.init_event(type_, bool::from(bubbles), bool::from(cancelable));
-        }
-
-        event
-    }
-
-    #[allow(non_snake_case)]
-    pub fn Constructor(
-        window: &Window,
-        proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &WebGLContextEventInit,
     ) -> Fallible<DomRoot<WebGLContextEvent>> {
@@ -99,6 +50,69 @@ impl WebGLContextEvent {
             bubbles,
             cancelable,
             status_message,
+            can_gc,
         ))
+    }
+
+    // https://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15
+    fn StatusMessage(&self) -> DOMString {
+        self.status_message.clone()
+    }
+
+    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    fn IsTrusted(&self) -> bool {
+        self.event.IsTrusted()
+    }
+}
+
+impl WebGLContextEvent {
+    fn new_inherited(status_message: DOMString) -> WebGLContextEvent {
+        WebGLContextEvent {
+            event: Event::new_inherited(),
+            status_message,
+        }
+    }
+
+    pub(crate) fn new(
+        window: &Window,
+        type_: Atom,
+        bubbles: EventBubbles,
+        cancelable: EventCancelable,
+        status_message: DOMString,
+        can_gc: CanGc,
+    ) -> DomRoot<WebGLContextEvent> {
+        Self::new_with_proto(
+            window,
+            None,
+            type_,
+            bubbles,
+            cancelable,
+            status_message,
+            can_gc,
+        )
+    }
+
+    fn new_with_proto(
+        window: &Window,
+        proto: Option<HandleObject>,
+        type_: Atom,
+        bubbles: EventBubbles,
+        cancelable: EventCancelable,
+        status_message: DOMString,
+        can_gc: CanGc,
+    ) -> DomRoot<WebGLContextEvent> {
+        let event = reflect_dom_object_with_proto(
+            Box::new(WebGLContextEvent::new_inherited(status_message)),
+            window,
+            proto,
+            can_gc,
+        );
+
+        {
+            let parent = event.upcast::<Event>();
+            parent.init_event(type_, bool::from(bubbles), bool::from(cancelable));
+        }
+
+        event
     }
 }

@@ -6,7 +6,6 @@
 
 use app_units::Au;
 use euclid::default::{Point2D, Rect, Size2D, Vector2D};
-use servo_config::opts;
 use style::servo::restyle_damage::ServoRestyleDamage;
 use webrender_api::units::LayoutPoint;
 use webrender_api::{ColorF, PropertyBinding, RectangleDisplayItem};
@@ -21,12 +20,12 @@ use crate::fragment::{CoordinateSystem, FragmentBorderBoxIterator};
 use crate::generated_content::ResolveGeneratedContent;
 use crate::incremental::RelayoutMode;
 use crate::traversal::{
-    AssignBSizes, AssignISizes, BubbleISizes, BuildDisplayList, InorderFlowTraversal,
-    PostorderFlowTraversal, PreorderFlowTraversal,
+    AssignBSizes, AssignISizes, BuildDisplayList, InorderFlowTraversal, PostorderFlowTraversal,
+    PreorderFlowTraversal,
 };
 
 pub fn resolve_generated_content(root: &mut dyn Flow, layout_context: &LayoutContext) {
-    ResolveGeneratedContent::new(&layout_context).traverse(root, 0);
+    ResolveGeneratedContent::new(layout_context).traverse(root, 0);
 }
 
 /// Run the main layout passes sequentially.
@@ -58,19 +57,8 @@ pub fn reflow(root: &mut dyn Flow, layout_context: &LayoutContext, relayout_mode
         }
     }
 
-    if opts::get().debug.bubble_inline_sizes_separately {
-        let bubble_inline_sizes = BubbleISizes {
-            layout_context: &layout_context,
-        };
-        bubble_inline_sizes.traverse(root);
-    }
-
-    let assign_inline_sizes = AssignISizes {
-        layout_context: &layout_context,
-    };
-    let assign_block_sizes = AssignBSizes {
-        layout_context: &layout_context,
-    };
+    let assign_inline_sizes = AssignISizes { layout_context };
+    let assign_block_sizes = AssignBSizes { layout_context };
 
     doit(root, assign_inline_sizes, assign_block_sizes, relayout_mode);
 }
@@ -92,6 +80,8 @@ pub fn build_display_list_for_subtree<'a>(
     let base = state.create_base_display_item(
         bounds,
         flow_root.as_block().fragment.node,
+        // The unique id is the same as the node id because this is the root fragment.
+        flow_root.as_block().fragment.node.id() as u64,
         None,
         DisplayListSection::BackgroundAndBorders,
     );
@@ -104,7 +94,7 @@ pub fn build_display_list_for_subtree<'a>(
         },
     )));
 
-    let mut build_display_list = BuildDisplayList { state: state };
+    let mut build_display_list = BuildDisplayList { state };
     build_display_list.traverse(flow_root);
     build_display_list.state
 }
@@ -133,11 +123,10 @@ pub fn iterate_through_flow_tree_fragment_border_boxes(
                     .stacking_relative_border_box(CoordinateSystem::Own);
                 if let Some(matrix) = kid.as_block().fragment.transform_matrix(&relative_position) {
                     let transform_matrix = matrix.transform_point2d(LayoutPoint::zero()).unwrap();
-                    stacking_context_position = stacking_context_position +
-                        Vector2D::new(
-                            Au::from_f32_px(transform_matrix.x),
-                            Au::from_f32_px(transform_matrix.y),
-                        )
+                    stacking_context_position += Vector2D::new(
+                        Au::from_f32_px(transform_matrix.x),
+                        Au::from_f32_px(transform_matrix.y),
+                    )
                 }
             }
             doit(kid, level + 1, iterator, &stacking_context_position);

@@ -31,8 +31,6 @@ pub struct BackgroundPlacement {
     pub clip_rect: Rect<Au>,
     /// Rounded corners for the clip_rect.
     pub clip_radii: BorderRadius,
-    /// Whether or not the background is fixed to the viewport.
-    pub fixed: bool,
 }
 
 /// Access element at index modulo the array length.
@@ -143,6 +141,7 @@ pub fn clip(
 /// no intrinsic size.
 ///
 /// Return `None` if the background size is zero, otherwise a [`BackgroundPlacement`].
+#[allow(clippy::too_many_arguments)]
 pub fn placement(
     bg: &Background,
     viewport_size: Size2D<Au>,
@@ -169,17 +168,13 @@ pub fn placement(
         border_radii,
     );
 
-    let mut fixed = false;
     let mut bounds = match bg_attachment {
         BackgroundAttachment::Scroll => match bg_origin {
             BackgroundOrigin::BorderBox => absolute_bounds,
             BackgroundOrigin::PaddingBox => absolute_bounds.inner_rect(border),
             BackgroundOrigin::ContentBox => absolute_bounds.inner_rect(border_padding),
         },
-        BackgroundAttachment::Fixed => {
-            fixed = true;
-            Rect::new(Point2D::origin(), viewport_size)
-        },
+        BackgroundAttachment::Fixed => Rect::new(Point2D::origin(), viewport_size),
     };
 
     let mut tile_size = compute_background_image_size(bg_size, bounds.size, intrinsic_size);
@@ -222,7 +217,6 @@ pub fn placement(
         tile_spacing,
         clip_rect,
         clip_radii,
-        fixed,
     })
 }
 
@@ -302,6 +296,7 @@ fn tile_image(position: &mut Au, size: &mut Au, absolute_anchor_origin: Au, imag
 /// For either the x or the y axis adjust various values to account for tiling.
 ///
 /// This is done separately for both axes because the repeat keywords may differ.
+#[allow(clippy::too_many_arguments)]
 fn tile_image_axis(
     repeat: BackgroundRepeatKeyword,
     position: &mut Au,

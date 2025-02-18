@@ -4,16 +4,18 @@
 
 #![deny(unsafe_code)]
 
+#[macro_use]
+mod tracing;
+
 mod browsingcontext;
 mod constellation;
 mod event_loop;
 mod logging;
-mod network_listener;
 mod pipeline;
 mod sandboxing;
 mod serviceworker;
 mod session_history;
-mod timer_scheduler;
+mod webview;
 
 pub use crate::constellation::{Constellation, InitialConstellationState};
 pub use crate::logging::{FromCompositorLogger, FromScriptLogger};

@@ -2,8 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(crown::unrooted_must_root)]
+#![cfg_attr(crown, allow(crown::unrooted_must_root))]
 
+use std::cell::Cell;
 use std::io;
 
 use html5ever::buffer_queue::BufferQueue;
@@ -29,16 +30,17 @@ use crate::dom::htmltemplateelement::HTMLTemplateElement;
 use crate::dom::node::Node;
 use crate::dom::processinginstruction::ProcessingInstruction;
 use crate::dom::servoparser::{ParsingAlgorithm, Sink};
+use crate::script_runtime::CanGc;
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[crown::unrooted_must_root_lint::must_root]
-pub struct Tokenizer {
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
+pub(crate) struct Tokenizer {
     #[ignore_malloc_size_of = "Defined in html5ever"]
     inner: HtmlTokenizer<TreeBuilder<Dom<Node>, Sink>>,
 }
 
 impl Tokenizer {
-    pub fn new(
+    pub(crate) fn new(
         document: &Document,
         url: ServoUrl,
         fragment_context: Option<super::FragmentContext>,
@@ -47,9 +49,9 @@ impl Tokenizer {
         let sink = Sink {
             base_url: url,
             document: Dom::from_ref(document),
-            current_line: 1,
+            current_line: Cell::new(1),
             script: Default::default(),
-            parsing_algorithm: parsing_algorithm,
+            parsing_algorithm,
         };
 
         let options = TreeBuilderOpts {
@@ -61,7 +63,7 @@ impl Tokenizer {
             let tb = TreeBuilder::new_for_fragment(
                 sink,
                 Dom::from_ref(fc.context_elem),
-                fc.form_elem.map(|n| Dom::from_ref(n)),
+                fc.form_elem.map(Dom::from_ref),
                 options,
             );
 
@@ -75,11 +77,10 @@ impl Tokenizer {
             HtmlTokenizer::new(TreeBuilder::new(sink, options), Default::default())
         };
 
-        Tokenizer { inner: inner }
+        Tokenizer { inner }
     }
 
-    #[must_use]
-    pub fn feed(&mut self, input: &mut BufferQueue) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
+    pub(crate) fn feed(&self, input: &BufferQueue) -> TokenizerResult<DomRoot<HTMLScriptElement>> {
         match self.inner.feed(input) {
             TokenizerResult::Done => TokenizerResult::Done,
             TokenizerResult::Script(script) => {
@@ -88,15 +89,15 @@ impl Tokenizer {
         }
     }
 
-    pub fn end(&mut self) {
+    pub(crate) fn end(&self) {
         self.inner.end();
     }
 
-    pub fn url(&self) -> &ServoUrl {
+    pub(crate) fn url(&self) -> &ServoUrl {
         &self.inner.sink.sink.base_url
     }
 
-    pub fn set_plaintext_state(&mut self) {
+    pub(crate) fn set_plaintext_state(&self) {
         self.inner.set_plaintext_state();
     }
 }
@@ -109,7 +110,7 @@ unsafe impl CustomTraceable for HtmlTokenizer<TreeBuilder<Dom<Node>, Sink>> {
 
         impl HtmlTracer for Tracer {
             type Handle = Dom<Node>;
-            #[allow(crown::unrooted_must_root)]
+            #[cfg_attr(crown, allow(crown::unrooted_must_root))]
             fn trace_handle(&self, node: &Dom<Node>) {
                 unsafe {
                     node.trace(self.0);
@@ -134,8 +135,8 @@ fn start_element<S: Serializer>(node: &Element, serializer: &mut S) -> io::Resul
             (qname, value)
         })
         .collect::<Vec<_>>();
-    let attr_refs = attrs.iter().map(|&(ref qname, ref value)| {
-        let ar: AttrRef = (&qname, &**value);
+    let attr_refs = attrs.iter().map(|(qname, value)| {
+        let ar: AttrRef = (qname, &**value);
         ar
     });
     serializer.start_elem(name, attr_refs)?;
@@ -157,23 +158,23 @@ struct SerializationIterator {
     stack: Vec<SerializationCommand>,
 }
 
-fn rev_children_iter(n: &Node) -> impl Iterator<Item = DomRoot<Node>> {
-    if n.downcast::<Element>().map_or(false, |e| e.is_void()) {
+fn rev_children_iter(n: &Node, can_gc: CanGc) -> impl Iterator<Item = DomRoot<Node>> {
+    if n.downcast::<Element>().is_some_and(|e| e.is_void()) {
         return Node::new_document_node().rev_children();
     }
 
     match n.downcast::<HTMLTemplateElement>() {
-        Some(t) => t.Content().upcast::<Node>().rev_children(),
+        Some(t) => t.Content(can_gc).upcast::<Node>().rev_children(),
         None => n.rev_children(),
     }
 }
 
 impl SerializationIterator {
-    fn new(node: &Node, skip_first: bool) -> SerializationIterator {
+    fn new(node: &Node, skip_first: bool, can_gc: CanGc) -> SerializationIterator {
         let mut ret = SerializationIterator { stack: vec![] };
         if skip_first || node.is::<DocumentFragment>() || node.is::<Document>() {
-            for c in rev_children_iter(node) {
-                ret.push_node(&*c);
+            for c in rev_children_iter(node, can_gc) {
+                ret.push_node(&c);
             }
         } else {
             ret.push_node(node);
@@ -202,7 +203,7 @@ impl Iterator for SerializationIterator {
         if let Some(SerializationCommand::OpenElement(ref e)) = res {
             self.stack
                 .push(SerializationCommand::CloseElement(e.clone()));
-            for c in rev_children_iter(&*e.upcast::<Node>()) {
+            for c in rev_children_iter(e.upcast::<Node>(), CanGc::note()) {
                 self.push_node(&c);
             }
         }
@@ -211,7 +212,7 @@ impl Iterator for SerializationIterator {
     }
 }
 
-impl<'a> Serialize for &'a Node {
+impl Serialize for &Node {
     fn serialize<S: Serializer>(
         &self,
         serializer: &mut S,
@@ -219,7 +220,7 @@ impl<'a> Serialize for &'a Node {
     ) -> io::Result<()> {
         let node = *self;
 
-        let iter = SerializationIterator::new(node, traversal_scope != IncludeNode);
+        let iter = SerializationIterator::new(node, traversal_scope != IncludeNode, CanGc::note());
 
         for cmd in iter {
             match cmd {
@@ -228,13 +229,13 @@ impl<'a> Serialize for &'a Node {
                 },
 
                 SerializationCommand::CloseElement(n) => {
-                    end_element(&&n, serializer)?;
+                    end_element(&n, serializer)?;
                 },
 
                 SerializationCommand::SerializeNonelement(n) => match n.type_id() {
                     NodeTypeId::DocumentType => {
                         let doctype = n.downcast::<DocumentType>().unwrap();
-                        serializer.write_doctype(&doctype.name())?;
+                        serializer.write_doctype(doctype.name())?;
                     },
 
                     NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => {
@@ -250,7 +251,7 @@ impl<'a> Serialize for &'a Node {
                     NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) => {
                         let pi = n.downcast::<ProcessingInstruction>().unwrap();
                         let data = pi.upcast::<CharacterData>().data();
-                        serializer.write_processing_instruction(&pi.target(), &data)?;
+                        serializer.write_processing_instruction(pi.target(), &data)?;
                     },
 
                     NodeTypeId::DocumentFragment(_) => {},

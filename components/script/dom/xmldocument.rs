@@ -2,16 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::ptr::NonNull;
-
 use dom_struct::dom_struct;
-use js::jsapi::JSObject;
 use mime::Mime;
+use net_traits::request::InsecureRequestsPolicy;
 use script_traits::DocumentActivity;
 use servo_url::{MutableOrigin, ServoUrl};
 
 use crate::document_loader::DocumentLoader;
-use crate::dom::bindings::codegen::Bindings::DocumentBinding::DocumentMethods;
+use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
+    DocumentMethods, NamedPropertyValue,
+};
 use crate::dom::bindings::codegen::Bindings::XMLDocumentBinding::XMLDocumentMethods;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object;
@@ -21,15 +21,16 @@ use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLD
 use crate::dom::location::Location;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
-use crate::script_runtime::JSContext;
+use crate::script_runtime::CanGc;
 
 // https://dom.spec.whatwg.org/#xmldocument
 #[dom_struct]
-pub struct XMLDocument {
+pub(crate) struct XMLDocument {
     document: Document,
 }
 
 impl XMLDocument {
+    #[allow(clippy::too_many_arguments)]
     fn new_inherited(
         window: &Window,
         has_browsing_context: HasBrowsingContext,
@@ -41,6 +42,7 @@ impl XMLDocument {
         activity: DocumentActivity,
         source: DocumentSource,
         doc_loader: DocumentLoader,
+        inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
     ) -> XMLDocument {
         XMLDocument {
             document: Document::new_inherited(
@@ -57,11 +59,14 @@ impl XMLDocument {
                 None,
                 None,
                 Default::default(),
+                false,
+                inherited_insecure_requests_policy,
             ),
         }
     }
 
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         window: &Window,
         has_browsing_context: HasBrowsingContext,
         url: Option<ServoUrl>,
@@ -72,6 +77,7 @@ impl XMLDocument {
         activity: DocumentActivity,
         source: DocumentSource,
         doc_loader: DocumentLoader,
+        inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
     ) -> DomRoot<XMLDocument> {
         let doc = reflect_dom_object(
             Box::new(XMLDocument::new_inherited(
@@ -85,8 +91,10 @@ impl XMLDocument {
                 activity,
                 source,
                 doc_loader,
+                inherited_insecure_requests_policy,
             )),
             window,
+            CanGc::note(),
         );
         {
             let node = doc.upcast::<Node>();
@@ -96,7 +104,7 @@ impl XMLDocument {
     }
 }
 
-impl XMLDocumentMethods for XMLDocument {
+impl XMLDocumentMethods<crate::DomTypeHolder> for XMLDocument {
     // https://html.spec.whatwg.org/multipage/#dom-document-location
     fn GetLocation(&self) -> Option<DomRoot<Location>> {
         self.upcast::<Document>().GetLocation()
@@ -108,7 +116,7 @@ impl XMLDocumentMethods for XMLDocument {
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:dom-document-nameditem-filter
-    fn NamedGetter(&self, _cx: JSContext, name: DOMString) -> Option<NonNull<JSObject>> {
-        self.upcast::<Document>().NamedGetter(_cx, name)
+    fn NamedGetter(&self, name: DOMString) -> Option<NamedPropertyValue> {
+        self.upcast::<Document>().NamedGetter(name)
     }
 }

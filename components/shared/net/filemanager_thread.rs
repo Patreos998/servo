@@ -5,7 +5,9 @@
 use std::cmp::{max, min};
 use std::ops::Range;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
+use base::id::WebViewId;
 use embedder_traits::FilterPattern;
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
@@ -108,6 +110,16 @@ impl RelativePos {
             end: (start + span).to_usize().unwrap(),
         }
     }
+
+    // Per <https://fetch.spec.whatwg.org/#concept-scheme-fetch> step 3.blob.14.8:
+    // "A range header denotes an inclusive byte range, while the slice blob algorithm input range does not.
+    // To use the slice blob algorithm, we have to increment rangeEnd."
+    pub fn to_abs_blob_range(&self, size: usize) -> Range<usize> {
+        let orig_range = self.to_abs_range(size);
+        let start = orig_range.start;
+        let end = usize::min(orig_range.end + 1, size);
+        Range { start, end }
+    }
 }
 
 /// Response to file selection request
@@ -115,7 +127,7 @@ impl RelativePos {
 pub struct SelectedFile {
     pub id: Uuid,
     pub filename: PathBuf,
-    pub modified: u64,
+    pub modified: SystemTime,
     pub size: u64,
     // https://w3c.github.io/FileAPI/#dfn-type
     pub type_string: String,
@@ -125,18 +137,20 @@ pub struct SelectedFile {
 pub enum FileManagerThreadMsg {
     /// Select a single file. Last field is pre-selected file path for testing
     SelectFile(
+        WebViewId,
         Vec<FilterPattern>,
         IpcSender<FileManagerResult<SelectedFile>>,
         FileOrigin,
-        Option<String>,
+        Option<PathBuf>,
     ),
 
     /// Select multiple files. Last field is pre-selected file paths for testing
     SelectFiles(
+        WebViewId,
         Vec<FilterPattern>,
         IpcSender<FileManagerResult<Vec<SelectedFile>>>,
         FileOrigin,
-        Option<Vec<String>>,
+        Option<Vec<PathBuf>>,
     ),
 
     /// Read FileID-indexed file in chunks, optionally check URL validity based on boolean flag

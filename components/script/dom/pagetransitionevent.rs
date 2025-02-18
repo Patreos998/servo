@@ -18,10 +18,11 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::event::Event;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 // https://html.spec.whatwg.org/multipage/#pagetransitionevent
 #[dom_struct]
-pub struct PageTransitionEvent {
+pub(crate) struct PageTransitionEvent {
     event: Event,
     persisted: Cell<bool>,
 }
@@ -37,22 +38,25 @@ impl PageTransitionEvent {
     fn new_uninitialized(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<PageTransitionEvent> {
         reflect_dom_object_with_proto(
             Box::new(PageTransitionEvent::new_inherited()),
             window,
             proto,
+            can_gc,
         )
     }
 
-    pub fn new(
+    pub(crate) fn new(
         window: &Window,
         type_: Atom,
         bubbles: bool,
         cancelable: bool,
         persisted: bool,
+        can_gc: CanGc,
     ) -> DomRoot<PageTransitionEvent> {
-        Self::new_with_proto(window, None, type_, bubbles, cancelable, persisted)
+        Self::new_with_proto(window, None, type_, bubbles, cancelable, persisted, can_gc)
     }
 
     fn new_with_proto(
@@ -62,8 +66,9 @@ impl PageTransitionEvent {
         bubbles: bool,
         cancelable: bool,
         persisted: bool,
+        can_gc: CanGc,
     ) -> DomRoot<PageTransitionEvent> {
-        let ev = PageTransitionEvent::new_uninitialized(window, proto);
+        let ev = PageTransitionEvent::new_uninitialized(window, proto, can_gc);
         ev.persisted.set(persisted);
         {
             let event = ev.upcast::<Event>();
@@ -71,11 +76,14 @@ impl PageTransitionEvent {
         }
         ev
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl PageTransitionEventMethods<crate::DomTypeHolder> for PageTransitionEvent {
+    // https://html.spec.whatwg.org/multipage/#pagetransitionevent
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         type_: DOMString,
         init: &PageTransitionEventBinding::PageTransitionEventInit,
     ) -> Fallible<DomRoot<PageTransitionEvent>> {
@@ -86,11 +94,10 @@ impl PageTransitionEvent {
             init.parent.bubbles,
             init.parent.cancelable,
             init.persisted,
+            can_gc,
         ))
     }
-}
 
-impl PageTransitionEventMethods for PageTransitionEvent {
     // https://html.spec.whatwg.org/multipage/#dom-pagetransitionevent-persisted
     fn Persisted(&self) -> bool {
         self.persisted.get()

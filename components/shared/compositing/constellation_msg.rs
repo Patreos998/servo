@@ -6,18 +6,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-use embedder_traits::Cursor;
-use gfx_traits::Epoch;
+use base::id::{BrowsingContextId, PipelineId, TopLevelBrowsingContextId, WebViewId};
+use base::Epoch;
+use embedder_traits::{Cursor, InputEvent, MediaSessionActionType, Theme, TraversalDirection};
 use ipc_channel::ipc::IpcSender;
-use keyboard_types::KeyboardEvent;
-use msg::constellation_msg::{
-    BrowsingContextId, PipelineId, TopLevelBrowsingContextId, TraversalDirection,
-};
 use script_traits::{
-    AnimationTickType, CompositorEvent, LogEntry, MediaSessionActionType, WebDriverCommandMsg,
-    WindowSizeData, WindowSizeType,
+    AnimationTickType, LogEntry, WebDriverCommandMsg, WindowSizeData, WindowSizeType,
 };
 use servo_url::ServoUrl;
+use webrender_traits::CompositorHitTestResult;
 
 /// Messages to the constellation.
 pub enum ConstellationMsg {
@@ -34,8 +31,6 @@ pub enum ConstellationMsg {
     GetFocusTopLevelBrowsingContext(IpcSender<Option<TopLevelBrowsingContextId>>),
     /// Query the constellation to see if the current compositor output is stable
     IsReadyToSaveImage(HashMap<PipelineId, Epoch>),
-    /// Inform the constellation of a key event.
-    Keyboard(KeyboardEvent),
     /// Whether to allow script to navigate.
     AllowNavigationResponse(PipelineId, bool),
     /// Request to load a page.
@@ -46,6 +41,8 @@ pub enum ConstellationMsg {
     TraverseHistory(TopLevelBrowsingContextId, TraversalDirection),
     /// Inform the constellation of a window being resized.
     WindowSize(TopLevelBrowsingContextId, WindowSizeData, WindowSizeType),
+    /// Inform the constellation of a theme change.
+    ThemeChange(Theme),
     /// Requests that the constellation instruct layout to begin a new tick of the animation.
     TickAnimation(PipelineId, AnimationTickType),
     /// Dispatch a webdriver command
@@ -55,66 +52,69 @@ pub enum ConstellationMsg {
     /// A log entry, with the top-level browsing context id and thread name
     LogEntry(Option<TopLevelBrowsingContextId>, Option<String>, LogEntry),
     /// Create a new top level browsing context.
-    NewBrowser(ServoUrl, TopLevelBrowsingContextId),
+    NewWebView(ServoUrl, TopLevelBrowsingContextId),
+    /// A top level browsing context is created in both constellation and compositor.
+    WebViewOpened(TopLevelBrowsingContextId),
     /// Close a top level browsing context.
-    CloseBrowser(TopLevelBrowsingContextId),
+    CloseWebView(TopLevelBrowsingContextId),
     /// Panic a top level browsing context.
     SendError(Option<TopLevelBrowsingContextId>, String),
-    /// Make browser visible.
-    SelectBrowser(TopLevelBrowsingContextId),
-    /// Forward an event to the script task of the given pipeline.
-    ForwardEvent(PipelineId, CompositorEvent),
+    /// Make a webview focused.
+    FocusWebView(TopLevelBrowsingContextId),
+    /// Make none of the webviews focused.
+    BlurWebView,
+    /// Forward an input event to an appropriate ScriptTask.
+    ForwardInputEvent(InputEvent, Option<CompositorHitTestResult>),
     /// Requesting a change to the onscreen cursor.
-    SetCursor(Cursor),
+    SetCursor(WebViewId, Cursor),
     /// Enable the sampling profiler, with a given sampling rate and max total sampling duration.
-    EnableProfiler(Duration, Duration),
-    /// Disable the sampling profiler.
-    DisableProfiler,
+    ToggleProfiler(Duration, Duration),
     /// Request to exit from fullscreen mode
     ExitFullScreen(TopLevelBrowsingContextId),
     /// Media session action.
     MediaSessionAction(MediaSessionActionType),
-    /// Toggle browser visibility.
-    ChangeBrowserVisibility(TopLevelBrowsingContextId, bool),
-    /// Virtual keyboard was dismissed
-    IMEDismissed,
-    /// Compositing done, but external code needs to present.
-    ReadyToPresent(TopLevelBrowsingContextId),
+    /// Set whether to use less resources, by stopping animations and running timers at a heavily limited rate.
+    SetWebViewThrottled(TopLevelBrowsingContextId, bool),
 }
 
 impl fmt::Debug for ConstellationMsg {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        write!(formatter, "ConstellationMsg::{}", self.variant_name())
+    }
+}
+
+impl ConstellationMsg {
+    /// Return the variant name, for error logging that happens after the message is consumed.
+    pub fn variant_name(&self) -> &'static str {
         use self::ConstellationMsg::*;
-        let variant = match *self {
+        match *self {
             Exit => "Exit",
             GetBrowsingContext(..) => "GetBrowsingContext",
             GetPipeline(..) => "GetPipeline",
             GetFocusTopLevelBrowsingContext(..) => "GetFocusTopLevelBrowsingContext",
             IsReadyToSaveImage(..) => "IsReadyToSaveImage",
-            Keyboard(..) => "Keyboard",
             AllowNavigationResponse(..) => "AllowNavigationResponse",
             LoadUrl(..) => "LoadUrl",
             TraverseHistory(..) => "TraverseHistory",
             WindowSize(..) => "WindowSize",
+            ThemeChange(..) => "ThemeChange",
             TickAnimation(..) => "TickAnimation",
             WebDriverCommand(..) => "WebDriverCommand",
             Reload(..) => "Reload",
             LogEntry(..) => "LogEntry",
-            NewBrowser(..) => "NewBrowser",
-            CloseBrowser(..) => "CloseBrowser",
+            NewWebView(..) => "NewWebView",
+            WebViewOpened(..) => "WebViewOpened",
+            CloseWebView(..) => "CloseWebView",
+            FocusWebView(..) => "FocusWebView",
+            BlurWebView => "BlurWebView",
             SendError(..) => "SendError",
-            SelectBrowser(..) => "SelectBrowser",
-            ForwardEvent(..) => "ForwardEvent",
+            ForwardInputEvent(..) => "ForwardEvent",
             SetCursor(..) => "SetCursor",
-            EnableProfiler(..) => "EnableProfiler",
-            DisableProfiler => "DisableProfiler",
+            ToggleProfiler(..) => "EnableProfiler",
             ExitFullScreen(..) => "ExitFullScreen",
             MediaSessionAction(..) => "MediaSessionAction",
-            ChangeBrowserVisibility(..) => "ChangeBrowserVisibility",
-            IMEDismissed => "IMEDismissed",
+            SetWebViewThrottled(..) => "SetWebViewThrottled",
             ClearCache => "ClearCache",
-            ReadyToPresent(..) => "ReadyToPresent",
-        };
-        write!(formatter, "ConstellationMsg::{}", variant)
+        }
     }
 }

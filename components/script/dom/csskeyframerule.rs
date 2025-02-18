@@ -6,19 +6,21 @@ use dom_struct::dom_struct;
 use servo_arc::Arc;
 use style::shared_lock::{Locked, ToCssWithGuard};
 use style::stylesheets::keyframes_rule::Keyframe;
+use style::stylesheets::CssRuleType;
 
 use crate::dom::bindings::codegen::Bindings::CSSKeyframeRuleBinding::CSSKeyframeRuleMethods;
 use crate::dom::bindings::inheritance::Castable;
-use crate::dom::bindings::reflector::{reflect_dom_object, DomObject};
+use crate::dom::bindings::reflector::{reflect_dom_object, DomGlobal};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::cssrule::{CSSRule, SpecificCSSRule};
 use crate::dom::cssstyledeclaration::{CSSModificationAccess, CSSStyleDeclaration, CSSStyleOwner};
 use crate::dom::cssstylesheet::CSSStyleSheet;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct CSSKeyframeRule {
+pub(crate) struct CSSKeyframeRule {
     cssrule: CSSRule,
     #[ignore_malloc_size_of = "Arc"]
     #[no_trace]
@@ -33,13 +35,13 @@ impl CSSKeyframeRule {
     ) -> CSSKeyframeRule {
         CSSKeyframeRule {
             cssrule: CSSRule::new_inherited(parent_stylesheet),
-            keyframerule: keyframerule,
+            keyframerule,
             style_decl: Default::default(),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         window: &Window,
         parent_stylesheet: &CSSStyleSheet,
         keyframerule: Arc<Locked<Keyframe>>,
@@ -50,11 +52,12 @@ impl CSSKeyframeRule {
                 keyframerule,
             )),
             window,
+            CanGc::note(),
         )
     }
 }
 
-impl CSSKeyframeRuleMethods for CSSKeyframeRule {
+impl CSSKeyframeRuleMethods<crate::DomTypeHolder> for CSSKeyframeRule {
     // https://drafts.csswg.org/css-animations/#dom-csskeyframerule-style
     fn Style(&self) -> DomRoot<CSSStyleDeclaration> {
         self.style_decl.or_init(|| {
@@ -73,9 +76,8 @@ impl CSSKeyframeRuleMethods for CSSKeyframeRule {
 }
 
 impl SpecificCSSRule for CSSKeyframeRule {
-    fn ty(&self) -> u16 {
-        use crate::dom::bindings::codegen::Bindings::CSSRuleBinding::CSSRuleConstants;
-        CSSRuleConstants::KEYFRAME_RULE
+    fn ty(&self) -> CssRuleType {
+        CssRuleType::Keyframe
     }
 
     fn get_css(&self) -> DOMString {

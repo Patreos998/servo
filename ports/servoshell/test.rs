@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::parser::{get_default_url, location_bar_input_to_url, parse_url_or_filename};
 
 #[cfg(not(target_os = "windows"))]
-const FAKE_CWD: &'static str = "/fake/cwd";
+const FAKE_CWD: &str = "/fake/cwd";
 
 #[cfg(target_os = "windows")]
 const FAKE_CWD: &'static str = "C:/fake/cwd";
@@ -89,15 +89,17 @@ fn test_argument_parsing_special() {
 // Helper function to test url
 fn test_url(input: &str, location: &str, cmdline_if_exists: &str, cmdline_otherwise: &str) {
     assert_eq!(
-        location_bar_input_to_url(input).unwrap().into_string(),
+        location_bar_input_to_url(input, "https://duckduckgo.com/html/?q=%s")
+            .unwrap()
+            .into_string(),
         location
     );
     assert_eq!(
-        get_default_url(Some(input), FAKE_CWD, |_| true).into_string(),
+        get_default_url(Some(input), FAKE_CWD, |_| true, &Default::default()).into_string(),
         cmdline_if_exists
     );
     assert_eq!(
-        get_default_url(Some(input), FAKE_CWD, |_| false).into_string(),
+        get_default_url(Some(input), FAKE_CWD, |_| false, &Default::default()).into_string(),
         cmdline_otherwise
     );
 }

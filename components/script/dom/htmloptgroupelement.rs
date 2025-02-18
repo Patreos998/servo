@@ -5,7 +5,7 @@
 use dom_struct::dom_struct;
 use html5ever::{local_name, LocalName, Prefix};
 use js::rust::HandleObject;
-use style_traits::dom::ElementState;
+use style_dom::ElementState;
 
 use crate::dom::attr::Attr;
 use crate::dom::bindings::codegen::Bindings::HTMLOptGroupElementBinding::HTMLOptGroupElementMethods;
@@ -20,9 +20,10 @@ use crate::dom::node::{BindContext, Node, ShadowIncluding, UnbindContext};
 use crate::dom::validation::Validatable;
 use crate::dom::validitystate::ValidationFlags;
 use crate::dom::virtualmethods::VirtualMethods;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct HTMLOptGroupElement {
+pub(crate) struct HTMLOptGroupElement {
     htmlelement: HTMLElement,
 }
 
@@ -42,12 +43,13 @@ impl HTMLOptGroupElement {
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(
         local_name: LocalName,
         prefix: Option<Prefix>,
         document: &Document,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
     ) -> DomRoot<HTMLOptGroupElement> {
         Node::reflect_node_with_proto(
             Box::new(HTMLOptGroupElement::new_inherited(
@@ -55,6 +57,7 @@ impl HTMLOptGroupElement {
             )),
             document,
             proto,
+            can_gc,
         )
     }
 
@@ -72,7 +75,7 @@ impl HTMLOptGroupElement {
     }
 }
 
-impl HTMLOptGroupElementMethods for HTMLOptGroupElement {
+impl HTMLOptGroupElementMethods<crate::DomTypeHolder> for HTMLOptGroupElement {
     // https://html.spec.whatwg.org/multipage/#dom-optgroup-disabled
     make_bool_getter!(Disabled, "disabled");
 
@@ -87,43 +90,40 @@ impl VirtualMethods for HTMLOptGroupElement {
 
     fn attribute_mutated(&self, attr: &Attr, mutation: AttributeMutation) {
         self.super_type().unwrap().attribute_mutated(attr, mutation);
-        match attr.local_name() {
-            &local_name!("disabled") => {
-                let disabled_state = match mutation {
-                    AttributeMutation::Set(None) => true,
-                    AttributeMutation::Set(Some(_)) => {
-                        // Option group was already disabled.
-                        return;
-                    },
-                    AttributeMutation::Removed => false,
-                };
-                let el = self.upcast::<Element>();
-                el.set_disabled_state(disabled_state);
-                el.set_enabled_state(!disabled_state);
-                let options = el
-                    .upcast::<Node>()
-                    .children()
-                    .filter(|child| child.is::<HTMLOptionElement>())
-                    .map(|child| DomRoot::from_ref(child.downcast::<HTMLOptionElement>().unwrap()));
-                if disabled_state {
-                    for option in options {
-                        let el = option.upcast::<Element>();
-                        el.set_disabled_state(true);
-                        el.set_enabled_state(false);
-                    }
-                } else {
-                    for option in options {
-                        let el = option.upcast::<Element>();
-                        el.check_disabled_attribute();
-                    }
+        if attr.local_name() == &local_name!("disabled") {
+            let disabled_state = match mutation {
+                AttributeMutation::Set(None) => true,
+                AttributeMutation::Set(Some(_)) => {
+                    // Option group was already disabled.
+                    return;
+                },
+                AttributeMutation::Removed => false,
+            };
+            let el = self.upcast::<Element>();
+            el.set_disabled_state(disabled_state);
+            el.set_enabled_state(!disabled_state);
+            let options = el
+                .upcast::<Node>()
+                .children()
+                .filter(|child| child.is::<HTMLOptionElement>())
+                .map(|child| DomRoot::from_ref(child.downcast::<HTMLOptionElement>().unwrap()));
+            if disabled_state {
+                for option in options {
+                    let el = option.upcast::<Element>();
+                    el.set_disabled_state(true);
+                    el.set_enabled_state(false);
                 }
-            },
-            _ => {},
+            } else {
+                for option in options {
+                    let el = option.upcast::<Element>();
+                    el.check_disabled_attribute();
+                }
+            }
         }
     }
 
     fn bind_to_tree(&self, context: &BindContext) {
-        if let Some(ref s) = self.super_type() {
+        if let Some(s) = self.super_type() {
             s.bind_to_tree(context);
         }
 

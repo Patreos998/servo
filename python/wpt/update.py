@@ -27,7 +27,7 @@ def do_sync(**kwargs) -> int:
 
     # Commits should always be authored by the GitHub Actions bot.
     os.environ["GIT_AUTHOR_NAME"] = "Servo WPT Sync"
-    os.environ["GIT_AUTHOR_EMAIL"] = "josh+wptsync@joshmatthews.net"
+    os.environ["GIT_AUTHOR_EMAIL"] = "ghbot+wpt-sync@servo.org"
     os.environ["GIT_COMMITTER_NAME"] = os.environ['GIT_AUTHOR_NAME']
     os.environ["GIT_COMMITTER_EMAIL"] = os.environ['GIT_AUTHOR_EMAIL']
 
@@ -60,9 +60,7 @@ def remove_unused_metadata():
     for meta_root in META_ROOTS:
         for base_dir, dir_names, files in os.walk(meta_root):
             # Skip recursing into any directories that were previously found to be missing.
-            if base_dir in unused_dirs:
-                # Skip processing any subdirectories of known missing directories.
-                unused_dirs += [os.path.join(base_dir, x) for x in dir_names]
+            if any([os.path.commonpath([base_dir, unused_dir]) == unused_dir for unused_dir in unused_dirs]):
                 continue
 
             for dir_name in dir_names:

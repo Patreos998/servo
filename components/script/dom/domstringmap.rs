@@ -10,10 +10,11 @@ use crate::dom::bindings::reflector::{reflect_dom_object, Reflector};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::htmlelement::HTMLElement;
-use crate::dom::node::window_from_node;
+use crate::dom::node::NodeTraits;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct DOMStringMap {
+pub(crate) struct DOMStringMap {
     reflector_: Reflector,
     element: Dom<HTMLElement>,
 }
@@ -26,22 +27,25 @@ impl DOMStringMap {
         }
     }
 
-    pub fn new(element: &HTMLElement) -> DomRoot<DOMStringMap> {
-        let window = window_from_node(element);
-        reflect_dom_object(Box::new(DOMStringMap::new_inherited(element)), &*window)
+    pub(crate) fn new(element: &HTMLElement) -> DomRoot<DOMStringMap> {
+        reflect_dom_object(
+            Box::new(DOMStringMap::new_inherited(element)),
+            &*element.owner_window(),
+            CanGc::note(),
+        )
     }
 }
 
 // https://html.spec.whatwg.org/multipage/#domstringmap
-impl DOMStringMapMethods for DOMStringMap {
+impl DOMStringMapMethods<crate::DomTypeHolder> for DOMStringMap {
     // https://html.spec.whatwg.org/multipage/#dom-domstringmap-removeitem
     fn NamedDeleter(&self, name: DOMString) {
         self.element.delete_custom_attr(name)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-domstringmap-setitem
-    fn NamedSetter(&self, name: DOMString, value: DOMString) -> ErrorResult {
-        self.element.set_custom_attr(name, value)
+    fn NamedSetter(&self, name: DOMString, value: DOMString, can_gc: CanGc) -> ErrorResult {
+        self.element.set_custom_attr(name, value, can_gc)
     }
 
     // https://html.spec.whatwg.org/multipage/#dom-domstringmap-nameditem
@@ -51,10 +55,6 @@ impl DOMStringMapMethods for DOMStringMap {
 
     // https://html.spec.whatwg.org/multipage/#the-domstringmap-interface:supported-property-names
     fn SupportedPropertyNames(&self) -> Vec<DOMString> {
-        self.element
-            .supported_prop_names_custom_attr()
-            .iter()
-            .cloned()
-            .collect()
+        self.element.supported_prop_names_custom_attr().to_vec()
     }
 }

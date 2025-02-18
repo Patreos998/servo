@@ -9,14 +9,15 @@ use crate::dom::bindings::codegen::Bindings::RTCIceCandidateBinding::{
     RTCIceCandidateInit, RTCIceCandidateMethods,
 };
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomObject, Reflector};
+use crate::dom::bindings::reflector::{reflect_dom_object_with_proto, DomGlobal, Reflector};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct RTCIceCandidate {
+pub(crate) struct RTCIceCandidate {
     reflector: Reflector,
     candidate: DOMString,
     sdp_m_id: Option<DOMString>,
@@ -25,7 +26,7 @@ pub struct RTCIceCandidate {
 }
 
 impl RTCIceCandidate {
-    pub fn new_inherited(
+    pub(crate) fn new_inherited(
         candidate: DOMString,
         sdp_m_id: Option<DOMString>,
         sdp_m_line_index: Option<u16>,
@@ -40,12 +41,13 @@ impl RTCIceCandidate {
         }
     }
 
-    pub fn new(
+    pub(crate) fn new(
         global: &GlobalScope,
         candidate: DOMString,
         sdp_m_id: Option<DOMString>,
         sdp_m_line_index: Option<u16>,
         username_fragment: Option<DOMString>,
+        can_gc: CanGc,
     ) -> DomRoot<RTCIceCandidate> {
         Self::new_with_proto(
             global,
@@ -54,6 +56,7 @@ impl RTCIceCandidate {
             sdp_m_id,
             sdp_m_line_index,
             username_fragment,
+            can_gc,
         )
     }
 
@@ -64,6 +67,7 @@ impl RTCIceCandidate {
         sdp_m_id: Option<DOMString>,
         sdp_m_line_index: Option<u16>,
         username_fragment: Option<DOMString>,
+        can_gc: CanGc,
     ) -> DomRoot<RTCIceCandidate> {
         reflect_dom_object_with_proto(
             Box::new(RTCIceCandidate::new_inherited(
@@ -74,19 +78,23 @@ impl RTCIceCandidate {
             )),
             global,
             proto,
+            can_gc,
         )
     }
+}
 
-    #[allow(non_snake_case)]
-    pub fn Constructor(
+impl RTCIceCandidateMethods<crate::DomTypeHolder> for RTCIceCandidate {
+    /// <https://w3c.github.io/webrtc-pc/#dom-rtcicecandidate-constructor>
+    fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
+        can_gc: CanGc,
         config: &RTCIceCandidateInit,
     ) -> Fallible<DomRoot<RTCIceCandidate>> {
         if config.sdpMid.is_none() && config.sdpMLineIndex.is_none() {
-            return Err(Error::Type(format!(
-                "one of sdpMid and sdpMLineIndex must be set"
-            )));
+            return Err(Error::Type(
+                "one of sdpMid and sdpMLineIndex must be set".to_string(),
+            ));
         }
         Ok(RTCIceCandidate::new_with_proto(
             &window.global(),
@@ -95,11 +103,10 @@ impl RTCIceCandidate {
             config.sdpMid.clone(),
             config.sdpMLineIndex,
             config.usernameFragment.clone(),
+            can_gc,
         ))
     }
-}
 
-impl RTCIceCandidateMethods for RTCIceCandidate {
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcicecandidate-candidate>
     fn Candidate(&self) -> DOMString {
         self.candidate.clone()
@@ -112,7 +119,7 @@ impl RTCIceCandidateMethods for RTCIceCandidate {
 
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcicecandidate-sdpmlineindex>
     fn GetSdpMLineIndex(&self) -> Option<u16> {
-        self.sdp_m_line_index.clone()
+        self.sdp_m_line_index
     }
 
     /// <https://w3c.github.io/webrtc-pc/#dom-rtcicecandidate-usernamefragment>
@@ -125,7 +132,7 @@ impl RTCIceCandidateMethods for RTCIceCandidate {
         RTCIceCandidateInit {
             candidate: self.candidate.clone(),
             sdpMid: self.sdp_m_id.clone(),
-            sdpMLineIndex: self.sdp_m_line_index.clone(),
+            sdpMLineIndex: self.sdp_m_line_index,
             usernameFragment: self.username_fragment.clone(),
         }
     }

@@ -17,26 +17,31 @@ use crate::dom::htmlinputelement::{HTMLInputElement, InputType};
 use crate::dom::node::Node;
 use crate::dom::nodelist::{NodeList, NodeListType, RadioList, RadioListMode};
 use crate::dom::window::Window;
+use crate::script_runtime::CanGc;
 
 #[dom_struct]
-pub struct RadioNodeList {
+pub(crate) struct RadioNodeList {
     node_list: NodeList,
 }
 
 impl RadioNodeList {
-    #[allow(crown::unrooted_must_root)]
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn new_inherited(list_type: NodeListType) -> RadioNodeList {
         RadioNodeList {
             node_list: NodeList::new_inherited(list_type),
         }
     }
 
-    #[allow(crown::unrooted_must_root)]
-    pub fn new(window: &Window, list_type: NodeListType) -> DomRoot<RadioNodeList> {
-        reflect_dom_object(Box::new(RadioNodeList::new_inherited(list_type)), window)
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new(window: &Window, list_type: NodeListType) -> DomRoot<RadioNodeList> {
+        reflect_dom_object(
+            Box::new(RadioNodeList::new_inherited(list_type)),
+            window,
+            CanGc::note(),
+        )
     }
 
-    pub fn new_controls_except_image_inputs(
+    pub(crate) fn new_controls_except_image_inputs(
         window: &Window,
         form: &HTMLFormElement,
         name: &Atom,
@@ -51,7 +56,7 @@ impl RadioNodeList {
         )
     }
 
-    pub fn new_images(
+    pub(crate) fn new_images(
         window: &Window,
         form: &HTMLFormElement,
         name: &Atom,
@@ -61,16 +66,15 @@ impl RadioNodeList {
             NodeListType::Radio(RadioList::new(form, RadioListMode::Images, name.clone())),
         )
     }
-
-    // https://dom.spec.whatwg.org/#dom-nodelist-length
-    // https://github.com/servo/servo/issues/5875
-    #[allow(non_snake_case)]
-    pub fn Length(&self) -> u32 {
-        self.node_list.Length()
-    }
 }
 
-impl RadioNodeListMethods for RadioNodeList {
+impl RadioNodeListMethods<crate::DomTypeHolder> for RadioNodeList {
+    // https://dom.spec.whatwg.org/#dom-nodelist-length
+    // https://github.com/servo/servo/issues/5875
+    fn Length(&self) -> u32 {
+        self.node_list.Length()
+    }
+
     // https://html.spec.whatwg.org/multipage/#dom-radionodelist-value
     fn Value(&self) -> DOMString {
         self.upcast::<NodeList>()
@@ -102,7 +106,7 @@ impl RadioNodeListMethods for RadioNodeList {
             // Step 1
             if let Some(input) = node.downcast::<HTMLInputElement>() {
                 match input.input_type() {
-                    InputType::Radio if value == DOMString::from("on") => {
+                    InputType::Radio if value == *"on" => {
                         // Step 2
                         let val = input.Value();
                         if val.is_empty() || val == value {

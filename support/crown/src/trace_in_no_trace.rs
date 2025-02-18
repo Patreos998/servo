@@ -34,7 +34,7 @@ empty Traceable (like primitive types). Consider removing the wrapper.";
 
 pub fn register(lint_store: &mut LintStore) {
     let symbols = Symbols::new();
-    lint_store.register_lints(&[&TRACE_IN_NO_TRACE, &EMPTY_TRACE_IN_NO_TRACE]);
+    lint_store.register_lints(&[TRACE_IN_NO_TRACE, EMPTY_TRACE_IN_NO_TRACE]);
     lint_store.register_late_pass(move |_| Box::new(NotracePass::new(symbols.clone())));
 }
 
@@ -86,7 +86,7 @@ fn get_must_not_have_traceable(sym: &Symbols, attrs: &[Attribute]) -> Option<usi
                     TokenKind::Literal(lit) => lit.symbol.as_str().parse().unwrap(),
                     _ => panic!("must_not_have_traceable expected integer literal here"),
                 },
-                TokenTree::Delimited(_, _, _) => {
+                TokenTree::Delimited(..) => {
                     todo!("must_not_have_traceable does not support multiple notraceable positions")
                 },
             },
@@ -127,24 +127,22 @@ fn incorrect_no_trace<'tcx, I: Into<MultiSpan> + Copy>(
         let recur_into_subtree = match t.kind() {
             ty::Adt(did, substs) => {
                 if let Some(pos) =
-                    get_must_not_have_traceable(sym, &cx.tcx.get_attrs_unchecked(did.did()))
+                    get_must_not_have_traceable(sym, cx.tcx.get_attrs_unchecked(did.did()))
                 {
                     let inner = substs.type_at(pos);
                     if inner.is_primitive_ty() {
-                        cx.lint(
-                            EMPTY_TRACE_IN_NO_TRACE,
-                            EMPTY_TRACE_IN_NO_TRACE_MSG,
-                            |lint| lint.set_span(span),
-                        )
+                        cx.lint(EMPTY_TRACE_IN_NO_TRACE, |lint| {
+                            lint.primary_message(EMPTY_TRACE_IN_NO_TRACE_MSG);
+                            lint.span(span);
+                        })
                     } else if is_jstraceable(cx, inner) {
-                        cx.lint(
-                            TRACE_IN_NO_TRACE,
-                            format!(
+                        cx.lint(TRACE_IN_NO_TRACE, |lint| {
+                            lint.primary_message(format!(
                                 "must_not_have_traceable marked wrapper must not have \
 jsmanaged inside on {pos}-th position. Consider removing the wrapper."
-                            ),
-                            |lint| lint.set_span(span),
-                        )
+                            ));
+                            lint.span(span);
+                        })
                     }
                     false
                 } else {
@@ -169,7 +167,7 @@ impl<'tcx> LateLintPass<'tcx> for NotracePass {
             return;
         }*/
         if let hir::ItemKind::Struct(def, ..) = &item.kind {
-            for ref field in def.fields() {
+            for field in def.fields() {
                 let field_type = cx.tcx.type_of(field.def_id);
                 incorrect_no_trace(&self.symbols, cx, field_type.skip_binder(), field.span);
             }
@@ -177,6 +175,7 @@ impl<'tcx> LateLintPass<'tcx> for NotracePass {
     }
 
     fn check_variant(&mut self, cx: &LateContext, var: &hir::Variant) {
+        #[allow(clippy::single_match)]
         match var.data {
             hir::VariantData::Tuple(fields, ..) => {
                 for field in fields {

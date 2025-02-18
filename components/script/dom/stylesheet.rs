@@ -14,7 +14,7 @@ use crate::dom::element::Element;
 use crate::dom::medialist::MediaList;
 
 #[dom_struct]
-pub struct StyleSheet {
+pub(crate) struct StyleSheet {
     reflector_: Reflector,
     type_: DOMString,
     href: Option<DOMString>,
@@ -22,22 +22,22 @@ pub struct StyleSheet {
 }
 
 impl StyleSheet {
-    #[allow(crown::unrooted_must_root)]
-    pub fn new_inherited(
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    pub(crate) fn new_inherited(
         type_: DOMString,
         href: Option<DOMString>,
         title: Option<DOMString>,
     ) -> StyleSheet {
         StyleSheet {
             reflector_: Reflector::new(),
-            type_: type_,
-            href: href,
-            title: title,
+            type_,
+            href,
+            title,
         }
     }
 }
 
-impl StyleSheetMethods for StyleSheet {
+impl StyleSheetMethods<crate::DomTypeHolder> for StyleSheet {
     // https://drafts.csswg.org/cssom/#dom-stylesheet-type
     fn Type_(&self) -> DOMString {
         self.type_.clone()
